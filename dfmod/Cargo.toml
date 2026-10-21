@@ -1,0 +1,15 @@
+[package]
+name = "dfmod"
+version = "0.1.0"
+edition = "2021"
+description = "Reader for Daggerfall Unity .dfmod mods (Unity 2019.4 AssetBundles): UnityFS + SerializedFile + Texture2D"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lz4_flex = "0.11"
+lzma-rs = "0.3"
+memmap2 = "0.9"
+thiserror = "1"
+
+[dev-dependencies]
+png = "0.17"

@@ -1,0 +1,8 @@
+[package]
+name = "daggerfall-data"
+version = "0.1.0"
+edition = "2021"
+description = "Lettori dei formati di dati di Daggerfall (TEXTURE.nnn, palette), portati da Daggerfall Unity"
+license = "MIT"
+
+[dependencies]

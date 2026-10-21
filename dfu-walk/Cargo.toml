@@ -1,0 +1,30 @@
+[package]
+name = "dfu-walk"
+version = "0.1.0"
+edition = "2021"
+description = "Terreno percorribile di Daggerfall in Bevy, basato sul crate daggerfall-data"
+license = "MIT"
+
+[dependencies]
+daggerfall-data = { path = "../daggerfall-data" }
+bevy = { version = "0.15", default-features = false, features = [
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_window",
+    "bevy_winit",
+    "bevy_ui",
+    "default_font",
+    "multi_threaded",
+    "x11",
+    "tonemapping_luts",
+] }
+dfmod = { version = "0.1.0", path = "../dfmod" }
+
+# Bevy è molto lento in debug: ottimizza le dipendenze anche nelle build di sviluppo.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

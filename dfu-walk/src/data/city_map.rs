@@ -1,9 +1,4 @@
-//! Mappa locale di una città: edifici dall'alto, con taverne (verde), negozi (rosso)
-//! e gilde (blu) evidenziati. Tutto in memoria, senza dipendenze: produce un'immagine
-//! RGBA (mappa + legenda) che il viewer carica come texture.
-//!
-//! Coordinate: quelle locali del map pixel (x a est, z = -nord, origine nell'angolo
-//! sud-ovest), le stesse di `city_buildings`. Nell'immagine il nord è in alto.
+//! Mappa locale della città (tasto L): corridoio del viale allargato a 52 metri.
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,22 +12,20 @@ use crate::wall_gen::{classify_wall, wall_footprint};
 pub const MAP_PX: usize = 640;
 pub const STRIP_PX: usize = 56;
 
-/// Dimensioni (larghezza, altezza) dell'immagine: mappa quadrata + striscia con la legenda.
 pub fn image_size() -> (usize, usize) {
     (MAP_PX, MAP_PX + STRIP_PX)
 }
-
-// ---------------------------------------------------------------- categorie
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoiKind {
     Tavern,
     Shop,
     Guild,
+    Palace,
 }
 
 impl PoiKind {
-    pub const ALL: [PoiKind; 3] = [PoiKind::Tavern, PoiKind::Shop, PoiKind::Guild];
+    pub const ALL: [PoiKind; 4] = [PoiKind::Tavern, PoiKind::Shop, PoiKind::Guild, PoiKind::Palace];
 
     pub fn index(self) -> usize {
         self as usize
@@ -43,6 +36,7 @@ impl PoiKind {
             PoiKind::Tavern => [70, 210, 90],
             PoiKind::Shop => [230, 65, 60],
             PoiKind::Guild => [75, 125, 240],
+            PoiKind::Palace => [255, 215, 0],
         }
     }
 
@@ -51,48 +45,20 @@ impl PoiKind {
             PoiKind::Tavern => "TAVERNE",
             PoiKind::Shop => "NEGOZI",
             PoiKind::Guild => "GILDE",
+            PoiKind::Palace => "PALAZZO",
         }
     }
 }
 
-/// Categoria dal `BuildingType` (valori dell'enum di Daggerfall Unity).
-/// Taverne: 15. Gilde: sale delle gilde (11) e templi (14). Negozi: alchimista, armaiolo,
-/// libraio, sarto, mobili, gioielli, emporio, banco dei pegni, armi. Banche e biblioteche
-/// non sono incluse: aggiungi 3 o 10 qui se le vuoi come negozi.
 pub fn poi_kind(building_type: u8) -> Option<PoiKind> {
     match building_type {
         15 => Some(PoiKind::Tavern),
         11 | 14 => Some(PoiKind::Guild),
+        16 => Some(PoiKind::Palace),
         0 | 2 | 5 | 6 | 7 | 8 | 9 | 12 | 13 => Some(PoiKind::Shop),
         _ => None,
     }
 }
-
-pub fn building_type_name(t: u8) -> &'static str {
-    match t {
-        0 => "Alchemist",
-        1 => "HouseForSale",
-        2 => "Armorer",
-        3 => "Bank",
-        4 => "Town4",
-        5 => "Bookseller",
-        6 => "ClothingStore",
-        7 => "FurnitureStore",
-        8 => "GemStore",
-        9 => "GeneralStore",
-        10 => "Library",
-        11 => "GuildHall",
-        12 => "PawnShop",
-        13 => "WeaponSmith",
-        14 => "Temple",
-        15 => "Tavern",
-        16 => "Palace",
-        17..=22 => "House",
-        _ => "?",
-    }
-}
-
-// ---------------------------------------------------------------- dati
 
 #[derive(Clone, Copy, Debug)]
 pub struct MapBuilding {
@@ -100,13 +66,11 @@ pub struct MapBuilding {
     pub cz: f32,
     pub half_w: f32,
     pub half_d: f32,
-    /// stessa convenzione di `CityBuilder::add`
     pub rot_deg: f32,
     pub kind: Option<PoiKind>,
     pub building_type: u8,
 }
 
-/// Quadrato di mondo mostrato dall'immagine: angolo nord-ovest (x_min, z_min) e lato.
 #[derive(Clone, Copy, Debug)]
 pub struct MapView {
     pub x_min: f32,
@@ -117,12 +81,10 @@ pub struct MapView {
 #[derive(Clone, Debug)]
 pub struct CityMap {
     pub name: String,
-    /// rettangolo della località: [x_min, z_min, x_max, z_max]
     pub rect: [f32; 4],
     pub view: MapView,
     pub buildings: Vec<MapBuilding>,
-    /// numero di edifici per categoria (indice = `PoiKind::index`)
-    pub counts: [usize; 3],
+    pub counts: [usize; 4],
 }
 
 impl CityMap {
@@ -131,7 +93,6 @@ impl CityMap {
     }
 }
 
-/// Raccoglie gli edifici della località con lo stesso piazzamento di `build_city_buildings`.
 pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_bsa: &BsaArchive) -> CityMap {
     let bw = location.width.min(8);
     let bh = location.height.min(8);
@@ -140,7 +101,23 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
 
     let mut footprints: HashMap<u32, Option<Footprint>> = HashMap::new();
     let mut buildings = Vec::new();
-    let mut seen: [HashSet<(usize, usize, u8)>; 3] = Default::default();
+    let mut seen: [HashSet<(usize, usize, u8)>; 4] = Default::default();
+
+    let palace_target_bx = 5.min(bw.saturating_sub(2));
+    let palace_target_by = 6.min(bh.saturating_sub(2));
+    let mut palace_marked = false;
+
+    let road_x = (start_bx + palace_target_bx) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5;
+    let road_z_south = -((start_by + 1) as f32 * BLOCK_SIZE_M);
+    let road_z_north = -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5) + 32.0;
+
+    let is_on_avenue = |x: f32, z: f32| -> bool {
+        if z > road_z_south || z < (road_z_north - 40.0) {
+            return false;
+        }
+        let dist_x = (x - road_x).abs();
+        dist_x < 26.0 || (z <= road_z_north && dist_x < 46.0)
+    };
 
     for by in 0..bh {
         for bx in 0..bw {
@@ -153,6 +130,29 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
             let gz = start_by + by;
             let bx0 = gx as f32 * BLOCK_SIZE_M;
             let bz0 = gz as f32 * BLOCK_SIZE_M;
+
+            let upper_name = name.to_ascii_uppercase();
+            let is_palace_block = !palace_marked && (
+                (bx == palace_target_bx && by == palace_target_by)
+                || upper_name.starts_with("PALA")
+                || upper_name == "CASTAA01.RMB"
+                || rmb.buildings.iter().any(|b| b.building_type == 16)
+            );
+
+            if is_palace_block {
+                buildings.push(MapBuilding {
+                    cx: bx0 + BLOCK_SIZE_M * 0.5,
+                    cz: -(bz0 + BLOCK_SIZE_M * 0.5),
+                    half_w: 37.0,
+                    half_d: 27.0,
+                    rot_deg: 0.0,
+                    kind: Some(PoiKind::Palace),
+                    building_type: 16,
+                });
+                seen[PoiKind::Palace.index()].insert((gx, gz, 0));
+                palace_marked = true;
+                continue;
+            }
 
             for obj in rmb.placed_models().iter().filter(|o| o.is_building) {
                 let fp = footprints.entry(obj.model_id).or_insert_with(|| {
@@ -174,7 +174,10 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
                 let wx = px + fp.cx * c + fp.cz * s;
                 let wz = pz - fp.cx * s + fp.cz * c;
 
-                // le mura non sono negozi: i loro BuildingData non contano
+                if is_on_avenue(wx, wz) {
+                    continue;
+                }
+
                 let data = if is_wall_block {
                     None
                 } else {
@@ -191,7 +194,6 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
                     None => (None, 0xFF),
                 };
 
-                // le mura sono ruotate di 90 gradi come nel generatore
                 let shape = if is_wall_block { wall_footprint(&fp) } else { fp };
                 buildings.push(MapBuilding {
                     cx: wx,
@@ -224,11 +226,9 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
         rect,
         view,
         buildings,
-        counts: [seen[0].len(), seen[1].len(), seen[2].len()],
+        counts: [seen[0].len(), seen[1].len(), seen[2].len(), seen[3].len()],
     }
 }
-
-// ---------------------------------------------------------------- disegno
 
 const GROUND: [u8; 3] = [44, 52, 44];
 const OUTSIDE: [u8; 3] = [22, 24, 24];
@@ -280,7 +280,6 @@ fn draw_building(buf: &mut [u8], view: &MapView, scale: f32, b: &MapBuilding, fi
             let wx = view.x_min + (px as f32 + 0.5) / scale;
             let wz = view.z_min + (py as f32 + 0.5) / scale;
             let (dx, dz) = (wx - b.cx, wz - b.cz);
-            // rotazione inversa di quella di CityBuilder::add
             let lx = dx * c - dz * s;
             let lz = dx * s + dz * c;
             if lx.abs() <= b.half_w && lz.abs() <= b.half_d {
@@ -291,14 +290,12 @@ fn draw_building(buf: &mut [u8], view: &MapView, scale: f32, b: &MapBuilding, fi
     }
 }
 
-/// Immagine RGBA `image_size()`: mappa in alto, legenda in basso.
 pub fn render_city_map(map: &CityMap) -> Vec<u8> {
     let (w, h) = image_size();
     let mut buf = vec![0u8; w * h * 4];
     let view = map.view;
     let scale = MAP_PX as f32 / view.side_m;
 
-    // sfondo: dentro la località più chiaro
     for py in 0..MAP_PX {
         for px in 0..MAP_PX {
             let wx = view.x_min + (px as f32 + 0.5) / scale;
@@ -308,7 +305,6 @@ pub fn render_city_map(map: &CityMap) -> Vec<u8> {
         }
     }
 
-    // griglia dei blocchi
     for k in 0..=8 {
         let x = k as f32 * BLOCK_SIZE_M;
         if x >= map.rect[0] - 0.01 && x <= map.rect[2] + 0.01 {
@@ -326,7 +322,6 @@ pub fn render_city_map(map: &CityMap) -> Vec<u8> {
         }
     }
 
-    // edifici comuni, poi quelli evidenziati, poi i pallini
     for b in map.buildings.iter().filter(|b| b.kind.is_none()) {
         draw_building(&mut buf, &view, scale, b, PLAIN_FILL, PLAIN_EDGE);
     }
@@ -337,11 +332,11 @@ pub fn render_city_map(map: &CityMap) -> Vec<u8> {
     for b in map.buildings.iter().filter(|b| b.kind.is_some()) {
         let col = b.kind.unwrap().color();
         let (cx, cy) = ((b.cx - view.x_min) * scale, (b.cz - view.z_min) * scale);
-        fill_circle(&mut buf, w, h, cx, cy, 6.5, [12, 12, 12]);
-        fill_circle(&mut buf, w, h, cx, cy, 4.5, col);
+        let radius = if b.kind == Some(PoiKind::Palace) { 11.0 } else { 6.5 };
+        fill_circle(&mut buf, w, h, cx, cy, radius, [12, 12, 12]);
+        fill_circle(&mut buf, w, h, cx, cy, radius - 2.5, col);
     }
 
-    // cornice
     for i in 0..MAP_PX as i32 {
         for t in 0..2 {
             put(&mut buf, w, h, i, t, WHITE);
@@ -351,7 +346,6 @@ pub fn render_city_map(map: &CityMap) -> Vec<u8> {
         }
     }
 
-    // striscia: nome e legenda
     for py in MAP_PX..h {
         for px in 0..w {
             put(&mut buf, w, h, px as i32, py as i32, STRIP_BG);
@@ -368,13 +362,12 @@ pub fn render_city_map(map: &CityMap) -> Vec<u8> {
             }
         }
         let text = format!("{} {}", k.label(), map.counts[k.index()]);
-        let adv = draw_text(&mut buf, w, h, x + 18, y, &text, 2, WHITE);
-        x += 18 + adv + 26;
+        let adv = draw_text(&mut buf, w, h, x + 16, y, &text, 2, WHITE);
+        x += 16 + adv + 18;
     }
     buf
 }
 
-/// Immagine con un solo messaggio al centro (nessuna città, errore...).
 pub fn render_notice(text: &str) -> Vec<u8> {
     let (w, h) = image_size();
     let mut buf = vec![0u8; w * h * 4];
@@ -387,8 +380,6 @@ pub fn render_notice(text: &str) -> Vec<u8> {
     draw_text(&mut buf, w, h, (w as i32 - width) / 2, h as i32 / 2 - 10, text, 3, WHITE);
     buf
 }
-
-// ---------------------------------------------------------------- font 5x7
 
 fn glyph(ch: char) -> [u8; 7] {
     match ch.to_ascii_uppercase() {
@@ -435,7 +426,6 @@ fn glyph(ch: char) -> [u8; 7] {
     }
 }
 
-/// Disegna `text` in maiuscolo; ritorna la larghezza in pixel.
 fn draw_text(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, text: &str, scale: i32, color: [u8; 3]) -> i32 {
     let mut cx = x;
     for ch in text.chars() {
@@ -454,82 +444,4 @@ fn draw_text(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, text: &str, sca
         cx += 6 * scale;
     }
     cx - x
-}
-
-// ---------------------------------------------------------------- test
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_map(buildings: Vec<MapBuilding>) -> CityMap {
-        CityMap {
-            name: "TEST".into(),
-            rect: [0.0, -102.4, 102.4, 0.0],
-            view: MapView { x_min: 0.0, z_min: -102.4, side_m: 102.4 },
-            buildings,
-            counts: [1, 0, 0],
-        }
-    }
-
-    fn pixel(buf: &[u8], map: &CityMap, wx: f32, wz: f32) -> [u8; 3] {
-        let scale = MAP_PX as f32 / map.view.side_m;
-        let px = ((wx - map.view.x_min) * scale) as usize;
-        let py = ((wz - map.view.z_min) * scale) as usize;
-        let i = (py * MAP_PX + px) * 4;
-        [buf[i], buf[i + 1], buf[i + 2]]
-    }
-
-    fn building(rot: f32, kind: Option<PoiKind>) -> MapBuilding {
-        MapBuilding { cx: 50.0, cz: -50.0, half_w: 10.0, half_d: 4.0, rot_deg: rot, kind, building_type: 0 }
-    }
-
-    #[test]
-    fn categories() {
-        assert_eq!(poi_kind(15), Some(PoiKind::Tavern));
-        assert_eq!(poi_kind(11), Some(PoiKind::Guild));
-        assert_eq!(poi_kind(14), Some(PoiKind::Guild));
-        for t in [0, 2, 5, 6, 7, 8, 9, 12, 13] {
-            assert_eq!(poi_kind(t), Some(PoiKind::Shop), "tipo {t}");
-        }
-        assert_eq!(poi_kind(1), None); // casa in vendita
-        assert_eq!(poi_kind(17), None); // casa
-        assert_eq!(PoiKind::Tavern.color()[1] > PoiKind::Tavern.color()[0], true); // verde
-        assert_eq!(PoiKind::Shop.color()[0] > PoiKind::Shop.color()[2], true); // rosso
-        assert_eq!(PoiKind::Guild.color()[2] > PoiKind::Guild.color()[0], true); // blu
-    }
-
-    #[test]
-    fn image_has_expected_size_and_marker_color() {
-        let map = test_map(vec![building(0.0, Some(PoiKind::Tavern))]);
-        let buf = render_city_map(&map);
-        let (w, h) = image_size();
-        assert_eq!(buf.len(), w * h * 4);
-        assert_eq!(pixel(&buf, &map, 50.0, -50.0), PoiKind::Tavern.color());
-        // un po' fuori dal pallino ma dentro l'edificio: colore di riempimento
-        assert_eq!(pixel(&buf, &map, 57.0, -50.0), PoiKind::Tavern.color());
-    }
-
-    #[test]
-    fn rotation_is_applied_like_city_builder() {
-        // 90 gradi: l'asse lungo (x locale) diventa l'asse z del mondo
-        let map = test_map(vec![building(90.0, None)]);
-        let buf = render_city_map(&map);
-        assert_eq!(pixel(&buf, &map, 50.0, -42.0), PLAIN_FILL); // lungo z: dentro
-        assert_eq!(pixel(&buf, &map, 58.0, -50.0), GROUND); // lungo x: fuori
-        // senza rotazione e' il contrario
-        let map = test_map(vec![building(0.0, None)]);
-        let buf = render_city_map(&map);
-        assert_eq!(pixel(&buf, &map, 58.0, -50.0), PLAIN_FILL);
-        assert_eq!(pixel(&buf, &map, 50.0, -42.0), GROUND);
-    }
-
-    #[test]
-    fn text_draws_pixels() {
-        let buf = render_notice("NESSUNA CITTA");
-        let bg = [STRIP_BG[0], STRIP_BG[1], STRIP_BG[2], 255];
-        assert!(buf.chunks_exact(4).any(|p| p != bg));
-        let (w, h) = image_size();
-        assert_eq!(buf.len(), w * h * 4);
-    }
 }

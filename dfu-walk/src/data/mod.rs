@@ -1,5 +1,6 @@
 //! Lettori dei formati di dati di Daggerfall, portati da Daggerfall Unity (MIT).
 //! Vedi il file NOTICE per l'attribuzione.
+pub mod palace_gen;
 pub mod wall_gen;
 pub mod building_gen;
 pub mod city_buildings;

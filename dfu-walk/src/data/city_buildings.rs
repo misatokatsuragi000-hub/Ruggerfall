@@ -1,4 +1,4 @@
-//! Assembla tutti gli edifici procedurali e mura allineando l'asse Nord-Sud alle strade.
+//! Assembla gli edifici con corridoio della Grande Strada Reale allargato a 52 metri.
 
 use std::collections::HashMap;
 
@@ -9,6 +9,7 @@ use crate::building_gen::{
     choose_front_side, generate_building, seed_for, CityBuilder, Footprint, BLOCK_SIZE_M, DF_UNIT,
 };
 use crate::maps::DFLocation;
+use crate::palace_gen::generate_royal_palace;
 use crate::wall_gen::{classify_wall, generate_wall, wall_footprint, WallKind};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -34,6 +35,23 @@ pub fn build_city_buildings(
     let start_by = (8 - bh) / 2;
 
     let mut model_cache: HashMap<u32, Option<(Footprint, BuildingTextures)>> = HashMap::new();
+    let mut palace_spawned = false;
+
+    let palace_target_bx = 5.min(bw.saturating_sub(2));
+    let palace_target_by = 6.min(bh.saturating_sub(2));
+
+    let road_x = (start_bx + palace_target_bx) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5;
+    let road_z_south = -((start_by + 1) as f32 * BLOCK_SIZE_M);
+    let road_z_north = -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5) + 32.0;
+
+    // Fascia di rispetto allargata: 26 metri per lato (52m totali) e 46m davanti al palazzo
+    let is_on_avenue = |x: f32, z: f32| -> bool {
+        if z > road_z_south || z < (road_z_north - 40.0) {
+            return false;
+        }
+        let dist_x = (x - road_x).abs();
+        dist_x < 26.0 || (z <= road_z_north && dist_x < 46.0)
+    };
 
     for by in 0..bh {
         for bx in 0..bw {
@@ -41,15 +59,32 @@ pub fn build_city_buildings(
             let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
             let Ok(rmb) = RmbBlock::parse(raw) else { continue };
 
-            // In Daggerfall la riga by=0 è il Nord della città (blocco WALLAA02/03),
-            // la riga bh-1 è il Sud (WALLAA00/01). L'inversione r = bh - 1 - by
-            // allinea edifici e strade alle rispettive quote Z del terreno.
             let gx = start_bx + bx;
             let gz = start_by + by;
             let bx0 = gx as f32 * BLOCK_SIZE_M;
             let bz0 = gz as f32 * BLOCK_SIZE_M;
             let bounds = [bx0, -(bz0 + BLOCK_SIZE_M), bx0 + BLOCK_SIZE_M, -bz0];
             let is_wall_block = name.to_ascii_uppercase().starts_with("WALL");
+
+            let upper_name = name.to_ascii_uppercase();
+            let is_palace_block = !palace_spawned && (
+                (bx == palace_target_bx && by == palace_target_by)
+                || upper_name.starts_with("PALA")
+                || upper_name == "CASTAA01.RMB"
+                || rmb.buildings.iter().any(|b| b.building_type == 16)
+            );
+
+            if is_palace_block {
+                let center_x = bx0 + BLOCK_SIZE_M * 0.5;
+                let center_z = -(bz0 + BLOCK_SIZE_M * 0.5);
+                let gy = ground_height(center_x, center_z);
+
+                let palace_mesh = generate_royal_palace(None, None);
+                builder.add(&palace_mesh, [0.0, 0.0, 0.0], 0.0, [center_x, gy, center_z]);
+                stats.built += 1;
+                palace_spawned = true;
+                continue;
+            }
 
             for pm in rmb.placed_models() {
                 stats.objects += 1;
@@ -72,7 +107,6 @@ pub fn build_city_buildings(
                 let pz = -(bz0 + pm.n * DF_UNIT);
                 let rot = pm.rotation_deg;
 
-                // 1. Mura, archi di porta e torri
                 if is_wall_block {
                     let wfp = wall_footprint(&fp);
                     let maybe_wkind = if pm.model_id == 446 {
@@ -98,7 +132,6 @@ pub fn build_city_buildings(
                     }
                 }
 
-                // 2. Case, botteghe, gilde, taverne
                 let Some(kind) = fp.classify() else {
                     let wfp = wall_footprint(&fp);
                     let maybe_wkind = if pm.model_id == 446 {
@@ -129,6 +162,11 @@ pub fn build_city_buildings(
                 let (s, c) = rot.to_radians().sin_cos();
                 let wx = px + fp.cx * c + fp.cz * s;
                 let wz = pz - fp.cx * s + fp.cz * c;
+
+                if is_on_avenue(wx, wz) {
+                    stats.skipped += 1;
+                    continue;
+                }
 
                 let front = choose_front_side(
                     [wx, wz],

@@ -210,6 +210,7 @@ pub fn spawn_trees_for_chunk(
     images: &mut Assets<Image>,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    city_rect: Option<daggerfall_data::terrain_city::CityTileRect>,
 ) {
     if climate == 223 {
         return;
@@ -229,6 +230,14 @@ pub fn spawn_trees_for_chunk(
         for _ in 0..count {
             let gx = rng.gen_f32(2.0, 126.0);
             let gy = rng.gen_f32(2.0, 126.0);
+            // niente alberi dentro la città (con un margine di una cella e mezza)
+            if let Some(r) = city_rect {
+                let m = 1.5;
+                if gx >= r.min_x as f32 - m && gx <= r.max_x as f32 + m && gy >= r.min_y as f32 - m && gy <= r.max_y as f32 + m {
+                    continue;
+                }
+            }
+
             let y = terrain_height(samples, gx, gy);
 
             if y <= (27.0 * TERRAIN_HEIGHT_SCALE) {

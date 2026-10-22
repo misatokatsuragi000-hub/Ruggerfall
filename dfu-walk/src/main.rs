@@ -1,6 +1,7 @@
 //! Terreno percorribile di Daggerfall con supporto per shader WGSL,
-//! mod HD di D.R.E.A.M., mappa interattiva (tasto M) e vegetazione 3D procedurale.
-
+//! mod HD di D.R.E.A.M., mappa interattiva (tasto M), vegetazione 3D e città/villaggi.
+mod wall_textures;
+mod local_map;
 mod map;
 mod mod_textures;
 mod player;
@@ -13,10 +14,13 @@ mod world;
 use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use daggerfall_data::bsa::BsaArchive;
+use daggerfall_data::maps::MapsReader;
 use daggerfall_data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
 use daggerfall_data::{find_file_ci, generate_default_samples, PakFile, Palette, WoodsFile};
 use mod_textures::ModTexturesPlugin;
 use player::{Player, EYE_HEIGHT};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use terrain_material::TerrainMaterial;
@@ -50,8 +54,8 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 
 fn next_value<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>, what: &str) -> T {
     it.next()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| fail(format!("{what} vuole un numero\n{USAGE}")))
+    .and_then(|v| v.parse().ok())
+    .unwrap_or_else(|| fail(format!("{what} vuole un numero\n{USAGE}")))
 }
 
 fn parse_args() -> Args {
@@ -98,12 +102,50 @@ fn parse_args() -> Args {
 
 fn load_data(args: &Args) -> GameData {
     let open = |name: &str| find_file_ci(&args.dir, name).unwrap_or_else(|| fail(format!("{name} non trovato in {}", args.dir.display())));
+
+    let read_file = |name: &str| {
+        let p = open(name);
+        std::fs::read(&p).unwrap_or_else(|e| fail(format!("impossibile leggere {}: {e}", p.display())))
+    };
+
+    let maps_buf = Arc::new(read_file("MAPS.BSA"));
+    let blocks_buf = Arc::new(read_file("BLOCKS.BSA"));
+    let arch3d_buf = Arc::new(read_file("ARCH3D.BSA"));
+
+    let maps_bsa = BsaArchive::parse(&maps_buf).unwrap_or_else(|e| fail(e));
+    let maps_reader = MapsReader::new(&maps_bsa);
+    let mut locations = HashMap::new();
+
+    // Caricamento sicuro di tutte le città e villaggi
+    for region in 0..62 {
+        let name_file = format!("MAPNAMES.{:03}", region);
+        if let Some(names_raw) = maps_bsa.get_by_name(&name_file) {
+            if names_raw.len() < 4 {
+                continue;
+            }
+            let count = u32::from_le_bytes(names_raw[0..4].try_into().unwrap_or_default()) as usize;
+            for i in 0..count {
+                if let Some(loc) = maps_reader.get_location(region, i) {
+                    let mx = (loc.world_x / 32768) as i32;
+                    // Inversione asse Y: in Daggerfall Y=0 è a sud, in Bevy e nelle mappe la riga 0 è a nord
+                    let my = (MAP_HEIGHT_PIXELS - 1) - ((loc.world_y / 32768) as i32);
+                    locations.insert((mx, my), loc);
+                }
+            }
+        }
+    }
+    println!("Caricate {} località (città e villaggi) dalla mappa.", locations.len());
+
     GameData {
         dir: args.dir.clone(),
         woods: Arc::new(WoodsFile::open(open("WOODS.WLD")).unwrap_or_else(|e| fail(e))),
         climate: Arc::new(PakFile::open(open("CLIMATE.PAK")).unwrap_or_else(|e| fail(e))),
         palette: Arc::new(Palette::open(open("ART_PAL.COL")).unwrap_or_else(|e| fail(e))),
         winter: args.winter,
+        maps_buf,
+        blocks_buf,
+        arch3d_buf,
+        locations: Arc::new(locations),
     }
 }
 
@@ -128,7 +170,15 @@ fn find_start(data: &GameData) -> (i32, i32) {
 fn main() {
     let args = parse_args();
     let data = load_data(&args);
-    let (mx, my) = args.pixel.unwrap_or_else(|| find_start(&data));
+    // Capitale Daggerfall: map_x = 207, map_y = 499 - 286 = 213
+    let (mx, my) = args.pixel.unwrap_or_else(|| {
+        if data.locations.contains_key(&(207, 213)) {
+            (207, 213)
+        } else {
+            find_start(&data)
+        }
+    });
+
     if !in_map(mx, my) {
         fail(format!("il map pixel ({mx}, {my}) è fuori dalla mappa (0..999, 0..499)"));
     }
@@ -139,53 +189,57 @@ fn main() {
     println!("         Spazio = salta, F = volo (Spazio/Ctrl su e giù), Maiusc in volo = velocissimo.");
     println!("         T = ferma/riprendi il tempo, , e . = un'ora indietro/avanti.");
     println!("         M = apri/chiudi mappa dell'Iliac Bay.");
+    println!("         L = mappa locale della città (taverne verdi, negozi rossi, gilde blu).");
 
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Daggerfall - terreno".into(),
-                resolution: (1280.0_f32, 720.0_f32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
-        .add_plugins(ModTexturesPlugin {
-            dir: args.mods_dir.clone(),
-            nearest_filter: false,
-        })
-        .insert_resource(ClearColor(SKY))
-        .insert_resource(AmbientLight {
-            color: Color::srgb(0.85, 0.9, 1.0),
-            brightness: 450.0,
-        })
-        .insert_resource(data)
-        .insert_resource(HeightField::default())
-        .insert_resource(StartInfo { mx, my })
-        .insert_resource(RadiusSetting(args.radius))
-        .insert_resource(NaturePool::default())
-        .insert_resource(sky::SkyConfig {
-            hour: args.hour,
-            day_minutes: args.day_minutes,
-        })
-        .add_systems(Startup, (setup, sky::setup_sky, map::setup_map_ui).chain())
-        .add_systems(
-            Update,
-            (
-                player::grab_cursor,
-                player::player_look,
-                player::player_move,
-                rebase_origin,
-                stream_tiles,
-                collect_tiles,
-                sky::update_sky,
-                map::toggle_map,
-                map::update_map_marker,
-                update_title,
-            )
-                .chain(),
+    .add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "Daggerfall - terreno e città".into(),
+                             resolution: (1280.0_f32, 720.0_f32).into(),
+                             ..default()
+        }),
+        ..default()
+    }))
+    .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
+    .add_plugins(ModTexturesPlugin {
+        dir: args.mods_dir.clone(),
+                 nearest_filter: false,
+    })
+    .insert_resource(ClearColor(SKY))
+    .insert_resource(AmbientLight {
+        color: Color::srgb(0.85, 0.9, 1.0),
+                     brightness: 450.0,
+    })
+    .insert_resource(data)
+    .insert_resource(HeightField::default())
+    .insert_resource(StartInfo { mx, my })
+    .insert_resource(RadiusSetting(args.radius))
+    .insert_resource(NaturePool::default())
+    .insert_resource(wall_textures::WallTextures::default())
+    .insert_resource(sky::SkyConfig {
+        hour: args.hour,
+        day_minutes: args.day_minutes,
+    })
+    .add_systems(Startup, (setup, sky::setup_sky, map::setup_map_ui, local_map::setup_local_map).chain())
+    .add_systems(
+        Update,
+        (
+            player::grab_cursor,
+         player::player_look,
+         player::player_move,
+         rebase_origin,
+         stream_tiles,
+         collect_tiles,
+         sky::update_sky,
+         map::toggle_map,
+         map::update_map_marker,
+         local_map::toggle_local_map,
+         local_map::update_local_map,
+         update_title,
         )
-        .run();
+        .chain(),
+    )
+    .run();
 }
 
 #[derive(Resource)]
@@ -211,22 +265,22 @@ fn setup(
     let reach = (radius.0 as f32 + 0.3) * MAP_PIXEL_SIZE;
     commands.spawn((
         Camera3d::default(),
-        Projection::Perspective(PerspectiveProjection {
-            fov: 70.0_f32.to_radians(),
-            near: 0.3,
-            far: 60_000.0,
-            ..default()
-        }),
-        DistanceFog {
-            color: SKY,
-            falloff: FogFalloff::Linear {
-                start: reach * 0.5,
-                end: reach,
-            },
-            ..default()
-        },
-        Transform::from_xyz(MAP_PIXEL_SIZE / 2.0, ground + EYE_HEIGHT, -MAP_PIXEL_SIZE / 2.0),
-        Player::new(ground),
+                    Projection::Perspective(PerspectiveProjection {
+                        fov: 70.0_f32.to_radians(),
+                                            near: 0.3,
+                                            far: 60_000.0,
+                                            ..default()
+                    }),
+                    DistanceFog {
+                        color: SKY,
+                        falloff: FogFalloff::Linear {
+                            start: reach * 0.5,
+                            end: reach,
+                        },
+                        ..default()
+                    },
+                    Transform::from_xyz(MAP_PIXEL_SIZE / 2.0, ground + EYE_HEIGHT, -MAP_PIXEL_SIZE / 2.0),
+                    Player::new(ground),
     ));
 
     let _ = CELL_SIZE;
@@ -239,8 +293,8 @@ fn update_title(
     data: Res<GameData>,
     clock: Res<sky::SkyClock>,
     player: Query<(&Player, &Transform)>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
-    mut state: Local<(f32, f32)>,
+                mut windows: Query<&mut Window, With<PrimaryWindow>>,
+                mut state: Local<(f32, f32)>,
 ) {
     state.0 += time.delta_secs();
     state.1 = state.1 * 0.9 + time.delta_secs() * 0.1;
@@ -252,12 +306,12 @@ fn update_title(
     let (mx, my) = map_pixel_of(&origin, tf.translation);
     let fps = if state.1 > 0.0 { 1.0 / state.1 } else { 0.0 };
     window.title = format!(
-        "Daggerfall - map pixel ({mx}, {my}) clima {} - quota {:.0} m - ore {:02}:{:02} - {}{} tile - {fps:.0} fps [M: mappa]",
-        climate_of(&data, mx, my),
-        p.feet_y,
-        clock.hours.floor() as i32,
-        ((clock.hours.fract()) * 60.0) as i32,
-        if p.fly { "volo - " } else { "" },
-        streaming.loaded_count(),
+        "Daggerfall - map pixel ({mx}, {my}) clima {} - quota {:.0} m - ore {:02}:{:02} - {}{} tile - {fps:.0} fps [M: mappa, L: mappa locale]",
+                           climate_of(&data, mx, my),
+                           p.feet_y,
+                           clock.hours.floor() as i32,
+                           ((clock.hours.fract()) * 60.0) as i32,
+                           if p.fly { "volo - " } else { "" },
+                               streaming.loaded_count(),
     );
 }

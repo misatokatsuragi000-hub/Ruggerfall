@@ -5,6 +5,7 @@
 //! centinaia di chilometri dal punto di partenza (precisione degli f32).
 
 use bevy::prelude::*;
+use daggerfall_data::maps::DFLocation;
 use daggerfall_data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
 use daggerfall_data::{HeightSamples, PakFile, Palette, WoodsFile};
 use std::collections::HashMap;
@@ -24,6 +25,11 @@ pub struct GameData {
     pub climate: Arc<PakFile>,
     pub palette: Arc<Palette>,
     pub winter: bool,
+    // Buffer per città, blocchi RMB e modelli 3D
+    pub maps_buf: Arc<Vec<u8>>,
+    pub blocks_buf: Arc<Vec<u8>>,
+    pub arch3d_buf: Arc<Vec<u8>>,
+    pub locations: Arc<HashMap<(i32, i32), DFLocation>>,
 }
 
 /// Origine mobile, in map pixel: `east` = colonna del map pixel, `north` = 500 - riga.
@@ -47,7 +53,7 @@ pub fn in_map(mx: i32, my: i32) -> bool {
 pub fn absolute(origin: &Origin, pos: Vec3) -> (f64, f64) {
     (
         pos.x as f64 + origin.east as f64 * S,
-        -(pos.z as f64) + origin.north as f64 * S,
+     -(pos.z as f64) + origin.north as f64 * S,
     )
 }
 
@@ -61,8 +67,8 @@ pub fn map_pixel_of(origin: &Origin, pos: Vec3) -> (i32, i32) {
 pub fn tile_translation(origin: &Origin, mx: i32, my: i32) -> Vec3 {
     Vec3::new(
         (mx - origin.east) as f32 * MAP_PIXEL_SIZE,
-        0.0,
-        -(((MAP_HEIGHT_PIXELS - my) - origin.north) as f32) * MAP_PIXEL_SIZE,
+              0.0,
+              -(((MAP_HEIGHT_PIXELS - my) - origin.north) as f32) * MAP_PIXEL_SIZE,
     )
 }
 

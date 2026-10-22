@@ -1,5 +1,5 @@
 //! Mappa del mondo fedele di Daggerfall (1000x500 pixel), basata sulle tabelle
-//! ufficiali di CLIMATE.PAK e WOODS.WLD.
+//! ufficiali di CLIMATE.PAK, WOODS.WLD e le città/villaggi da MAPS.BSA.
 
 use crate::player::Player;
 use crate::world::*;
@@ -9,20 +9,19 @@ use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 const MAP_WIDTH: f32 = 1.30;
-const MAP_HEIGHT: f32 = 0.65; // Proporzione 2:1 esatta (1000x500 map pixel)
+const MAP_HEIGHT: f32 = 0.65;
 
-// I colori ufficiali dei 10 climi da dump_world.rs
 const CLIMATE_COLORS: [(i32, [u8; 3]); 10] = [
-    (223, [20, 45, 120]),   // Oceano (unico specchio d'acqua)
-    (224, [230, 200, 120]), // Deserto
-    (225, [210, 170, 90]),  // Deserto 2
-    (226, [140, 140, 140]), // Montagna
-    (227, [0, 120, 40]),    // Foresta pluviale
-    (228, [90, 110, 60]),   // Palude
-    (229, [200, 190, 60]),  // Sub-tropicale
-    (230, [80, 120, 100]),  // Boschi di montagna
-    (231, [60, 160, 60]),   // Boschi temperati
-    (232, [120, 60, 140]),  // Boschi infestati (Haunted woodlands)
+    (223, [20, 45, 120]),
+    (224, [230, 200, 120]),
+    (225, [210, 170, 90]),
+    (226, [140, 140, 140]),
+    (227, [0, 120, 40]),
+    (228, [90, 110, 60]),
+    (229, [200, 190, 60]),
+    (230, [80, 120, 100]),
+    (231, [60, 160, 60]),
+    (232, [120, 60, 140]),
 ];
 
 #[derive(Component)]
@@ -36,27 +35,10 @@ pub struct MapState {
     pub is_open: bool,
 }
 
-pub fn climate_name(climate: i32) -> &'static str {
-    match climate {
-        223 => "Oceano",
-        224 => "Deserto",
-        225 => "Deserto roccioso",
-        226 => "Montagna",
-        227 => "Foresta pluviale",
-        228 => "Palude",
-        229 => "Subtropicale",
-        230 => "Boschi di montagna",
-        231 => "Boschi temperati",
-        232 => "Boschi infestati",
-        _ => "Sconosciuto",
-    }
-}
-
-/// Genera la texture della mappa rispettando fedelmente CLIMATE.PAK e WOODS.WLD.
 pub fn generate_world_map_texture(data: &GameData) -> Image {
-    let w = MAP_WIDTH_PIXELS as usize; // 1000
-    let h = MAP_HEIGHT_PIXELS as usize; // 500
-    let mut pixels = Vec::with_capacity(w * h * 4);
+    let w = MAP_WIDTH_PIXELS as usize;
+    let h = MAP_HEIGHT_PIXELS as usize;
+    let mut pixels = vec![0u8; w * h * 4];
 
     for y in 0..h {
         for x in 0..w {
@@ -65,11 +47,10 @@ pub fn generate_world_map_texture(data: &GameData) -> Image {
 
             let base_rgb = match CLIMATE_COLORS.iter().find(|(c, _)| *c == climate) {
                 Some((_, rgb)) => *rgb,
-                None => [20, 45, 120], // Default oceano se non valido
+                None => [20, 45, 120],
             };
 
             let color: [u8; 4] = if climate == 223 {
-                // Oceano: leggero gradiente in base alla profondità senza mai confonderlo con la terra
                 let depth = (height as f32 / 30.0).clamp(0.0, 1.0);
                 [
                     (base_rgb[0] as f32 * (0.8 + depth * 0.2)) as u8,
@@ -78,7 +59,6 @@ pub fn generate_world_map_texture(data: &GameData) -> Image {
                     255,
                 ]
             } else {
-                // Terraferma: colore del clima modulato dalla quota per evidenziare rilievi e valli
                 let relief = (height as f32 / 120.0).clamp(0.0, 0.5);
                 let shade = 0.85 + relief;
                 [
@@ -89,7 +69,31 @@ pub fn generate_world_map_texture(data: &GameData) -> Image {
                 ]
             };
 
-            pixels.extend_from_slice(&color);
+            let idx = (y * w + x) * 4;
+            pixels[idx..idx + 4].copy_from_slice(&color);
+        }
+    }
+
+    // Punti bianchi per tutte le città e villaggi
+    for (&(mx, my), loc) in data.locations.iter() {
+        if mx < 0 || mx >= w as i32 || my < 0 || my >= h as i32 {
+            continue;
+        }
+
+        let cx = mx as usize;
+        let cy = my as usize;
+        let radius = if loc.width >= 4 { 1isize } else { 0isize };
+
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let px = cx as isize + dx;
+                let py = cy as isize + dy;
+
+                if px >= 0 && px < w as isize && py >= 0 && py < h as isize {
+                    let p_idx = (py as usize * w + px as usize) * 4;
+                    pixels[p_idx..p_idx + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
         }
     }
 
@@ -106,14 +110,13 @@ pub fn generate_world_map_texture(data: &GameData) -> Image {
     )
 }
 
-/// Freccia indicatore del giocatore (punta in alto).
 fn create_marker_arrow_mesh() -> Mesh {
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     let positions = vec![
-        [0.0, 0.024, 0.0],     // Punta
-        [-0.014, -0.016, 0.0], // Sinistra
-        [0.0, -0.008, 0.0],    // Rientranza
-        [0.014, -0.016, 0.0],  // Destra
+        [0.0, 0.024, 0.0],
+        [-0.014, -0.016, 0.0],
+        [0.0, -0.008, 0.0],
+        [0.014, -0.016, 0.0],
     ];
     let normals = vec![[0.0, 0.0, 1.0]; 4];
     let indices = vec![0, 1, 2, 0, 2, 3];
@@ -139,21 +142,20 @@ pub fn setup_map_ui(
 
     let map_material = materials.add(StandardMaterial {
         base_color_texture: Some(map_handle),
-        unlit: true,
-        ..default()
+                                     unlit: true,
+                                     ..default()
     });
 
     let frame_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.08, 0.06, 0.05),
-        unlit: true,
-        ..default()
+                                       unlit: true,
+                                       ..default()
     });
 
-    // Indicatore del giocatore: rosso vivace per contrastare con qualsiasi clima
     let marker_material = materials.add(StandardMaterial {
         base_color: Color::srgb(1.0, 0.1, 0.1),
-        unlit: true,
-        ..default()
+                                        unlit: true,
+                                        ..default()
     });
 
     let map_quad = meshes.add(Rectangle::new(MAP_WIDTH, MAP_HEIGHT));
@@ -162,28 +164,26 @@ pub fn setup_map_ui(
 
     commands.entity(player_entity).with_children(|parent| {
         parent
-            .spawn((
-                Mesh3d(frame_quad),
+        .spawn((
+            Mesh3d(frame_quad),
                 MeshMaterial3d(frame_material),
                 Transform::from_xyz(0.0, 0.0, -0.85),
                 Visibility::Hidden,
                 WorldMapUi,
-            ))
-            .with_children(|map_parent| {
-                // Mappa a colori
-                map_parent.spawn((
-                    Mesh3d(map_quad),
-                    MeshMaterial3d(map_material),
-                    Transform::from_xyz(0.0, 0.0, 0.001),
-                ));
-                // Freccia giocatore
-                map_parent.spawn((
-                    Mesh3d(marker_mesh),
-                    MeshMaterial3d(marker_material),
-                    Transform::from_xyz(0.0, 0.0, 0.003),
-                    MapMarker,
-                ));
-            });
+        ))
+        .with_children(|map_parent| {
+            map_parent.spawn((
+                Mesh3d(map_quad),
+                              MeshMaterial3d(map_material),
+                              Transform::from_xyz(0.0, 0.0, 0.001),
+            ));
+            map_parent.spawn((
+                Mesh3d(marker_mesh),
+                              MeshMaterial3d(marker_material),
+                              Transform::from_xyz(0.0, 0.0, 0.003),
+                              MapMarker,
+            ));
+        });
     });
 
     commands.insert_resource(MapState::default());
@@ -195,7 +195,7 @@ pub fn toggle_map(
     mut map_query: Query<&mut Visibility, With<WorldMapUi>>,
 ) {
     let toggle = keyboard.just_pressed(KeyCode::KeyM)
-        || (map_state.is_open && keyboard.just_pressed(KeyCode::Escape));
+    || (map_state.is_open && keyboard.just_pressed(KeyCode::Escape));
 
     if toggle {
         map_state.is_open = !map_state.is_open;
@@ -232,7 +232,6 @@ pub fn update_map_marker(
 
     let forward = player_tf.forward();
     let angle = forward.x.atan2(-forward.z);
-
     let pulse = 1.0 + 0.15 * (time.elapsed_secs() * 6.0).sin();
 
     marker_tf.translation.x = x;

@@ -1,4 +1,4 @@
-use crate::bsa::BsaArchive;
+use super::bsa::BsaArchive;
 
 const RMB_PREFIXES: [&str; 45] = [
     "TVRN", "GENR", "RESI", "WEAP", "ARMR", "ALCH", "BANK", "BOOK", "CLOT", "FURN",

@@ -1,7 +1,7 @@
 //! Palette a 256 colori (.PAL da 768 byte, .COL da 776 byte con header di 8).
 //! Porting di DFPalette.cs.
 
-use crate::error::{format_err, Result};
+use super::error::{format_err, Result};
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

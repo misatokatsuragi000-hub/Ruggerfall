@@ -4,8 +4,8 @@
 //! Le tile mantengono l'orientamento del file (riga 0 = in alto). I mipmap sono
 //! al massimo 4 livelli, così i bordi delle tile non si mescolano.
 
-use crate::palette::Palette;
-use crate::terrain::{TileArray, TILE_COUNT};
+use super::palette::Palette;
+use super::terrain::{TileArray, TILE_COUNT};
 
 pub const ATLAS_COLS: usize = 8;
 pub const ATLAS_ROWS: usize = 7;

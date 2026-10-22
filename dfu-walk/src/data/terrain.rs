@@ -6,8 +6,8 @@
 //! resta in indici R8 (stessa mappa di palette delle altre texture) e queste
 //! impostazioni di campionamento vanno decise lato renderer.
 
-use crate::error::{format_err, Result};
-use crate::texture::TextureFile;
+use super::error::{format_err, Result};
+use super::texture::TextureFile;
 
 pub const TILE_COUNT: usize = 56;
 

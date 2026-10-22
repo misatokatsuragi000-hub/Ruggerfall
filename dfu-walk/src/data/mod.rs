@@ -6,6 +6,7 @@ pub mod building_gen;
 pub mod city_buildings;
 pub mod city_map;
 pub mod terrain_city;
+pub mod interior;
 pub mod mesh_builder;
 pub mod maps;
 pub mod blocks;

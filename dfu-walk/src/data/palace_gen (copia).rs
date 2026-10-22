@@ -1,5 +1,5 @@
 //! Generatore procedurale del Palazzo Reale per Daggerfall con maschio circolare saldato al portale e fossato.
-use crate::building_gen::{BuildingMesh, MeshPart};
+use super::building_gen::{BuildingMesh, MeshPart};
 use std::f32::consts::PI;
 
 type V3 = [f32; 3];

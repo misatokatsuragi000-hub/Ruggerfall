@@ -1,6 +1,6 @@
 //! Cielo: cupola con colori che cambiano nel corso della giornata, sole, luna,
 //! stelle e uno strato di nuvole che scorre. Segue il giocatore, quindi non ha
-//! parallasse; la matematica sta in `daggerfall_data::sky`.
+//! parallasse; la matematica sta in `crate::data::sky`.
 
 use crate::player::Player;
 use crate::world::{absolute, Origin};
@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
-use daggerfall_data::sky::{
+use crate::data::sky::{
     cloud_grid, generate_cloud_texture, generate_stars, lighting, mip_chain_rgba, sky_color, sky_state, SkyState,
 };
 

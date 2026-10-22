@@ -11,9 +11,9 @@
 //! prefisso del nome. I dungeon stanno in tabelle da 20 byte nello stesso map
 //! pixel.
 
-use crate::bsa::BsaFile;
-use crate::error::{format_err, Result};
-use crate::reader::Cursor;
+use super::bsa::BsaFile;
+use super::error::{format_err, Result};
+use super::reader::Cursor;
 
 pub const MAP_PIXELS_WIDE: i32 = 1001;
 const CITY_RECORD_SIZE: usize = 174;

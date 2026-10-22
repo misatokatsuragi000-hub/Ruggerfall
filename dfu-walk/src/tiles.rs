@@ -12,12 +12,12 @@ use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
-use daggerfall_data::bsa::BsaArchive;
-use daggerfall_data::building_gen::{MaterialKind, MeshPart, MATERIAL_COUNT};
-use daggerfall_data::city_buildings::build_city_buildings;
-use daggerfall_data::terrain_city::{assemble_city_tilemap, flatten_terrain_heights, CityTileRect};
-use daggerfall_data::terrain_mesh::{build_terrain_mesh, terrain_height, TerrainMeshData, CELL_SIZE};
-use daggerfall_data::{
+use crate::data::bsa::BsaArchive;
+use crate::data::building_gen::{MaterialKind, MeshPart, MATERIAL_COUNT};
+use crate::data::city_buildings::build_city_buildings;
+use crate::data::terrain_city::{assemble_city_tilemap, flatten_terrain_heights, CityTileRect};
+use crate::data::terrain_mesh::{build_terrain_mesh, terrain_height, TerrainMeshData, CELL_SIZE};
+use crate::data::{
     encode_for_shader, generate_default_samples, generate_default_tilemap,
     ground_archive, HeightSamples,
 };
@@ -185,7 +185,7 @@ pub fn rebase_origin(
 ) {
     let Ok(mut pt) = player.get_single_mut() else { return };
     let (east, north) = absolute(&origin, pt.translation);
-    let side = daggerfall_data::terrain_mesh::MAP_PIXEL_SIZE as f64;
+    let side = crate::data::terrain_mesh::MAP_PIXEL_SIZE as f64;
     let (pe, pn) = ((east / side).floor() as i32, (north / side).floor() as i32);
     if (pe - origin.east).abs() < 2 && (pn - origin.north).abs() < 2 {
         return;
@@ -193,8 +193,8 @@ pub fn rebase_origin(
     let (de, dn) = (pe - origin.east, pn - origin.north);
     origin.east = pe;
     origin.north = pn;
-    pt.translation.x -= de as f32 * daggerfall_data::terrain_mesh::MAP_PIXEL_SIZE;
-    pt.translation.z += dn as f32 * daggerfall_data::terrain_mesh::MAP_PIXEL_SIZE;
+    pt.translation.x -= de as f32 * crate::data::terrain_mesh::MAP_PIXEL_SIZE;
+    pt.translation.z += dn as f32 * crate::data::terrain_mesh::MAP_PIXEL_SIZE;
     for (tile, mut tf) in &mut tiles {
         tf.translation = tile_translation(&origin, tile.mx, tile.my);
     }

@@ -1,6 +1,7 @@
 //! Terreno percorribile di Daggerfall con supporto per shader WGSL,
 //! mod HD di D.R.E.A.M., mappa interattiva (tasto M), vegetazione 3D e città/villaggi.
 mod wall_textures;
+mod data;
 mod interior;
 mod local_map;
 mod map;
@@ -15,10 +16,10 @@ mod world;
 use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use daggerfall_data::bsa::BsaArchive;
-use daggerfall_data::maps::MapsReader;
-use daggerfall_data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
-use daggerfall_data::{find_file_ci, generate_default_samples, PakFile, Palette, WoodsFile};
+use crate::data::bsa::BsaArchive;
+use crate::data::maps::MapsReader;
+use crate::data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
+use crate::data::{find_file_ci, generate_default_samples, PakFile, Palette, WoodsFile};
 use mod_textures::ModTexturesPlugin;
 use player::{Player, EYE_HEIGHT};
 use std::collections::HashMap;

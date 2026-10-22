@@ -8,8 +8,8 @@ use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerD
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use daggerfall_data::climate::{apply_climate, world_climate_settings, Season};
-use daggerfall_data::{archive_file_name, find_file_ci, TextureFile};
+use crate::data::climate::{apply_climate, world_climate_settings, Season};
+use crate::data::{archive_file_name, find_file_ci, TextureFile};
 use dfmod::{MapKind, TextureKey};
 use std::collections::HashMap;
 

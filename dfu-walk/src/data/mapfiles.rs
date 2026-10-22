@@ -15,9 +15,9 @@
 //! valido; questi file laterali restano la via più affidabile per ottenere le
 //! città del mondo base.
 
-use crate::error::{format_err, Result};
-use crate::places::SettlementKind;
-use crate::reader::Cursor;
+use super::error::{format_err, Result};
+use super::places::SettlementKind;
+use super::reader::Cursor;
 use std::path::Path;
 
 pub const MAP_PIXELS_WIDE: i32 = 1000;

@@ -2,15 +2,15 @@
 
 use std::collections::HashMap;
 
-use crate::arch3d::{Arch3dModel, BuildingTextures};
-use crate::blocks::RmbBlock;
-use crate::bsa::BsaArchive;
-use crate::building_gen::{
+use super::arch3d::{Arch3dModel, BuildingTextures};
+use super::blocks::RmbBlock;
+use super::bsa::BsaArchive;
+use super::building_gen::{
     choose_front_side, generate_building, seed_for, CityBuilder, Footprint, BLOCK_SIZE_M, DF_UNIT,
 };
-use crate::maps::DFLocation;
-use crate::palace_gen::generate_royal_palace;
-use crate::wall_gen::{classify_wall, generate_wall, wall_footprint, WallKind};
+use super::maps::DFLocation;
+use super::palace_gen::generate_royal_palace;
+use super::wall_gen::{classify_wall, generate_wall, wall_footprint, WallKind};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CityStats {

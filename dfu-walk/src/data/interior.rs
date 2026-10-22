@@ -1,391 +1,267 @@
-//! Interni delle taverne: con E vicino a una taverna si entra, con E vicino alla porta
-//! (o Backspace ovunque) si esce. L'interno e' costruito con i modelli originali del
-//! secondo BlockData del sotto-record e messo 6000 m sopra il punto d'ingresso, cosi' non si
-//! sovrappone a nulla e il resto del mondo resta caricato. Dentro si cammina sui pavimenti dei
-//! modelli (scale comprese) e le pareti bloccano.
+//! Interni degli edifici (taverne): modelli e flat del secondo BlockData di ogni sotto-record
+//! RMB, piu' la geometria usata per far camminare il giocatore (pavimenti e pareti).
+//!
+//! Sistema locale dell'interno: metri, x est, y su, z come nelle coordinate grezze Daggerfall
+//! (la stessa convenzione delle citta': `z_mondo = -nord`).
 
-use crate::mod_textures::ModTextures;
-use crate::player::{Player, EYE_HEIGHT};
-use crate::tiles::climate_of;
-use crate::wall_textures::WallTextures;
-use crate::world::*;
-use bevy::prelude::*;
-use bevy::render::mesh::{Indices, PrimitiveTopology};
-use bevy::render::render_asset::RenderAssetUsages;
-use daggerfall_data::blocks::RmbBlock;
-use daggerfall_data::bsa::BsaArchive;
-use daggerfall_data::building_gen::DF_UNIT;
-use daggerfall_data::city_map::{collect_city_map, MapBuilding, PoiKind};
-use daggerfall_data::interior::{build_interior, InteriorScene};
-use daggerfall_data::mesh_builder::{Submesh, WorldMesh};
-use daggerfall_data::terrain_mesh::MAP_PIXEL_SIZE;
 use std::collections::HashMap;
 
-/// Quota (m) a cui si costruisce l'interno.
-const INTERIOR_Y: f32 = 6000.0;
-/// Distanza massima dal perimetro della taverna per poter entrare.
-const ENTER_DISTANCE: f32 = 3.5;
-/// Distanza dalla porta interna entro cui E fa uscire.
-const EXIT_DISTANCE: f32 = 2.5;
-const WALK_SPEED: f32 = 4.0;
-const RUN_MULTIPLIER: f32 = 2.0;
-const GRAVITY: f32 = 20.0;
-const JUMP_SPEED: f32 = 5.5;
-const RADIUS: f32 = 0.3;
-/// Salita massima di un gradino e discesa a cui si resta incollati al pavimento.
-const STEP_UP: f32 = 0.6;
-const SNAP_DOWN: f32 = 0.5;
+use super::arch3d::Arch3dModel;
+use super::blocks::{RmbBlock, ROTATION_SIGN};
+use super::bsa::BsaArchive;
+use super::building_gen::DF_UNIT;
+use super::mesh_builder::WorldMesh;
 
-struct Active {
-    root: Entity,
-    /// posizione nel mondo del punto (0,0,0) dell'interno
-    origin: Vec3,
-    scene: InteriorScene,
-    saved_translation: Vec3,
-    saved_feet_y: f32,
-    saved_yaw: f32,
-    saved_origin: (i32, i32),
+/// Archivio dei flat "editor" (marcatori di quest, nemici...): non si disegnano.
+const EDITOR_FLATS_ARCHIVE: u16 = 199;
+
+pub type Tri = [[f32; 3]; 3];
+
+/// Sprite (flat) dell'interno, con la base al centro in `pos` (metri, sistema locale).
+#[derive(Debug, Clone, Copy)]
+pub struct InteriorFlat {
+    pub archive: u16,
+    pub record: u8,
+    pub pos: [f32; 3],
 }
 
-#[derive(Resource, Default)]
-pub struct InteriorState {
-    active: Option<Active>,
+#[derive(Debug, Clone)]
+pub struct InteriorScene {
+    pub mesh: WorldMesh,
+    pub flats: Vec<InteriorFlat>,
+    /// dove compaiono i piedi del giocatore (sistema locale)
+    pub spawn: [f32; 3],
+    /// porta d'uscita, se il record delle porte e' plausibile
+    pub exit: Option<[f32; 3]>,
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+    floors: Vec<Tri>,
+    walls: Vec<Tri>,
 }
 
-impl InteriorState {
-    pub fn is_inside(&self) -> bool {
-        self.active.is_some()
+/// Altezza del piano del triangolo in (x, z), se il punto cade nella sua proiezione.
+fn plane_y(t: &Tri, x: f32, z: f32) -> Option<f32> {
+    let (a, b, c) = (t[0], t[1], t[2]);
+    let d = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
+    if d.abs() < 1e-9 {
+        return None;
+    }
+    let l1 = ((b[2] - c[2]) * (x - c[0]) + (c[0] - b[0]) * (z - c[2])) / d;
+    let l2 = ((c[2] - a[2]) * (x - c[0]) + (a[0] - c[0]) * (z - c[2])) / d;
+    let l3 = 1.0 - l1 - l2;
+    const EPS: f32 = -1e-4;
+    if l1 < EPS || l2 < EPS || l3 < EPS {
+        return None;
+    }
+    Some(l1 * a[1] + l2 * b[1] + l3 * c[1])
+}
+
+/// Distanza orizzontale dal punto (x, z) al segmento a-b proiettato sul piano.
+fn dist_segment_xz(x: f32, z: f32, a: [f32; 3], b: [f32; 3]) -> f32 {
+    let (abx, abz) = (b[0] - a[0], b[2] - a[2]);
+    let (apx, apz) = (x - a[0], z - a[2]);
+    let len2 = abx * abx + abz * abz;
+    let t = if len2 < 1e-9 { 0.0 } else { ((apx * abx + apz * abz) / len2).clamp(0.0, 1.0) };
+    let (cx, cz) = (a[0] + abx * t, a[2] + abz * t);
+    ((x - cx).powi(2) + (z - cz).powi(2)).sqrt()
+}
+
+impl InteriorScene {
+    pub fn floor_count(&self) -> usize {
+        self.floors.len()
+    }
+
+    pub fn wall_count(&self) -> usize {
+        self.walls.len()
+    }
+
+    /// Quota del pavimento in (x, z): la piu' alta tra le superfici quasi orizzontali che non
+    /// stanno sopra `ref_y + step`. Cosi' scale e gradini (alzate basse) si salgono da soli.
+    pub fn floor_at(&self, x: f32, z: f32, ref_y: f32, step: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for t in &self.floors {
+            if let Some(y) = plane_y(t, x, z) {
+                if y <= ref_y + step && best.map_or(true, |b| y > b) {
+                    best = Some(y);
+                }
+            }
+        }
+        best
+    }
+
+    /// true se un cilindro di raggio `radius` in (x, z), con i piedi a `feet_y`, tocca una parete.
+    /// Si considerano le pareti tra il ginocchio e la testa.
+    pub fn blocked(&self, x: f32, z: f32, feet_y: f32, radius: f32) -> bool {
+        let (lo, hi) = (feet_y + 0.45, feet_y + 1.6);
+        for t in &self.walls {
+            let ymin = t[0][1].min(t[1][1]).min(t[2][1]);
+            let ymax = t[0][1].max(t[1][1]).max(t[2][1]);
+            if ymax < lo || ymin > hi {
+                continue;
+            }
+            for k in 0..3 {
+                if dist_segment_xz(x, z, t[k], t[(k + 1) % 3]) < radius {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
-/// Condizione per i sistemi che valgono solo all'aperto (il cielo).
-pub fn outside(state: Res<InteriorState>) -> bool {
-    !state.is_inside()
-}
+/// Costruisce l'interno del sotto-record `sub` del blocco. `None` se non ha modelli 3D.
+pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option<InteriorScene> {
+    let it = rmb.interiors.get(sub)?;
+    if it.objects_3d.is_empty() {
+        return None;
+    }
 
-#[derive(Component)]
-pub struct FlatBillboard;
-
-fn distance_to_building(b: &MapBuilding, px: f32, pz: f32) -> f32 {
-    // inverso della rotazione usata da CityBuilder: x' = x c + z s, z' = -x s + z c
-    let (s, c) = b.rot_deg.to_radians().sin_cos();
-    let (dx, dz) = (px - b.cx, pz - b.cz);
-    let lx = dx * c - dz * s;
-    let lz = dx * s + dz * c;
-    let ox = (lx.abs() - b.half_w).max(0.0);
-    let oz = (lz.abs() - b.half_d).max(0.0);
-    ox.hypot(oz)
-}
-
-/// Mesh Bevy di una sola texture: tiene solo i vertici usati dal submesh.
-fn submesh_to_bevy(mesh: &WorldMesh, sm: &Submesh) -> Mesh {
-    let mut remap: HashMap<u32, u32> = HashMap::new();
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut uvs: Vec<[f32; 2]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::with_capacity(sm.indices.len());
-    for &i in &sm.indices {
-        let new = *remap.entry(i).or_insert_with(|| {
-            let k = positions.len() as u32;
-            positions.push(mesh.vertices[i as usize]);
-            normals.push(mesh.normals[i as usize]);
-            uvs.push(mesh.uvs[i as usize]);
-            k
+    let mut cache: HashMap<u32, Option<Arch3dModel>> = HashMap::new();
+    let mut mesh = WorldMesh::new();
+    for o in &it.objects_3d {
+        let model = cache.entry(o.model_id).or_insert_with(|| {
+            arch3d.get_by_id(o.model_id).and_then(|raw| Arch3dModel::parse(o.model_id, raw).ok())
         });
-        indices.push(new);
+        let Some(m) = model.as_ref() else { continue };
+        let (x, y, z) = (o.x as f32 * DF_UNIT, -(o.y as f32) * DF_UNIT, o.z as f32 * DF_UNIT);
+        // `add_instance` ruota di +angolo, le citta' (CityBuilder) di -angolo con lo stesso segno.
+        mesh.add_instance(m, x, y, z, -(o.rotation_y_deg * ROTATION_SIGN));
     }
-    let mut out = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
-    out.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    out.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    out.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-    out.insert_indices(Indices::U32(indices));
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn interior_enter_exit(
-    mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
-    data: Res<GameData>,
-    origin: Res<Origin>,
-    mut state: ResMut<InteriorState>,
-    mut clear: ResMut<ClearColor>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut wall_textures: ResMut<WallTextures>,
-    mut mods: ResMut<ModTextures>,
-    mut player: Query<(&mut Player, &mut Transform)>,
-) {
-    let leave = keys.just_pressed(KeyCode::Backspace);
-    let act = keys.just_pressed(KeyCode::KeyE);
-    if !leave && !act {
-        return;
-    }
-    let Ok((mut p, mut tf)) = player.get_single_mut() else { return };
-
-    // ---- uscita ----
-    if state.active.is_some() {
-        let near_exit = {
-            let a = state.active.as_ref().unwrap();
-            let local = tf.translation - a.origin;
-            a.scene.exit.map_or(false, |e| (local.x - e[0]).hypot(local.z - e[2]) < EXIT_DISTANCE)
-        };
-        if leave || near_exit {
-            let a = state.active.take().unwrap();
-            // se nel frattempo e' cambiata l'origine del mondo, si corregge come `rebase_origin`
-            let (de, dn) = (origin.east - a.saved_origin.0, origin.north - a.saved_origin.1);
-            let mut pos = a.saved_translation;
-            pos.x -= de as f32 * MAP_PIXEL_SIZE;
-            pos.z += dn as f32 * MAP_PIXEL_SIZE;
-            p.feet_y = a.saved_feet_y;
-            p.vel_y = 0.0;
-            p.on_ground = true;
-            p.yaw = a.saved_yaw + std::f32::consts::PI; // si esce guardando la strada
-            tf.translation = pos;
-            commands.entity(a.root).despawn_recursive();
-            clear.0 = Color::srgb(0.55, 0.72, 0.92);
-            println!("Sei uscito dalla taverna.");
-        }
-        return;
+    if mesh.vertices.is_empty() {
+        return None;
     }
 
-    // ---- ingresso ----
-    if !act {
-        return;
-    }
-    let (mx, my) = map_pixel_of(&origin, tf.translation);
-    let Some(loc) = data.locations.get(&(mx, my)) else {
-        println!("Qui non c'e' nessuna citta'.");
-        return;
-    };
-    let (Ok(blocks), Ok(arch)) = (BsaArchive::parse(&data.blocks_buf), BsaArchive::parse(&data.arch3d_buf)) else {
-        println!("Interni: impossibile leggere BLOCKS.BSA o ARCH3D.BSA.");
-        return;
-    };
-    let map = collect_city_map(loc, &blocks, &arch);
-    let tile = tile_translation(&origin, mx, my);
-    let (px, pz) = (tf.translation.x - tile.x, tf.translation.z - tile.z);
-
-    let mut best: Option<(f32, (usize, usize, u8))> = None;
-    let (mut taverns, mut nearest) = (0usize, f32::MAX);
-    for b in &map.buildings {
-        if b.kind != Some(PoiKind::Tavern) {
-            continue;
-        }
-        let Some(src) = b.source else { continue };
-        let d = distance_to_building(b, px, pz);
-        taverns += 1;
-        nearest = nearest.min(d);
-        if d <= ENTER_DISTANCE && best.map_or(true, |(bd, _)| d < bd) {
-            best = Some((d, src));
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for v in &mesh.vertices {
+        for k in 0..3 {
+            mn[k] = mn[k].min(v[k]);
+            mx[k] = mx[k].max(v[k]);
         }
     }
-    let Some((_, (bx, by, sub))) = best else {
-        if taverns == 0 {
-            println!("Interni: nessuna taverna trovata in {} (map pixel {mx},{my}).", loc.name);
-        } else {
-            println!(
-                "Interni: {} taverne in {}, la piu' vicina a {:.1} m (serve entro {ENTER_DISTANCE} m).",
-                taverns, loc.name, nearest
-            );
-        }
-        return;
-    };
 
-    let Some(name) = loc.block_names.get(by * loc.width + bx) else {
-        println!("Interni: blocco ({bx},{by}) fuori dalla location.");
-        return;
-    };
-    let Some(raw) = blocks.get_by_name(name) else {
-        println!("Interni: il blocco {name} non esiste in BLOCKS.BSA.");
-        return;
-    };
-    let Ok(rmb) = RmbBlock::parse(raw) else {
-        println!("Interni: il blocco {name} non si legge.");
-        return;
-    };
-    let Some(scene) = build_interior(&rmb, sub as usize, &arch) else {
-        println!("L'interno di {name} (sotto-record {sub}) non ha modelli 3D.");
-        return;
-    };
-
-    let origin_world = Vec3::new(tf.translation.x, INTERIOR_Y, tf.translation.z);
-    let climate = climate_of(&data, mx, my);
-
-    let root = commands
-        .spawn((Transform::from_translation(origin_world), Visibility::default()))
-        .with_children(|parent| {
-            for sm in &scene.mesh.submeshes {
-                if sm.indices.is_empty() {
-                    continue;
-                }
-                let handle = wall_textures.material(
-                    sm.texture_archive,
-                    sm.texture_record,
-                    climate,
-                    &data,
-                    &mut mods,
-                    &mut images,
-                    &mut materials,
-                );
-                // il verso delle facce dei modelli non e' garantito: si disegnano da entrambi i lati
-                if let Some(m) = materials.get_mut(&handle) {
-                    m.double_sided = true;
-                    m.cull_mode = None;
-                }
-                parent.spawn((
-                    Mesh3d(meshes.add(submesh_to_bevy(&scene.mesh, sm))),
-                    MeshMaterial3d(handle),
-                    Transform::IDENTITY,
-                ));
+    let mut floors = Vec::new();
+    let mut walls = Vec::new();
+    for sm in &mesh.submeshes {
+        for ch in sm.indices.chunks_exact(3) {
+            let t: Tri = [
+                mesh.vertices[ch[0] as usize],
+                mesh.vertices[ch[1] as usize],
+                mesh.vertices[ch[2] as usize],
+            ];
+            let e1 = [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]];
+            let e2 = [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]];
+            let n = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len < 1e-6 {
+                continue;
             }
-
-            for f in &scene.flats {
-                let Some((material, w_px, h_px)) =
-                    wall_textures.flat_material(f.archive, f.record, &data, &mut images, &mut materials)
-                else {
-                    continue;
-                };
-                let (w, h) = (w_px * DF_UNIT, h_px * DF_UNIT);
-                parent.spawn((
-                    Mesh3d(meshes.add(Rectangle::new(w, h))),
-                    MeshMaterial3d(material),
-                    Transform::from_xyz(f.pos[0], f.pos[1] + h * 0.5, f.pos[2]),
-                    FlatBillboard,
-                ));
+            // il segno della normale non conta: si classifica per inclinazione
+            if (n[1] / len).abs() > 0.5 {
+                floors.push(t);
+            } else {
+                walls.push(t);
             }
+        }
+    }
 
-            // luce calda al centro della sala
-            let cx = (scene.bounds_min[0] + scene.bounds_max[0]) * 0.5;
-            let cz = (scene.bounds_min[2] + scene.bounds_max[2]) * 0.5;
-            parent.spawn((
-                PointLight {
-                    color: Color::srgb(1.0, 0.86, 0.62),
-                    intensity: 600_000.0,
-                    range: 40.0,
-                    shadows_enabled: false,
-                    ..default()
-                },
-                Transform::from_xyz(cx, scene.spawn[1] + 2.3, cz),
-            ));
+    let flats = it
+        .flats
+        .iter()
+        .filter(|f| f.texture_archive != EDITOR_FLATS_ARCHIVE)
+        .map(|f| InteriorFlat {
+            archive: f.texture_archive,
+            record: f.texture_record,
+            pos: [f.x as f32 * DF_UNIT, -(f.y as f32) * DF_UNIT, f.z as f32 * DF_UNIT],
         })
-        .id();
+        .collect();
 
-    // il giocatore compare davanti alla porta, rivolto verso la sala
-    let spawn = Vec3::from(scene.spawn);
-    let cx = (scene.bounds_min[0] + scene.bounds_max[0]) * 0.5;
-    let cz = (scene.bounds_min[2] + scene.bounds_max[2]) * 0.5;
-    let (dx, dz) = (cx - spawn.x, cz - spawn.z);
-
-    let saved = Active {
-        root,
-        origin: origin_world,
-        saved_translation: tf.translation,
-        saved_feet_y: p.feet_y,
-        saved_yaw: p.yaw,
-        saved_origin: (origin.east, origin.north),
-        scene,
+    let mut scene = InteriorScene {
+        mesh,
+        flats,
+        spawn: [0.0; 3],
+        exit: None,
+        bounds_min: mn,
+        bounds_max: mx,
+        floors,
+        walls,
     };
-    p.feet_y = origin_world.y + spawn.y;
-    p.vel_y = 0.0;
-    p.on_ground = true;
-    p.fly = false;
-    if dx.hypot(dz) > 0.5 {
-        p.yaw = (-dx).atan2(-dz);
-    }
-    tf.translation = Vec3::new(origin_world.x + spawn.x, p.feet_y + EYE_HEIGHT, origin_world.z + spawn.z);
-    clear.0 = Color::BLACK;
-    state.active = Some(saved);
-    println!("Sei entrato in {name} (sotto-record {sub}). E vicino alla porta o Backspace per uscire.");
+
+    let (cx, cz) = ((mn[0] + mx[0]) * 0.5, (mn[2] + mx[2]) * 0.5);
+    // porta valida solo se cade dentro (o appena fuori) dall'ingombro dei modelli
+    let door = it
+        .doors
+        .first()
+        .map(|d| [d.x as f32 * DF_UNIT, -(d.y as f32) * DF_UNIT, d.z as f32 * DF_UNIT])
+        .filter(|d| d[0] >= mn[0] - 2.0 && d[0] <= mx[0] + 2.0 && d[2] >= mn[2] - 2.0 && d[2] <= mx[2] + 2.0);
+
+    let (sx, sz, ref_y) = match door {
+        Some(d) => {
+            let (dx, dz) = (cx - d[0], cz - d[2]);
+            let l = (dx * dx + dz * dz).sqrt().max(1e-3);
+            (d[0] + dx / l * 1.5, d[2] + dz / l * 1.5, d[1] + 1.0)
+        }
+        None => (cx, cz, mn[1] + 1.0),
+    };
+    let floor = scene
+        .floor_at(sx, sz, ref_y, 1.0)
+        .or_else(|| scene.floor_at(cx, cz, mn[1] + 1.0, 1.0))
+        .unwrap_or(mn[1]);
+    scene.spawn = [sx, floor, sz];
+    scene.exit = door;
+    Some(scene)
 }
 
-pub fn interior_move(
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
-    state: Res<InteriorState>,
-    mut player: Query<(&mut Player, &mut Transform)>,
-) {
-    let Some(active) = state.active.as_ref() else { return };
-    let Ok((mut p, mut tf)) = player.get_single_mut() else { return };
-    let dt = time.delta_secs().min(0.05);
-    let (scene, o) = (&active.scene, active.origin);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let forward = Vec3::new(-p.yaw.sin(), 0.0, -p.yaw.cos());
-    let right = Vec3::new(p.yaw.cos(), 0.0, -p.yaw.sin());
-    let axis = |pos: KeyCode, neg: KeyCode| keys.pressed(pos) as i32 as f32 - keys.pressed(neg) as i32 as f32;
-    let wish = (forward * axis(KeyCode::KeyW, KeyCode::KeyS) + right * axis(KeyCode::KeyD, KeyCode::KeyA))
-        .normalize_or_zero();
-    let running = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    let speed = WALK_SPEED * if running { RUN_MULTIPLIER } else { 1.0 };
-
-    // passi da al massimo 10 cm, cosi' non si attraversano le pareti sottili
-    let total = speed * dt;
-    let steps = (total / 0.1).ceil().max(1.0) as i32;
-    let step = wish * (total / steps as f32);
-    let mut pos = tf.translation;
-    if step != Vec3::ZERO {
-        for _ in 0..steps {
-            let feet = p.feet_y - o.y;
-            // prima il passo intero, poi scorrimento lungo un solo asse
-            for cand in [step, Vec3::new(step.x, 0.0, 0.0), Vec3::new(0.0, 0.0, step.z)] {
-                if cand == Vec3::ZERO {
-                    continue;
-                }
-                let n = pos + cand;
-                if !scene.blocked(n.x - o.x, n.z - o.z, feet, RADIUS) {
-                    pos = n;
-                    break;
-                }
-            }
+    fn scene_with(floors: Vec<Tri>, walls: Vec<Tri>) -> InteriorScene {
+        InteriorScene {
+            mesh: WorldMesh::new(),
+            flats: Vec::new(),
+            spawn: [0.0; 3],
+            exit: None,
+            bounds_min: [0.0; 3],
+            bounds_max: [0.0; 3],
+            floors,
+            walls,
         }
     }
 
-    // verticale: pavimento dei modelli, gravita' e salto
-    let (lx, lz) = (pos.x - o.x, pos.z - o.z);
-    let feet_local = p.feet_y - o.y;
-    let floor = scene.floor_at(lx, lz, feet_local, STEP_UP);
-    if keys.just_pressed(KeyCode::Space) && p.on_ground {
-        p.vel_y = JUMP_SPEED;
-        p.on_ground = false;
-    }
-    match floor {
-        Some(f) if p.vel_y <= 0.0 && feet_local - f <= SNAP_DOWN => {
-            p.feet_y = o.y + f;
-            p.vel_y = 0.0;
-            p.on_ground = true;
-        }
-        _ => {
-            p.vel_y -= GRAVITY * dt;
-            p.feet_y += p.vel_y * dt;
-            p.on_ground = false;
-            if let Some(f) = floor {
-                if p.feet_y - o.y <= f {
-                    p.feet_y = o.y + f;
-                    p.vel_y = 0.0;
-                    p.on_ground = true;
-                }
-            }
-        }
+    #[test]
+    fn floor_height_and_step() {
+        // due triangoli che coprono il quadrato 0..4 a quota 0 e 0.4 (gradino)
+        let low: Vec<Tri> = vec![
+            [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 0.0, 4.0]],
+            [[0.0, 0.0, 0.0], [4.0, 0.0, 4.0], [0.0, 0.0, 4.0]],
+        ];
+        let step: Tri = [[1.0, 0.4, 1.0], [3.0, 0.4, 1.0], [2.0, 0.4, 3.0]];
+        let s = scene_with([low, vec![step]].concat(), Vec::new());
+        assert_eq!(s.floor_at(0.5, 3.0, 0.0, 0.6), Some(0.0));
+        let on_step = s.floor_at(2.0, 1.8, 0.0, 0.6).unwrap();
+        assert!((on_step - 0.4).abs() < 1e-4);
+        // fuori dal pavimento non c'e' nulla
+        assert_eq!(s.floor_at(10.0, 10.0, 0.0, 0.6), None);
     }
 
-    // caduto nel vuoto: si riparte dall'ingresso
-    if p.feet_y - o.y < scene.bounds_min[1] - 5.0 {
-        pos = Vec3::new(o.x + scene.spawn[0], 0.0, o.z + scene.spawn[2]);
-        p.feet_y = o.y + scene.spawn[1];
-        p.vel_y = 0.0;
-        p.on_ground = true;
-    }
-
-    pos.y = p.feet_y + EYE_HEIGHT;
-    tf.translation = pos;
-}
-
-/// Gli sprite (tavoli, persone...) guardano sempre la camera.
-pub fn face_flats(player: Query<&Player>, mut flats: Query<&mut Transform, With<FlatBillboard>>) {
-    let Ok(p) = player.get_single() else { return };
-    let rot = Quat::from_rotation_y(p.yaw);
-    for mut tf in &mut flats {
-        tf.rotation = rot;
+    #[test]
+    fn wall_blocks_between_knee_and_head() {
+        // parete verticale sul piano z = 2, da x = 0 a 4, alta 3 m
+        let wall: Vec<Tri> = vec![
+            [[0.0, 0.0, 2.0], [4.0, 0.0, 2.0], [4.0, 3.0, 2.0]],
+            [[0.0, 0.0, 2.0], [4.0, 3.0, 2.0], [0.0, 3.0, 2.0]],
+        ];
+        let s = scene_with(Vec::new(), wall);
+        assert!(s.blocked(2.0, 1.8, 0.0, 0.3));
+        assert!(!s.blocked(2.0, 1.0, 0.0, 0.3));
+        // un gradino basso (sotto il ginocchio) non blocca
+        let low_wall: Vec<Tri> = vec![[[0.0, 0.0, 2.0], [4.0, 0.0, 2.0], [4.0, 0.3, 2.0]]];
+        let s2 = scene_with(Vec::new(), low_wall);
+        assert!(!s2.blocked(2.0, 2.0, 0.0, 0.3));
     }
 }

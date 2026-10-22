@@ -2,12 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::arch3d::Arch3dModel;
-use crate::blocks::RmbBlock;
-use crate::bsa::BsaArchive;
-use crate::building_gen::{Footprint, BLOCK_SIZE_M, DF_UNIT};
-use crate::maps::DFLocation;
-use crate::wall_gen::{classify_wall, wall_footprint};
+use super::arch3d::Arch3dModel;
+use super::blocks::RmbBlock;
+use super::bsa::BsaArchive;
+use super::building_gen::{Footprint, BLOCK_SIZE_M, DF_UNIT};
+use super::maps::DFLocation;
+use super::wall_gen::{classify_wall, wall_footprint};
 
 pub const MAP_PX: usize = 640;
 pub const STRIP_PX: usize = 56;

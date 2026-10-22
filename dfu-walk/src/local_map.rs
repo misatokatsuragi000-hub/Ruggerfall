@@ -8,8 +8,8 @@ use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use daggerfall_data::bsa::BsaArchive;
-use daggerfall_data::city_map::{collect_city_map, image_size, render_city_map, render_notice, MapView, MAP_PX};
+use crate::data::bsa::BsaArchive;
+use crate::data::city_map::{collect_city_map, image_size, render_city_map, render_notice, MapView, MAP_PX};
 
 /// Altezza del pannello davanti alla camera (la larghezza segue le proporzioni dell'immagine).
 const HUD_HEIGHT: f32 = 0.90;

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::arch3d::Arch3dModel;
+use super::arch3d::Arch3dModel;
 
 #[derive(Debug, Clone)]
 pub struct Submesh {

@@ -5,9 +5,9 @@
 //! centinaia di chilometri dal punto di partenza (precisione degli f32).
 
 use bevy::prelude::*;
-use daggerfall_data::maps::DFLocation;
-use daggerfall_data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
-use daggerfall_data::{HeightSamples, PakFile, Palette, WoodsFile};
+use crate::data::maps::DFLocation;
+use crate::data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
+use crate::data::{HeightSamples, PakFile, Palette, WoodsFile};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

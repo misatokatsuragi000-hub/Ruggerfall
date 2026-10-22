@@ -1,6 +1,6 @@
-use crate::bsa::BsaArchive;
-use crate::blocks::RmbBlock;
-use crate::maps::DFLocation;
+use super::bsa::BsaArchive;
+use super::blocks::RmbBlock;
+use super::maps::DFLocation;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CityTileRect {

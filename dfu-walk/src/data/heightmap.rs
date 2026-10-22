@@ -1,9 +1,9 @@
 //! Altezze del terreno di un map pixel. Porting di DefaultTerrainSampler.cs
 //! (versione 1), con gli stessi coefficienti e la stessa interpolazione cubica.
 
-use crate::error::Result;
-use crate::perlin::perlin_noise;
-use crate::woods::WoodsFile;
+use super::error::Result;
+use super::perlin::perlin_noise;
+use super::woods::WoodsFile;
 
 pub const DEFAULT_HEIGHTMAP_DIM: usize = 129;
 pub const MAX_TERRAIN_HEIGHT: f32 = 1539.0;
@@ -138,7 +138,7 @@ pub fn generate_default_samples(woods: &WoodsFile, map_pixel_x: i32, map_pixel_y
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::woods::test_support::build_woods_filled;
+    use super::woods::test_support::build_woods_filled;
 
     fn no_noise(_: f32, _: f32) -> f32 {
         0.0

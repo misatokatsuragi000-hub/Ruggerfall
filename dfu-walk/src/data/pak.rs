@@ -1,8 +1,8 @@
 //! CLIMATE.PAK e POLITIC.PAK: mappe del mondo 1001x500 compresse a run.
 //! Porting di PakFile.cs e di MapsFile.GetClimateIndex/GetPoliticIndex.
 
-use crate::error::{format_err, Result};
-use crate::reader::Cursor;
+use super::error::{format_err, Result};
+use super::reader::Cursor;
 use std::path::Path;
 
 pub const PAK_WIDTH: usize = 1001;

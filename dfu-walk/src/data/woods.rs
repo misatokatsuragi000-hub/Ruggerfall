@@ -1,8 +1,8 @@
 //! WOODS.WLD: mappa delle altezze del mondo (1000x500) e dati di dettaglio 5x5
 //! per ogni map pixel. Porting di WoodsFile.cs.
 
-use crate::error::{format_err, Result};
-use crate::reader::Cursor;
+use super::error::{format_err, Result};
+use super::reader::Cursor;
 use std::path::Path;
 
 pub const MAP_WIDTH: usize = 1000;

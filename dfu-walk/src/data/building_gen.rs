@@ -1,6 +1,6 @@
 //! Generatore procedurale di edifici per le città con texture originali per facciate, tetti, porte e finestre.
 
-use crate::arch3d::{Arch3dModel, BuildingTextures};
+use super::arch3d::{Arch3dModel, BuildingTextures};
 
 pub const DF_UNIT: f32 = 0.025;
 pub const BLOCK_SIZE_M: f32 = 4096.0 * DF_UNIT;

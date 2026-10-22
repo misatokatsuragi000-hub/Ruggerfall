@@ -1,6 +1,6 @@
 //! Cursore di lettura little-endian con controllo dei limiti.
 
-use crate::error::{format_err, Error, Result};
+use super::error::{format_err, Error, Result};
 
 pub(crate) struct Cursor<'a> {
     data: &'a [u8],

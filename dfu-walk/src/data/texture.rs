@@ -5,9 +5,9 @@
 //! in alto): DFU le capovolge solo perché le texture di Unity hanno l'origine
 //! in basso, e qui non serve.
 
-use crate::error::{format_err, Error, Result};
-use crate::reader::Cursor;
-use crate::palette::Palette;
+use super::error::{format_err, Error, Result};
+use super::reader::Cursor;
+use super::palette::Palette;
 use std::path::Path;
 
 const SOLID_SIZE: usize = 32;

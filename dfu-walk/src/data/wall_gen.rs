@@ -1,6 +1,6 @@
 //! Generatore procedurale di mura, porte monumentali, muretti cimiteriali e monumenti in pietra.
 
-use crate::building_gen::{BuildingMesh, Footprint, MeshPart, Rng};
+use super::building_gen::{BuildingMesh, Footprint, MeshPart, Rng};
 
 pub const WALL_MIN_HEIGHT: f32 = 1.2;
 pub const WALL_MAX_HEIGHT: f32 = 16.0;

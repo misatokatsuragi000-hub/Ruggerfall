@@ -6,9 +6,9 @@
 //! Scale come in DFU: un map pixel è 32768 * 0,025 m, le altezze sono moltiplicate
 //! per `TERRAIN_HEIGHT_SCALE`.
 
-use crate::atlas::{ATLAS_COLS, ATLAS_ROWS};
-use crate::heightmap::HeightSamples;
-use crate::tilemap::TILEMAP_DIM;
+use super::atlas::{ATLAS_COLS, ATLAS_ROWS};
+use super::heightmap::HeightSamples;
+use super::tilemap::TILEMAP_DIM;
 
 /// Lato di un map pixel in metri (WorldMapTerrainDim * GlobalScale).
 pub const MAP_PIXEL_SIZE: f32 = 32768.0 * 0.025;

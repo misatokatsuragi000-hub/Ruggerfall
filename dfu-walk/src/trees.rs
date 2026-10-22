@@ -6,9 +6,9 @@ use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use daggerfall_data::building_gen::BLOCK_SIZE_M;
-use daggerfall_data::terrain_mesh::{terrain_height, CELL_SIZE, TERRAIN_HEIGHT_SCALE};
-use daggerfall_data::{archive_file_name, find_file_ci, HeightSamples, TextureFile};
+use crate::data::building_gen::BLOCK_SIZE_M;
+use crate::data::terrain_mesh::{terrain_height, CELL_SIZE, TERRAIN_HEIGHT_SCALE};
+use crate::data::{archive_file_name, find_file_ci, HeightSamples, TextureFile};
 use dfmod::{MapKind, TextureKey};
 use std::collections::HashMap;
 
@@ -210,7 +210,7 @@ pub fn spawn_trees_for_chunk(
     images: &mut Assets<Image>,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    city_rect: Option<daggerfall_data::terrain_city::CityTileRect>,
+    city_rect: Option<crate::data::terrain_city::CityTileRect>,
 ) {
     if climate == 223 {
         return;

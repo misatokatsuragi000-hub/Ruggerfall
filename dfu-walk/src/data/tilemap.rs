@@ -11,9 +11,9 @@
 //! Il valore 0xFF segna una cella di una località che sarebbe acqua (zero) e che
 //! non va sovrascritta; `encode_for_shader` lo riconverte in acqua.
 
-use crate::error::{format_err, Result};
-use crate::heightmap::{HeightSamples, NoiseFn, BEACH_ELEVATION, MAX_TERRAIN_HEIGHT, OCEAN_ELEVATION};
-use crate::perlin::perlin_noise;
+use super::error::{format_err, Result};
+use super::heightmap::{HeightSamples, NoiseFn, BEACH_ELEVATION, MAX_TERRAIN_HEIGHT, OCEAN_ELEVATION};
+use super::perlin::perlin_noise;
 
 pub const TILEMAP_DIM: usize = 128;
 pub const TILE_DATA_DIM: usize = TILEMAP_DIM + 1;
@@ -271,7 +271,7 @@ pub fn encode_for_shader(tilemap: &[u8], convert_water: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heightmap::HeightSamples;
+    use super::heightmap::HeightSamples;
 
     fn flat(height_units: f32) -> HeightSamples {
         HeightSamples {

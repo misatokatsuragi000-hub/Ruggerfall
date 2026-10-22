@@ -1,4 +1,4 @@
-//! Vegetazione e alberi 3D: viale reale verticale con carreggiata allargata a 30m.
+//! Vegetazione e alberi 3D: viale reale verticale con area del castello e ponte sgombri.
 
 use crate::mod_textures::ModTextures;
 use crate::world::GameData;
@@ -263,7 +263,7 @@ pub fn spawn_trees_for_chunk(
             ));
         }
 
-        // 2. IL GRANDE VIALE REALE CON CARREGGIATA ALLARGATA A 30 METRI
+        // 2. IL DOPPIO FILARE LUNGO IL VIALE (fermandosi tassativamente prima del ponte)
         if let Some(r) = city_rect {
             let start_bx = r.min_x / 16;
             let start_by = r.min_y / 16;
@@ -273,13 +273,17 @@ pub fn spawn_trees_for_chunk(
             let palace_target_bx = 5.min(bw.saturating_sub(2));
             let palace_target_by = 6.min(bh.saturating_sub(2));
 
-            let road_x = (start_bx + palace_target_bx) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5;
-            let road_z_south = -((start_by + 1) as f32 * BLOCK_SIZE_M);
-            let road_z_north = -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5) + 32.0;
+            let palace_x = (start_bx + palace_target_bx) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5;
+            let palace_z = -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5);
 
-            let len = (road_z_south - road_z_north).abs();
-            let tree_pairs = (len / 15.0).floor() as usize; // Spaziatura ogni 15 metri
-            let side_offset = 15.0; // Carreggiata di 30 metri totali!
+            let road_x = palace_x;
+            let road_z_south = -((start_by + 1) as f32 * BLOCK_SIZE_M);
+            // Si arresta a Z = palace_z + 56m, lasciando libero il ponte e l'ingresso del barbacane
+            let road_z_north = palace_z + 56.0;
+
+            let len = (road_z_south - road_z_north).max(0.0);
+            let tree_pairs = (len / 15.0).floor() as usize;
+            let side_offset = 15.0; // Carreggiata di 30m
 
             let big_trees = &tree_species[..tree_species.len().min(2)];
 
@@ -290,6 +294,12 @@ pub fn spawn_trees_for_chunk(
                 for s in [-side_offset, side_offset] {
                     let tx = road_x + s;
 
+                    // CONTROLLO RIGOROSO: nessun albero nella corte, sul ponte o nel fossato
+                    let dist_to_palace_sq = (tx - palace_x).powi(2) + (tz - palace_z).powi(2);
+                    if dist_to_palace_sq < 54.0 * 54.0 {
+                        continue;
+                    }
+
                     let gx = (tx / CELL_SIZE).clamp(0.0, 128.0);
                     let gy = ((-tz) / CELL_SIZE).clamp(0.0, 128.0);
                     let y = terrain_height(samples, gx, gy);
@@ -299,7 +309,7 @@ pub fn spawn_trees_for_chunk(
                     parent.spawn((
                         Mesh3d(tree.mesh.clone()),
                         MeshMaterial3d(tree.material.clone()),
-                        Transform::from_xyz(tx, y, tz).with_scale(Vec3::splat(1.5)),
+                        Transform::from_xyz(tx, y, tz).with_scale(Vec3::splat(1.45)),
                     ));
                 }
             }

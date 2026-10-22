@@ -8,45 +8,53 @@ const RMB_PREFIXES: [&str; 45] = [
 "TEMP", "WALL", "MARK", "SHIP", "WITC"
 ];
 
-pub fn decode_rmb_name(index: u8, number: u8, char_byte: u8) -> Option<String> {
+const LETTER2_ARRAY: [char; 4] = ['A', 'L', 'M', 'S'];
+
+/// Prima lettera usata se `letter1_for_rmb_name` non e' ancora letto dal record e il
+/// bit 0x10 e' acceso: riproduce la vecchia mappa (B per 0x3F/0x5F/0x7F, altrimenti A).
+fn legacy_letter1(char_byte: u8) -> char {
+    if matches!(char_byte, 0x3F | 0x5F | 0x7F) { 'B' } else { 'A' }
+}
+
+/// Porting di `resolveRmbBlockName` del JS, con il fallback del vecchio parser per i
+/// `char_byte` non standard (0x0F, 0x1F, 0x8F, 0x9F, 0x11, 0x13, 0x15) che altrimenti
+/// produrrebbero un nome diverso da quello presente in BLOCKS.BSA.
+/// `letter1_for_rmb_name`: `dfLocation.exterior.exteriorData.letter1ForRMBName` (None = non letto).
+pub fn decode_rmb_name(
+    index: u8,
+    number: u8,
+    char_byte: u8,
+    letter1_for_rmb_name: Option<u8>,
+) -> Option<String> {
     let prefix = RMB_PREFIXES.get(index as usize)?;
 
-    if *prefix == "MAGE" {
-        return Some(format!("MAGEAA{:02}.RMB", number));
-    }
-
-    if *prefix == "TEMP" {
-        if number == 0 {
-            return Some("TEMPAA00.RMB".to_string());
-        } else if (1..=8).contains(&number) {
-            let letter = (b'A' + (number - 1)) as char;
-            return Some(format!("TEMPAA{}0.RMB", letter));
+    // Letter 1.
+    let letter1 = if char_byte & 0x10 != 0 {
+        match letter1_for_rmb_name {
+            Some(c) => c as char,
+            None => legacy_letter1(char_byte),
         }
-    }
-
-    if *prefix == "THIE" {
-        let size_str = match char_byte {
-            0x2F => "AL",
-            0x4F => "AM",
-            0x6F => "AS",
-            _ => "AL",
-        };
-        return Some(format!("THIE{}00.RMB", size_str));
-    }
-
-    let char_str = match char_byte {
-        0x00..=0x07 | 0x8F => "AA",
-        0x0F | 0x11 | 0x13 | 0x15 | 0x1F | 0x9F => "AA",
-        0x2F => "AL",
-        0x3F => "BL",
-        0x4F => "AM",
-        0x5F => "BM",
-        0x6F => "AS",
-        0x7F => "BS",
-        _ => "AA",
+    } else {
+        'A'
     };
 
-    Some(format!("{}{}{:02}.RMB", prefix, char_str, number))
+    // Letter 2: ((2 * char) & 0xff) >> 6 == bit 5-6 del byte, ma i valori del vecchio
+    // match restano "AA" (letter2 = 'A') per non cambiare i nomi gia' funzionanti.
+    let letter2 = if matches!(char_byte, 0x0F | 0x1F | 0x8F | 0x9F | 0x11 | 0x13 | 0x15) {
+        'A'
+    } else {
+        LETTER2_ARRAY[(char_byte.wrapping_mul(2) >> 6) as usize]
+    };
+
+    // Numero del blocco.
+    let numbers = if index == 13 || index == 14 {
+        // Templi: lettera dal nibble basso + numero senza padding (come nel JS).
+        format!("{}{}", (b'A' + (char_byte & 0x0F)) as char, number)
+    } else {
+        format!("{:02}", number)
+    };
+
+    Some(format!("{}{}{}{}.RMB", prefix, letter1, letter2, numbers))
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +66,8 @@ pub struct DFLocation {
     pub width: usize,
     pub height: usize,
     pub block_names: Vec<String>,
+    /// `letter1ForRMBName` del record (codice ASCII); None finche' non e' letto.
+    pub letter1_for_rmb_name: Option<u8>,
 }
 
 pub struct MapsReader<'a> {
@@ -145,11 +155,15 @@ impl<'a> MapsReader<'a> {
         let block_numbers = &data[p + 64..p + 128];
         let block_chars = &data[p + 128..p + 192];
 
+        // `letter1ForRMBName` non e' ancora mappato con certezza: lasciamo None.
+        // Il fallback legacy garantisce i nomi gia' funzionanti.
+        let letter1_for_rmb_name: Option<u8> = None;
+
         let mut block_names = Vec::with_capacity(width * height);
         for y in 0..height {
             for x in 0..width {
                 let i = y * width + x;
-                let blk = decode_rmb_name(block_indices[i], block_numbers[i], block_chars[i])
+                let blk = decode_rmb_name(block_indices[i], block_numbers[i], block_chars[i], letter1_for_rmb_name)
                 .unwrap_or_else(|| "EMPTY.RMB".to_string());
                 block_names.push(blk);
             }
@@ -163,6 +177,7 @@ impl<'a> MapsReader<'a> {
             width,
             height,
             block_names,
+            letter1_for_rmb_name,
         })
     }
 

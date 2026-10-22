@@ -43,12 +43,13 @@ const BLOCK_UNITS: f32 = 4096.0;
 pub const DA_TO_DEG: f32 = 360.0 / 2048.0;
 
 /// Dati di un edificio (26 byte), uno per sotto-record: l'edificio `i` e' il sotto-record `i`.
-/// Layout (da Daggerfall Unity): NameSeed u16 @0, 16 byte nulli, FactionId u16 @18,
+/// Layout (da Daggerfall Unity): NameSeed u16 @0, ServiceTimeLimit u32 @2, 12 byte nulli, FactionId u16 @18,
 /// Sector i16 @20, LocationId u16 @22, BuildingType u8 @24, Quality u8 @25.
 /// Verificalo con `dump_pois`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RmbBuildingData {
     pub name_seed: u16,
+    pub service_time_limit: u32,
     pub faction_id: u16,
     pub sector: i16,
     pub location_id: u16,
@@ -60,6 +61,7 @@ pub fn parse_building_data(rec: &[u8]) -> RmbBuildingData {
     debug_assert!(rec.len() >= BUILDING_DATA_SIZE);
     RmbBuildingData {
         name_seed: u16::from_le_bytes([rec[0], rec[1]]),
+        service_time_limit: u32::from_le_bytes([rec[2], rec[3], rec[4], rec[5]]),
         faction_id: u16::from_le_bytes([rec[18], rec[19]]),
         sector: i16::from_le_bytes([rec[20], rec[21]]),
         location_id: u16::from_le_bytes([rec[22], rec[23]]),
@@ -308,6 +310,7 @@ mod tests {
     fn building_data_layout() {
         let mut rec = [0u8; 26];
         rec[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+        rec[2..6].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         rec[18..20].copy_from_slice(&0x0150u16.to_le_bytes());
         rec[20..22].copy_from_slice(&(-3i16).to_le_bytes());
         rec[22..24].copy_from_slice(&0x0042u16.to_le_bytes());
@@ -316,7 +319,9 @@ mod tests {
         let b = parse_building_data(&rec);
         assert_eq!(
             b,
-            RmbBuildingData { name_seed: 0x1234, faction_id: 0x150, sector: -3, location_id: 0x42, building_type: 15, quality: 7 }
+            RmbBuildingData { name_seed: 0x1234, service_time_limit: 0xDEADBEEF, faction_id: 0x150, sector: -3, location_id: 0x42, building_type: 15, quality: 7 }
         );
     }
 }
+
+

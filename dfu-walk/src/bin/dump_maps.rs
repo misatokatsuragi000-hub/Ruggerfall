@@ -12,48 +12,46 @@ const RMB_PREFIXES: [&str; 45] = [
 "TEMP", "WALL", "MARK", "SHIP", "WITC"                                          // 40..44
 ];
 
-fn decode_rmb_name(index: u8, number: u8, char_byte: u8) -> Option<String> {
+const LETTER2_ARRAY: [char; 4] = ['A', 'L', 'M', 'S'];
+
+/// Prima lettera usata se `letter1_for_rmb_name` non e' ancora letto dal record e il
+/// bit 0x10 e' acceso: riproduce la vecchia mappa (B per 0x3F/0x5F/0x7F, altrimenti A).
+fn legacy_letter1(char_byte: u8) -> char {
+    if matches!(char_byte, 0x3F | 0x5F | 0x7F) { 'B' } else { 'A' }
+}
+
+/// Porting di `resolveRmbBlockName` del JS.
+/// `letter1_for_rmb_name`: `dfLocation.exterior.exteriorData.letter1ForRMBName` (None = non letto).
+fn decode_rmb_name(
+    index: u8,
+    number: u8,
+    char_byte: u8,
+    letter1_for_rmb_name: Option<u8>,
+) -> Option<String> {
     let prefix = RMB_PREFIXES.get(index as usize)?;
 
-    // Gestione speciale MAGE: usa sempre AA
-    if *prefix == "MAGE" {
-        return Some(format!("MAGEAA{:02}.RMB", number));
-    }
-
-    // Gestione speciale Templi: multi-blocco con lettere A0..H0
-    if *prefix == "TEMP" {
-        if number == 0 {
-            return Some("TEMPAA00.RMB".to_string());
-        } else if (1..=8).contains(&number) {
-            let letter = (b'A' + (number - 1)) as char;
-            return Some(format!("TEMPAA{}0.RMB", letter));
+    // Letter 1.
+    let letter1 = if char_byte & 0x10 != 0 {
+        match letter1_for_rmb_name {
+            Some(c) => c as char,
+            None => legacy_letter1(char_byte),
         }
-    }
-
-    // Gestione speciale THIE: solo variante 00
-    if *prefix == "THIE" {
-        let size_str = match char_byte {
-            0x2F => "AL",
-            0x4F => "AM",
-            0x6F => "AS",
-            _ => "AL",
-        };
-        return Some(format!("THIE{}00.RMB", size_str));
-    }
-
-    let char_str = match char_byte {
-        0x00..=0x07 | 0x8F => "AA",
-        0x0F | 0x11 | 0x13 | 0x15 | 0x1F | 0x9F => "AA",
-        0x2F => "AL",
-        0x3F => "BL",
-        0x4F => "AM",
-        0x5F => "BM",
-        0x6F => "AS",
-        0x7F => "BS",
-        _ => "AA",
+    } else {
+        'A'
     };
 
-    Some(format!("{}{}{:02}.RMB", prefix, char_str, number))
+    // Letter 2: ((2 * char) & 0xff) >> 6 == bit 5-6 del byte.
+    let letter2 = LETTER2_ARRAY[(char_byte.wrapping_mul(2) >> 6) as usize];
+
+    // Numero del blocco.
+    let numbers = if index == 13 || index == 14 {
+        // Templi: lettera dal nibble basso + numero senza padding (es. TEMPAAA0.RMB).
+        format!("{}{}", (b'A' + (char_byte & 0x0F)) as char, number)
+    } else {
+        format!("{:02}", number)
+    };
+
+    Some(format!("{}{}{}{}.RMB", prefix, letter1, letter2, numbers))
 }
 
 struct BsaArchive<'a> {
@@ -170,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut row_str = String::new();
         for x in 0..block_width {
             let i = y * block_width + x;
-            let blk_name = decode_rmb_name(block_indices[i], block_numbers[i], block_chars[i])
+            let blk_name = decode_rmb_name(block_indices[i], block_numbers[i], block_chars[i], None)
             .unwrap_or_else(|| "??????.RMB".to_string());
 
             let exists = if blocks_bsa.get(&blk_name).is_some() { "OK" } else { "NOT FOUND" };
@@ -181,3 +179,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+

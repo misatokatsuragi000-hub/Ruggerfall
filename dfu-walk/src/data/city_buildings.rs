@@ -56,29 +56,40 @@ pub fn build_city_buildings(
     for by in 0..bh {
         for bx in 0..bw {
             let Some(name) = location.block_names.get(by * location.width + bx) else { continue };
-            let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
-            let Ok(rmb) = RmbBlock::parse(raw) else { continue };
+            let upper_name = name.to_ascii_uppercase();
 
             let gx = start_bx + bx;
             let gz = start_by + by;
             let bx0 = gx as f32 * BLOCK_SIZE_M;
             let bz0 = gz as f32 * BLOCK_SIZE_M;
             let bounds = [bx0, -(bz0 + BLOCK_SIZE_M), bx0 + BLOCK_SIZE_M, -bz0];
-            let is_wall_block = name.to_ascii_uppercase().starts_with("WALL");
 
-            let upper_name = name.to_ascii_uppercase();
-            let is_palace_block = !palace_spawned && (
+            // --- Palazzo, prima fase: coordinate o nome, senza lookup in BLOCKS.BSA ---
+            let palace_by_position = !palace_spawned && (
                 (bx == palace_target_bx && by == palace_target_by)
                 || upper_name.starts_with("PALA")
                 || upper_name == "CASTAA01.RMB"
-                || rmb.buildings.iter().any(|b| b.building_type == 16)
             );
-
-            if is_palace_block {
+            if palace_by_position {
                 let center_x = bx0 + BLOCK_SIZE_M * 0.5;
                 let center_z = -(bz0 + BLOCK_SIZE_M * 0.5);
                 let gy = ground_height(center_x, center_z);
+                let palace_mesh = generate_royal_palace(None, None);
+                builder.add(&palace_mesh, [0.0, 0.0, 0.0], 0.0, [center_x, gy, center_z]);
+                stats.built += 1;
+                palace_spawned = true;
+                continue;
+            }
 
+            let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
+            let Ok(rmb) = RmbBlock::parse(raw) else { continue };
+            let is_wall_block = upper_name.starts_with("WALL");
+
+            // --- Palazzo, seconda fase: rilevato dal building_type ---
+            if !palace_spawned && rmb.buildings.iter().any(|b| b.building_type == 16) {
+                let center_x = bx0 + BLOCK_SIZE_M * 0.5;
+                let center_z = -(bz0 + BLOCK_SIZE_M * 0.5);
+                let gy = ground_height(center_x, center_z);
                 let palace_mesh = generate_royal_palace(None, None);
                 builder.add(&palace_mesh, [0.0, 0.0, 0.0], 0.0, [center_x, gy, center_z]);
                 stats.built += 1;

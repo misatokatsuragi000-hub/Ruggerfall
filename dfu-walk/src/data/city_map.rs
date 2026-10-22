@@ -122,32 +122,48 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
     for by in 0..bh {
         for bx in 0..bw {
             let Some(name) = location.block_names.get(by * location.width + bx) else { continue };
-            let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
-            let Ok(rmb) = RmbBlock::parse(raw) else { continue };
-            let is_wall_block = name.to_ascii_uppercase().starts_with("WALL");
+            let upper_name = name.to_ascii_uppercase();
 
             let gx = start_bx + bx;
             let gz = start_by + by;
             let bx0 = gx as f32 * BLOCK_SIZE_M;
             let bz0 = gz as f32 * BLOCK_SIZE_M;
 
-            let upper_name = name.to_ascii_uppercase();
-            let is_palace_block = !palace_marked && (
+            // --- Palazzo, prima fase: coordinate o nome, senza lookup in BLOCKS.BSA ---
+            let palace_by_position = !palace_marked && (
                 (bx == palace_target_bx && by == palace_target_by)
                 || upper_name.starts_with("PALA")
                 || upper_name == "CASTAA01.RMB"
-                || rmb.buildings.iter().any(|b| b.building_type == 16)
             );
-
-            if is_palace_block {
+            if palace_by_position {
                 buildings.push(MapBuilding {
                     cx: bx0 + BLOCK_SIZE_M * 0.5,
                     cz: -(bz0 + BLOCK_SIZE_M * 0.5),
-                    half_w: 37.0,
-                    half_d: 27.0,
-                    rot_deg: 0.0,
-                    kind: Some(PoiKind::Palace),
-                    building_type: 16,
+                               half_w: 37.0,
+                               half_d: 27.0,
+                               rot_deg: 0.0,
+                               kind: Some(PoiKind::Palace),
+                               building_type: 16,
+                });
+                seen[PoiKind::Palace.index()].insert((gx, gz, 0));
+                palace_marked = true;
+                continue;
+            }
+
+            let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
+            let Ok(rmb) = RmbBlock::parse(raw) else { continue };
+            let is_wall_block = upper_name.starts_with("WALL");
+
+            // --- Palazzo, seconda fase: rilevato dal building_type ---
+            if !palace_marked && rmb.buildings.iter().any(|b| b.building_type == 16) {
+                buildings.push(MapBuilding {
+                    cx: bx0 + BLOCK_SIZE_M * 0.5,
+                    cz: -(bz0 + BLOCK_SIZE_M * 0.5),
+                               half_w: 37.0,
+                               half_d: 27.0,
+                               rot_deg: 0.0,
+                               kind: Some(PoiKind::Palace),
+                               building_type: 16,
                 });
                 seen[PoiKind::Palace.index()].insert((gx, gz, 0));
                 palace_marked = true;
@@ -157,9 +173,9 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
             for obj in rmb.placed_models().iter().filter(|o| o.is_building) {
                 let fp = footprints.entry(obj.model_id).or_insert_with(|| {
                     arch3d_bsa
-                        .get_by_id(obj.model_id)
-                        .and_then(|raw| Arch3dModel::parse(obj.model_id, raw).ok())
-                        .and_then(|m| Footprint::from_model(&m))
+                    .get_by_id(obj.model_id)
+                    .and_then(|raw| Arch3dModel::parse(obj.model_id, raw).ok())
+                    .and_then(|m| Footprint::from_model(&m))
                 });
                 let Some(fp) = *fp else { continue };
                 let passes = if is_wall_block { classify_wall(&fp).is_some() } else { fp.classify().is_some() };

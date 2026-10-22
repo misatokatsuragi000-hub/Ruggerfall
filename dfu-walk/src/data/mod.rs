@@ -9,6 +9,7 @@ pub mod terrain_city;
 pub mod mesh_builder;
 pub mod maps;
 pub mod blocks;
+pub mod interior;
 pub mod arch3d;
 pub mod atlas;
 pub mod bsa;

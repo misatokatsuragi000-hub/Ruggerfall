@@ -12,6 +12,27 @@ use crate::maps::DFLocation;
 use crate::palace_gen::generate_royal_palace;
 use crate::wall_gen::{classify_wall, generate_wall, wall_footprint, WallKind};
 
+/// Porta d'ingresso di un edificio, gia' collocata nel mondo (assi Bevy: x est,
+/// z = -nord, in metri). `block_name` + `subrecord` identificano l'interno da
+/// caricare da BLOCKS.BSA quando il giocatore preme E vicino alla porta.
+#[derive(Debug, Clone)]
+pub struct ExteriorDoor {
+    pub world_pos: [f32; 3],
+    /// rotazione del sotto-record in gradi (convenzione di `placed_models`)
+    pub rotation_deg: f32,
+    pub block_name: String,
+    pub subrecord: u8,
+}
+
+/// Quante porte d'ingresso pubblicare per ogni blocco RMB. In Daggerfall solo
+/// l'edificio principale di una cella ha un interno dedicato: gli altri modelli
+/// piazzati nel blocco usano template generici, quindi pubblicarli creerebbe
+/// porte che portano a stanze sbagliate.
+const DOORS_PER_BLOCK: usize = 1;
+/// La porta sta davanti alla facciata principale: meta' della profondita' piu'
+/// un passo avanti, cosi' il giocatore si ferma sul marciapiede e non dentro.
+const DOOR_FRONT_OFFSET_M: f32 = 1.5;
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CityStats {
     pub objects: usize,
@@ -25,9 +46,10 @@ pub fn build_city_buildings(
     blocks_bsa: &BsaArchive,
     arch3d_bsa: &BsaArchive,
     ground_height: &dyn Fn(f32, f32) -> f32,
-) -> (CityBuilder, CityStats) {
+) -> (CityBuilder, CityStats, Vec<ExteriorDoor>) {
     let mut builder = CityBuilder::new();
     let mut stats = CityStats::default();
+    let mut doors_out: Vec<ExteriorDoor> = Vec::new();
 
     let bw = location.width.min(8);
     let bh = location.height.min(8);
@@ -84,6 +106,8 @@ pub fn build_city_buildings(
             let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
             let Ok(rmb) = RmbBlock::parse(raw) else { continue };
             let is_wall_block = upper_name.starts_with("WALL");
+            let doors_before = doors_out.len();
+            let mut block_doors = 0usize;
 
             // --- Palazzo, seconda fase: rilevato dal building_type ---
             if !palace_spawned && rmb.buildings.iter().any(|b| b.building_type == 16) {
@@ -99,6 +123,12 @@ pub fn build_city_buildings(
 
             for pm in rmb.placed_models() {
                 stats.objects += 1;
+
+                // gli oggetti della lista misc del blocco (decorazioni) non sono
+                // edifici visitabili: vengono comunque conteggiati in stats.objects
+                if !pm.is_building {
+                    continue;
+                }
 
                 let (fp, btex) = match model_cache.entry(pm.model_id).or_insert_with(|| {
                     let raw = arch3d_bsa.get_by_id(pm.model_id)?;
@@ -197,9 +227,34 @@ pub fn build_city_buildings(
                 let gy = ground_height(px, pz) + lift;
                 builder.add(&mesh, [fp.cx, 0.0, fp.cz], rot, [px, gy, pz]);
                 stats.built += 1;
+
+                // una sola porta d'ingresso per ogni sotto-record (l'edificio ha una
+                // sola facciata principale): la prima costruita viene trattenuta
+                let sub = pm.subrecord.unwrap_or(0);
+                if !is_wall_block && block_doors < DOORS_PER_BLOCK {
+                    let phi = rot.to_radians();
+                    let (s, c) = phi.sin_cos();
+                    // fronte dell'edificio: centro del footprint ruotato attorno alla
+                    // posizione del modello + passo avanti lungo la normale della
+                    // facciata scelta (fronte = lato locale -z)
+                    let fx = px + (fp.cx * c + fp.cz * s) - DOOR_FRONT_OFFSET_M * s;
+                    let fz = pz + (-fp.cx * s + fp.cz * c) + DOOR_FRONT_OFFSET_M * c;
+                    doors_out.push(ExteriorDoor {
+                        world_pos: [fx, ground_height(fx, fz), fz],
+                        rotation_deg: rot,
+                        block_name: upper_name.clone(),
+                        subrecord: sub,
+                    });
+                    block_doors += 1;
+                }
             }
         }
+
+        // in Daggerfall solo l'edificio principale di una cella ha un interno
+        // dedicato: pubblicare le porte di tutti i sotto-record porterebbe a
+        // stanze di template generici, quindi ci si ferma a DOORS_PER_BLOCK
+        doors_out.truncate((doors_before + DOORS_PER_BLOCK).min(doors_out.len()));
     }
 
-    (builder, stats)
+    (builder, stats, doors_out)
 }

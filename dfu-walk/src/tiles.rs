@@ -1,6 +1,7 @@
 //! //! Caricamento e streaming dei map pixel con alberi 3D, case e shader WGSL.
 
 use crate::mod_textures::ModTextures;
+use crate::interior_enter::{CityDoors, LocalDoor};
 use crate::player::Player;
 use crate::terrain_material::{TerrainExtension, TerrainMaterial};
 use crate::trees::{spawn_trees_for_chunk, NaturePool};
@@ -42,6 +43,8 @@ pub struct TileResult {
     city_parts: Option<[MeshPart; MATERIAL_COUNT]>,
     city_textured: Vec<((u16, u8), MeshPart)>,
     city_rect: Option<CityTileRect>,
+    /// porte d'ingresso degli edifici del tile (in coordinate locali del tile)
+    doors: Vec<crate::interior_enter::LocalDoor>,
 }
 
 #[derive(Resource)]
@@ -50,6 +53,9 @@ pub struct Streaming {
     pub tile_px: (usize, usize),
     loaded: HashMap<(i32, i32), Entity>,
     pending: HashMap<(i32, i32), Task<Option<TileResult>>>,
+    /// task di tile gia' conclusi ma non ancora raccolti (perche' fuori raggio):
+    /// le loro porte vanno comunque aggiunte a CityDoors prima di buttarli
+    finished: HashMap<(i32, i32), Option<TileResult>>,
 }
 
 impl Streaming {
@@ -59,6 +65,7 @@ impl Streaming {
             tile_px,
             loaded: HashMap::new(),
             pending: HashMap::new(),
+            finished: HashMap::new(),
         }
     }
 
@@ -122,16 +129,27 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
 
         // quota del suolo in metri, come la mesh del terreno (x est, z = -nord)
         let ground = |x: f32, z: f32| terrain_height(&samples, x / CELL_SIZE, -z / CELL_SIZE);
-        let (builder, stats) = build_city_buildings(loc, &blocks_bsa, &arch3d_bsa, &ground);
+        let (builder, stats, doors) = build_city_buildings(loc, &blocks_bsa, &arch3d_bsa, &ground);
         info!(
-            "{}: {} oggetti, {} edifici, {} scartati, {} modelli mancanti",
-            loc.name, stats.objects, stats.built, stats.skipped, stats.missing_models
+            "{}: {} oggetti, {} edifici, {} scartati, {} modelli mancanti, {} porte",
+            loc.name, stats.objects, stats.built, stats.skipped, stats.missing_models, doors.len()
         );
         if !builder.is_empty() {
             let (parts, textured) = builder.into_all();
             city_parts = Some(parts);
             city_textured = textured;
         }
+        // le porte sono nelle coordinate locali del tile (0..MAP_PIXEL_SIZE):
+        // verranno traslate con l'origine quando il tile viene raccolto
+        local_doors = doors
+            .into_iter()
+            .map(|d| LocalDoor {
+                local_pos: [d.world_pos[0], d.world_pos[1], d.world_pos[2]],
+                rotation_deg: d.rotation_deg,
+                block_name: d.block_name,
+                subrecord: d.subrecord,
+            })
+            .collect();
     }
 
     let tilemap = generate_default_tilemap(&samples, mx, my, tile_preset.as_deref()).ok()?;

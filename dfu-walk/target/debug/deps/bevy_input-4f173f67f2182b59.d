@@ -1,0 +1,13 @@
+/workspace/dfu-walk/target/debug/deps/bevy_input-4f173f67f2182b59.d: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/axis.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/button_input.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/common_conditions.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/gamepad.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/gestures.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/keyboard.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/mouse.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/touch.rs
+
+/workspace/dfu-walk/target/debug/deps/libbevy_input-4f173f67f2182b59.rmeta: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/axis.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/button_input.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/common_conditions.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/gamepad.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/gestures.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/keyboard.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/mouse.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/touch.rs
+
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/lib.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/axis.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/button_input.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/common_conditions.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/gamepad.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/gestures.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/keyboard.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/mouse.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_input-0.15.3/src/touch.rs:

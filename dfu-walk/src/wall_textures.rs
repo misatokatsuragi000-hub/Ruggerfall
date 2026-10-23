@@ -1,7 +1,6 @@
 //! Texture originali di Daggerfall per le mura procedurali: un materiale per ogni
 //! (archivio, record), con clima e stagione applicati come per il resto del mondo.
 //! Se una mod fornisce la versione HD della stessa texture, usa quella.
-
 use crate::mod_textures::ModTextures;
 use crate::world::GameData;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -17,7 +16,7 @@ use std::collections::HashMap;
 pub struct WallTextures {
     /// (archivio dopo il clima, record) -> materiale
     cache: HashMap<(u32, u8), Handle<StandardMaterial>>,
-    /// flat (archivio, record) -> (materiale, larghezza px, altezza px)
+    /// flat (archivio, record) -> (materiale, larghezza scalata, altezza scalata)
     flats: HashMap<(u16, u8), Option<(Handle<StandardMaterial>, f32, f32)>>,
     /// (archivio originale, record) -> dimensioni in pixel della texture originale
     sizes: HashMap<(u16, u8), (f32, f32)>,
@@ -49,7 +48,6 @@ fn load_image(
         }
         return Some(handle);
     }
-
     // texture originale da TEXTURE.nnn
     let path = find_file_ci(&data.dir, &archive_file_name(archive))?;
     let file = TextureFile::open(&path).ok()?;
@@ -85,15 +83,13 @@ impl WallTextures {
         let season = if data.winter { Season::Winter } else { Season::Summer };
         let climate = world_climate_settings(world_climate).climate_type;
         let final_archive = apply_climate(archive as i32, record as i32, climate, season).max(0) as u32;
-
         let key = (final_archive, record);
         if let Some(handle) = self.cache.get(&key) {
             return handle.clone();
         }
-
         // se la variante per clima/stagione non esiste, riprova con l'archivio del modello
         let image = load_image(final_archive, record, data, mods, images)
-            .or_else(|| load_image(archive as u32, record, data, mods, images));
+        .or_else(|| load_image(archive as u32, record, data, mods, images));
         let material = match image {
             Some(texture) => StandardMaterial {
                 base_color_texture: Some(texture),
@@ -110,7 +106,6 @@ impl WallTextures {
                 }
             }
         };
-
         let handle = materials.add(material);
         self.cache.insert(key, handle.clone());
         handle
@@ -139,8 +134,10 @@ impl WallTextures {
 }
 
 impl WallTextures {
-    /// Materiale di un flat (sprite): l'indice di palette 0 e' trasparente. Restituisce anche
-    /// larghezza e altezza in pixel. `None` se l'archivio o il record non esistono.
+    /// Materiale di un flat (sprite): l'indice di palette 0 e' trasparente.
+    /// Restituisce anche larghezza e altezza SCALATE (come in Daggerfall Unity),
+    /// applicando il fattore di scala letto dal record della texture.
+    /// `None` se l'archivio o il record non esistono.
     pub fn flat_material(
         &mut self,
         archive: u16,
@@ -155,12 +152,23 @@ impl WallTextures {
         let result: Option<(Handle<StandardMaterial>, f32, f32)> = (|| {
             let path = find_file_ci(&data.dir, &archive_file_name(archive as u32))?;
             let file = TextureFile::open(&path).ok()?;
+            let rec = file.record(record as usize)?;
             let frame = file.frame(record as usize, 0).ok()?;
             if frame.width == 0 || frame.height == 0 {
                 return None;
             }
             let rgba = frame.to_rgba(&data.palette, Some(0));
-            let (w, h) = (frame.width as f32, frame.height as f32);
+            let w = frame.width as f32;
+            let h = frame.height as f32;
+
+            // Applica il fattore di scala dal record della texture, come in Daggerfall Unity:
+            // finalSize = size + size * (scale / 256)
+            // Alcuni sprite hanno scale = 256 (raddoppio), altri scale = 0 (1:1).
+            let scale_x = rec.scale_x as f32 / 256.0;
+            let scale_y = rec.scale_y as f32 / 256.0;
+            let final_w = w * (1.0 + scale_x);
+            let final_h = h * (1.0 + scale_y);
+
             let mut image = Image::new(
                 Extent3d { width: frame.width as u32, height: frame.height as u32, depth_or_array_layers: 1 },
                 TextureDimension::D2,
@@ -171,14 +179,14 @@ impl WallTextures {
             image.sampler = ImageSampler::nearest();
             let material = materials.add(StandardMaterial {
                 base_color_texture: Some(images.add(image)),
-                alpha_mode: AlphaMode::Mask(0.5),
-                cull_mode: None,
-                double_sided: true,
-                perceptual_roughness: 0.9,
-                reflectance: 0.1,
-                ..default()
+                                         alpha_mode: AlphaMode::Mask(0.5),
+                                         cull_mode: None,
+                                         double_sided: true,
+                                         perceptual_roughness: 0.9,
+                                         reflectance: 0.1,
+                                         ..default()
             });
-            Some((material, w, h))
+            Some((material, final_w, final_h))
         })();
         self.flats.insert((archive, record), result.clone());
         result

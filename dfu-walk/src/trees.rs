@@ -1,5 +1,4 @@
 //! Vegetazione e alberi 3D: viale reale verticale con area del castello e ponte sgombri.
-
 use crate::mod_textures::ModTextures;
 use crate::world::GameData;
 use bevy::prelude::*;
@@ -50,6 +49,7 @@ fn tree_count_for_climate(climate: i32) -> usize {
 }
 
 struct SimpleRng(u64);
+
 impl SimpleRng {
     fn new(seed: u64) -> Self {
         Self(if seed == 0 { 0x517cc1b727220a95 } else { seed })
@@ -71,7 +71,6 @@ impl SimpleRng {
 
 fn create_cross_billboard_mesh(w: f32, h: f32, is_unity_bottom_up: bool) -> Mesh {
     let hw = w / 2.0;
-
     let positions = vec![
         [-hw, 0.0, 0.0],
         [hw, 0.0, 0.0],
@@ -82,20 +81,16 @@ fn create_cross_billboard_mesh(w: f32, h: f32, is_unity_bottom_up: bool) -> Mesh
         [0.0, h, hw],
         [0.0, h, -hw],
     ];
-
     let normals = vec![[0.0, 1.0, 0.0]; 8];
     let (v_base, v_top) = if is_unity_bottom_up { (0.0, 1.0) } else { (1.0, 0.0) };
-
     let uvs = vec![
         [0.0, v_base], [1.0, v_base], [1.0, v_top], [0.0, v_top],
         [0.0, v_base], [1.0, v_base], [1.0, v_top], [0.0, v_top],
     ];
-
     let indices = vec![
         0, 1, 2, 0, 2, 3,
         4, 5, 6, 4, 6, 7,
     ];
-
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
@@ -136,7 +131,6 @@ impl NaturePool {
                 warn!("Impossibile aprire `{filename}`");
                 return Vec::new();
             };
-
             let mut species = Vec::new();
             for r in 0..tex_file.record_count() {
                 let Ok(frame) = tex_file.frame(r, 0) else { continue };
@@ -145,8 +139,22 @@ impl NaturePool {
                     continue;
                 }
 
-                let h_meters = (h_px as f32 * 0.08).clamp(3.0, 22.0);
-                let w_meters = (w_px as f32 * 0.08).clamp(2.0, 18.0);
+                // Per gli archivi di natura (>= 500), Daggerfall NON applica il fattore
+                // di scala memorizzato nel record: gli alberi usano la dimensione nativa
+                // dei pixel. I valori ScaleX/ScaleY = 256 presenti nel file sono un residuo
+                // del formato e raddoppierebbero erroneamente tutti gli alberi.
+                // La scala si applica solo ai flat generici (archivi < 500), vedi wall_textures.rs.
+                let (final_w, final_h) = if archive_id >= 500 {
+                    (w_px as f32, h_px as f32)
+                } else {
+                    let rec = tex_file.record(r).unwrap();
+                    let scale_x = rec.scale_x as f32 / 256.0;
+                    let scale_y = rec.scale_y as f32 / 256.0;
+                    (w_px as f32 * (1.0 + scale_x), h_px as f32 * (1.0 + scale_y))
+                };
+
+                let h_meters = (final_h * 0.08).clamp(3.0, 22.0);
+                let w_meters = (final_w * 0.08).clamp(2.0, 18.0);
 
                 let key = TextureKey {
                     archive: archive_id,
@@ -154,7 +162,6 @@ impl NaturePool {
                     frame: 0,
                     kind: MapKind::Albedo,
                 };
-
                 let (image_handle, is_hd) = if let Some(hd_handle) = mods.image_by_key(&key, images) {
                     (hd_handle, true)
                 } else {
@@ -172,24 +179,21 @@ impl NaturePool {
                     ));
                     (img, false)
                 };
-
                 let mesh_handle = meshes.add(create_cross_billboard_mesh(w_meters, h_meters, is_hd));
                 let mat_handle = materials.add(StandardMaterial {
                     base_color_texture: Some(image_handle),
-                    alpha_mode: AlphaMode::Mask(0.5),
-                    perceptual_roughness: 0.85,
-                    reflectance: 0.1,
-                    cull_mode: None,
-                    ..default()
+                                               alpha_mode: AlphaMode::Mask(0.5),
+                                               perceptual_roughness: 0.85,
+                                               reflectance: 0.1,
+                                               cull_mode: None,
+                                               ..default()
                 });
-
                 species.push(TreeType {
                     mesh: mesh_handle,
                     material: mat_handle,
                     size: h_meters * w_meters,
                 });
             }
-
             species.sort_by(|a, b| b.size.partial_cmp(&a.size).unwrap_or(std::cmp::Ordering::Equal));
             species
         })
@@ -215,101 +219,81 @@ pub fn spawn_trees_for_chunk(
     if climate == 223 {
         return;
     }
-
     let archive = nature_archive_for_climate(climate, winter);
     let tree_species = pool.get_or_load(archive, data, mods, images, meshes, materials);
     if tree_species.is_empty() {
         return;
     }
-
     let seed = ((mx as u64) << 32) ^ (my as u64) ^ 0x9e3779b97f4a7c15;
     let mut rng = SimpleRng::new(seed);
-
     commands.entity(chunk_entity).with_children(|parent| {
         // 1. Alberi selvaggi esterni alle mura
         let count = tree_count_for_climate(climate);
         for _ in 0..count {
             let gx = rng.gen_f32(2.0, 126.0);
             let gy = rng.gen_f32(2.0, 126.0);
-
             if let Some(r) = city_rect {
                 let m = 1.5;
                 if gx >= r.min_x as f32 - m && gx <= r.max_x as f32 + m && gy >= r.min_y as f32 - m && gy <= r.max_y as f32 + m {
                     continue;
                 }
             }
-
             let y = terrain_height(samples, gx, gy);
             if y <= (27.0 * TERRAIN_HEIGHT_SCALE) {
                 continue;
             }
-
             let slope_x = (terrain_height(samples, gx + 0.8, gy) - terrain_height(samples, gx - 0.8, gy)).abs();
             let slope_y = (terrain_height(samples, gx, gy + 0.8) - terrain_height(samples, gx - 0.8, gy)).abs();
             if slope_x.max(slope_y) > 7.0 {
                 continue;
             }
-
             let species_idx = rng.gen_range(tree_species.len());
             let tree = &tree_species[species_idx];
             let local_x = gx * CELL_SIZE;
             let local_z = -(gy * CELL_SIZE);
             let scale_var = rng.gen_f32(0.9, 1.3);
-
             parent.spawn((
                 Mesh3d(tree.mesh.clone()),
-                MeshMaterial3d(tree.material.clone()),
-                Transform::from_xyz(local_x, y, local_z).with_scale(Vec3::splat(scale_var)),
+                          MeshMaterial3d(tree.material.clone()),
+                          Transform::from_xyz(local_x, y, local_z).with_scale(Vec3::splat(scale_var)),
             ));
         }
-
         // 2. IL DOPPIO FILARE LUNGO IL VIALE (fermandosi tassativamente prima del ponte)
         if let Some(r) = city_rect {
             let start_bx = r.min_x / 16;
             let start_by = r.min_y / 16;
             let bw = (r.max_x - r.min_x) / 16;
             let bh = (r.max_y - r.min_y) / 16;
-
             let palace_target_bx = 5.min(bw.saturating_sub(2));
             let palace_target_by = 6.min(bh.saturating_sub(2));
-
             let palace_x = (start_bx + palace_target_bx) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5;
             let palace_z = -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5);
-
             let road_x = palace_x;
             let road_z_south = -((start_by + 1) as f32 * BLOCK_SIZE_M);
             // Si arresta a Z = palace_z + 56m, lasciando libero il ponte e l'ingresso del barbacane
             let road_z_north = palace_z + 56.0;
-
             let len = (road_z_south - road_z_north).max(0.0);
             let tree_pairs = (len / 15.0).floor() as usize;
             let side_offset = 15.0; // Carreggiata di 30m
-
             let big_trees = &tree_species[..tree_species.len().min(2)];
-
             for i in 0..tree_pairs {
                 let frac = (i as f32 + 0.5) / tree_pairs as f32;
                 let tz = road_z_south - frac * len;
-
                 for s in [-side_offset, side_offset] {
                     let tx = road_x + s;
-
                     // CONTROLLO RIGOROSO: nessun albero nella corte, sul ponte o nel fossato
                     let dist_to_palace_sq = (tx - palace_x).powi(2) + (tz - palace_z).powi(2);
                     if dist_to_palace_sq < 54.0 * 54.0 {
                         continue;
                     }
-
                     let gx = (tx / CELL_SIZE).clamp(0.0, 128.0);
                     let gy = ((-tz) / CELL_SIZE).clamp(0.0, 128.0);
                     let y = terrain_height(samples, gx, gy);
-
                     let tree = &big_trees[i % big_trees.len()];
-
                     parent.spawn((
                         Mesh3d(tree.mesh.clone()),
-                        MeshMaterial3d(tree.material.clone()),
-                        Transform::from_xyz(tx, y, tz).with_scale(Vec3::splat(1.45)),
+                                  MeshMaterial3d(tree.material.clone()),
+                                  Transform::from_xyz(tx, y, tz).with_scale(Vec3::splat(1.45)),
                     ));
                 }
             }

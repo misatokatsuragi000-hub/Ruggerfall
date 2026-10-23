@@ -19,6 +19,8 @@ pub struct WallTextures {
     cache: HashMap<(u32, u8), Handle<StandardMaterial>>,
     /// flat (archivio, record) -> (materiale, larghezza px, altezza px)
     flats: HashMap<(u16, u8), Option<(Handle<StandardMaterial>, f32, f32)>>,
+    /// (archivio originale, record) -> dimensioni in pixel della texture originale
+    sizes: HashMap<(u16, u8), (f32, f32)>,
 }
 
 /// Le UV delle mura superano 1: serve la ripetizione.
@@ -112,6 +114,27 @@ impl WallTextures {
         let handle = materials.add(material);
         self.cache.insert(key, handle.clone());
         handle
+    }
+}
+
+impl WallTextures {
+    /// Dimensioni in pixel del record originale di TEXTURE.nnn. Servono a normalizzare le UV
+    /// dei modelli ARCH3D (1/16 di pixel: dividere per 16 e poi per larghezza/altezza).
+    /// Si usa sempre la texture originale, anche se una mod fornisce la versione HD:
+    /// l'immagine HD copre comunque l'intervallo 0..1.
+    pub fn original_size(&mut self, archive: u16, record: u8, data: &GameData) -> (f32, f32) {
+        if let Some(size) = self.sizes.get(&(archive, record)) {
+            return *size;
+        }
+        let size = (|| {
+            let path = find_file_ci(&data.dir, &archive_file_name(archive as u32))?;
+            let file = TextureFile::open(&path).ok()?;
+            let frame = file.frame(record as usize, 0).ok()?;
+            (frame.width > 0 && frame.height > 0).then(|| (frame.width as f32, frame.height as f32))
+        })()
+        .unwrap_or((64.0, 64.0));
+        self.sizes.insert((archive, record), size);
+        size
     }
 }
 

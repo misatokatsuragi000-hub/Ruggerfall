@@ -1,4 +1,6 @@
-//! Assembla gli edifici con corridoio della Grande Strada Reale allargato a 52 metri.
+//! Assembla gli edifici con corridoio della Grande Strada Reale allargato a 52 metri,
+//! pulizia totale degli ostacoli lungo la carreggiata e trasformazione monumentale
+//! ESCLUSIVAMENTE dell'edificio principale della Gilda (nessun palazzo adiacente modificato).
 
 use std::collections::HashMap;
 
@@ -9,7 +11,7 @@ use super::building_gen::{
     choose_front_side, generate_building, seed_for, CityBuilder, Footprint, BLOCK_SIZE_M, DF_UNIT,
 };
 use super::maps::DFLocation;
-use super::palace_gen::generate_royal_palace;
+use super::palace_gen::{generate_guild_hall, generate_royal_palace};
 use super::wall_gen::{classify_wall, generate_wall, wall_footprint, WallKind};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -44,9 +46,9 @@ pub fn build_city_buildings(
     let road_z_south = -((start_by + 1) as f32 * BLOCK_SIZE_M);
     let road_z_north = -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5) + 32.0;
 
-    // Fascia di rispetto allargata: 26 metri per lato (52m totali) e 46m davanti al palazzo
+    // Fascia di rispetto: 26 metri per lato (52m totali) e 46m davanti al palazzo
     let is_on_avenue = |x: f32, z: f32| -> bool {
-        if z > road_z_south || z < (road_z_north - 40.0) {
+        if z > (road_z_south + 4.0) || z < (road_z_north - 40.0) {
             return false;
         }
         let dist_x = (x - road_x).abs();
@@ -64,7 +66,7 @@ pub fn build_city_buildings(
             let bz0 = gz as f32 * BLOCK_SIZE_M;
             let bounds = [bx0, -(bz0 + BLOCK_SIZE_M), bx0 + BLOCK_SIZE_M, -bz0];
 
-            // --- Palazzo, prima fase: coordinate o nome, senza lookup in BLOCKS.BSA ---
+            // --- Palazzo Reale, prima fase: coordinate o nome ---
             let palace_by_position = !palace_spawned && (
                 (bx == palace_target_bx && by == palace_target_by)
                 || upper_name.starts_with("PALA")
@@ -85,7 +87,7 @@ pub fn build_city_buildings(
             let Ok(rmb) = RmbBlock::parse(raw) else { continue };
             let is_wall_block = upper_name.starts_with("WALL");
 
-            // --- Palazzo, seconda fase: rilevato dal building_type ---
+            // --- Palazzo Reale, seconda fase: rilevato dal building_type == 16 ---
             if !palace_spawned && rmb.buildings.iter().any(|b| b.building_type == 16) {
                 let center_x = bx0 + BLOCK_SIZE_M * 0.5;
                 let center_z = -(bz0 + BLOCK_SIZE_M * 0.5);
@@ -97,7 +99,53 @@ pub fn build_city_buildings(
                 continue;
             }
 
-            for pm in rmb.placed_models() {
+            // Identifica se questo blocco contiene una Gilda
+            let is_guild_block = !is_wall_block
+            && (bx != palace_target_bx || by != palace_target_by)
+            && (upper_name.starts_with("MAGE")
+            || upper_name.starts_with("FIGH")
+            || upper_name.starts_with("THIE")
+            || upper_name.starts_with("DARK")
+            || upper_name.starts_with("GUIL")
+            || rmb.buildings.iter().any(|b| b.building_type == 11));
+
+            // In un blocco Gilda, individua SOLO l'edificio principale con impronta maggiore
+            let guild_pm_index = if is_guild_block {
+                let mut best_idx = None;
+                let mut max_area = 0.0f32;
+
+                for (idx, pm) in rmb.placed_models().iter().enumerate() {
+                    let maybe_fp = match model_cache.entry(pm.model_id).or_insert_with(|| {
+                        let raw = arch3d_bsa.get_by_id(pm.model_id)?;
+                        let m = Arch3dModel::parse(pm.model_id, raw).ok()?;
+                        let fp = Footprint::from_model(&m)?;
+                        let btex = m.building_textures();
+                        Some((fp, btex))
+                    }) {
+                        Some(pair) => Some(pair.0),
+                        None => None,
+                    };
+
+                    if let Some(fp) = maybe_fp {
+                        if fp.classify().is_some() {
+                            let area = fp.width * fp.depth;
+                            if area > max_area {
+                                max_area = area;
+                                best_idx = Some(idx);
+                            }
+                        }
+                    }
+                }
+                best_idx
+            } else {
+                None
+            };
+
+            // Identifica se questo blocco è il muro a Sud sulla colonna della strada reale
+            let is_south_gate_block = is_wall_block && bx == palace_target_bx && by < palace_target_by;
+            let mut south_gate_spawned = false;
+
+            for (pm_idx, pm) in rmb.placed_models().iter().enumerate() {
                 stats.objects += 1;
 
                 let (fp, btex) = match model_cache.entry(pm.model_id).or_insert_with(|| {
@@ -118,8 +166,43 @@ pub fn build_city_buildings(
                 let pz = -(bz0 + pm.n * DF_UNIT);
                 let rot = pm.rotation_deg;
 
+                let (s, c) = rot.to_radians().sin_cos();
+                let wx = px + fp.cx * c + fp.cz * s;
+                let wz = pz - fp.cx * s + fp.cz * c;
+
+                // FILTRO A MONTE: elimina qualsiasi modello nella Grande Strada Reale
+                if is_on_avenue(wx, wz) && !is_south_gate_block {
+                    stats.skipped += 1;
+                    continue;
+                }
+
                 if is_wall_block {
                     let wfp = wall_footprint(&fp);
+                    let is_wall_model = pm.model_id == 446 || classify_wall(&wfp).is_some();
+
+                    if is_south_gate_block && is_wall_model {
+                        if !south_gate_spawned {
+                            let mut gate_fp = wfp;
+                            gate_fp.width = BLOCK_SIZE_M;
+                            gate_fp.depth = gate_fp.depth.max(3.0);
+                            gate_fp.height = gate_fp.height.max(11.0);
+
+                            let seed = seed_for(
+                                pm.model_id,
+                                gx as i32 * 4096 + 2048,
+                                gz as i32 * 4096 + pm.n as i32,
+                            );
+                            let wall_tex = btex.wall.or(Some((317, 0)));
+                            let mesh = generate_wall(&gate_fp, WallKind::Gate, seed, wall_tex);
+                            let gy = ground_height(road_x, pz);
+
+                            builder.add(&mesh, [0.0, 0.0, 0.0], rot, [road_x, gy, pz]);
+                            stats.built += 1;
+                            south_gate_spawned = true;
+                        }
+                        continue;
+                    }
+
                     let maybe_wkind = if pm.model_id == 446 {
                         Some(WallKind::Gate)
                     } else {
@@ -170,15 +253,6 @@ pub fn build_city_buildings(
                     continue;
                 };
 
-                let (s, c) = rot.to_radians().sin_cos();
-                let wx = px + fp.cx * c + fp.cz * s;
-                let wz = pz - fp.cx * s + fp.cz * c;
-
-                if is_on_avenue(wx, wz) {
-                    stats.skipped += 1;
-                    continue;
-                }
-
                 let front = choose_front_side(
                     [wx, wz],
                     [fp.width * 0.5, fp.depth * 0.5],
@@ -191,7 +265,19 @@ pub fn build_city_buildings(
                     pm.n as i32 + gz as i32 * 4096,
                 );
 
-                let mesh = generate_building(&fp, kind, front, seed, btex);
+                // --- TRASFORMAZIONE SELETTIVA: SOLO L'EDIFICIO PRINCIPALE DELLA GILDA ---
+                let is_guild_building = is_guild_block && Some(pm_idx) == guild_pm_index;
+
+                let mesh = if is_guild_building {
+                    let mut guild_tex = btex;
+                    guild_tex.wall = Some((335, 0));
+                    guild_tex.roof = Some((339, 0));
+
+                    generate_guild_hall(&fp, front, seed, guild_tex)
+                } else {
+                    // Tutti i palazzi adiacenti rimangono normali edifici
+                    generate_building(&fp, kind, front, seed, btex)
+                };
 
                 let lift = if is_wall_block { 0.0 } else { (-(pm.y as f32) * DF_UNIT).clamp(0.0, 3.0) };
                 let gy = ground_height(px, pz) + lift;

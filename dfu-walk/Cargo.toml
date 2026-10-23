@@ -14,6 +14,7 @@ path = "src/data/mod.rs"
 name = "dfu-walk"
 path = "src/main.rs"
 
+
 [dependencies]
 bevy = { version = "0.15", default-features = false, features = [
     "bevy_asset",
@@ -27,6 +28,8 @@ bevy = { version = "0.15", default-features = false, features = [
     "multi_threaded",
     "x11",
     "tonemapping_luts",
+    "bevy_audio",   # <-- aggiungi
+    "vorbis",       # <-- aggiungi (decodifica .ogg)
 ] }
 dfmod = { version = "0.1.0", path = "../dfmod" }
 

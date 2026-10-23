@@ -1,25 +1,28 @@
 //! Terreno percorribile di Daggerfall con supporto per shader WGSL,
-//! mod HD di D.R.E.A.M., mappa interattiva (tasto M), vegetazione 3D e città/villaggi.
-mod wall_textures;
+//! mod HD di D.R.E.A.M., mappa interattiva (tasto M), vegetazione 3D,
+//! città/villaggi e colonna sonora originale.
 mod data;
 mod interior;
 mod local_map;
 mod map;
 mod mod_textures;
+mod music;
+mod music_zones;
 mod player;
 mod sky;
 mod terrain_material;
 mod tiles;
 mod trees;
+mod wall_textures;
 mod world;
 
-use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
-use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
 use crate::data::bsa::BsaArchive;
 use crate::data::maps::MapsReader;
 use crate::data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
 use crate::data::{find_file_ci, generate_default_samples, PakFile, Palette, WoodsFile};
+use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
+use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 use mod_textures::ModTexturesPlugin;
 use player::{Player, EYE_HEIGHT};
 use std::collections::HashMap;
@@ -49,6 +52,9 @@ struct StartInfo {
     my: i32,
 }
 
+#[derive(Resource)]
+struct RadiusSetting(i32);
+
 fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("errore: {msg}");
     std::process::exit(1)
@@ -63,14 +69,14 @@ fn next_value<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>, what:
 fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     let dir = it.next().unwrap_or_else(|| fail(USAGE));
-
-    let default_dream_mods = PathBuf::from("/mnt/1CE16DBE48849731/Daggerfall/DaggerfallUnity_Data/StreamingAssets/Mods");
+    let default_dream_mods = PathBuf::from(
+        "/mnt/1CE16DBE48849731/Daggerfall/DaggerfallUnity_Data/StreamingAssets/Mods",
+    );
     let default_mods = if default_dream_mods.exists() {
         default_dream_mods
     } else {
         PathBuf::from("mods")
     };
-
     let mut args = Args {
         dir: PathBuf::from(dir),
         mods_dir: default_mods,
@@ -80,11 +86,12 @@ fn parse_args() -> Args {
         hour: 10.5,
         day_minutes: 24.0,
     };
-
     while let Some(a) = it.next() {
         match a.as_str() {
             "--mods" => {
-                let m = it.next().unwrap_or_else(|| fail(format!("--mods vuole un percorso\n{USAGE}")));
+                let m = it
+                .next()
+                .unwrap_or_else(|| fail(format!("--mods vuole un percorso\n{USAGE}")));
                 args.mods_dir = PathBuf::from(m);
             }
             "--pixel" => {
@@ -95,7 +102,9 @@ fn parse_args() -> Args {
             "--radius" => args.radius = next_value::<i32>(&mut it, "--radius").clamp(1, 8),
             "--winter" => args.winter = true,
             "--hour" => args.hour = next_value(&mut it, "--hour"),
-            "--day-minutes" => args.day_minutes = next_value::<f32>(&mut it, "--day-minutes").max(0.0),
+            "--day-minutes" => {
+                args.day_minutes = next_value::<f32>(&mut it, "--day-minutes").max(0.0)
+            }
             other => fail(format!("opzione sconosciuta: {other}\n{USAGE}")),
         }
     }
@@ -103,11 +112,14 @@ fn parse_args() -> Args {
 }
 
 fn load_data(args: &Args) -> GameData {
-    let open = |name: &str| find_file_ci(&args.dir, name).unwrap_or_else(|| fail(format!("{name} non trovato in {}", args.dir.display())));
-
+    let open = |name: &str| {
+        find_file_ci(&args.dir, name)
+        .unwrap_or_else(|| fail(format!("{name} non trovato in {}", args.dir.display())))
+    };
     let read_file = |name: &str| {
         let p = open(name);
-        std::fs::read(&p).unwrap_or_else(|e| fail(format!("impossibile leggere {}: {e}", p.display())))
+        std::fs::read(&p)
+        .unwrap_or_else(|e| fail(format!("impossibile leggere {}: {e}", p.display())))
     };
 
     let maps_buf = Arc::new(read_file("MAPS.BSA"));
@@ -116,27 +128,29 @@ fn load_data(args: &Args) -> GameData {
 
     let maps_bsa = BsaArchive::parse(&maps_buf).unwrap_or_else(|e| fail(e));
     let maps_reader = MapsReader::new(&maps_bsa);
-    let mut locations = HashMap::new();
 
-    // Caricamento sicuro di tutte le città e villaggi
+    let mut locations = HashMap::new();
     for region in 0..62 {
         let name_file = format!("MAPNAMES.{:03}", region);
         if let Some(names_raw) = maps_bsa.get_by_name(&name_file) {
             if names_raw.len() < 4 {
                 continue;
             }
-            let count = u32::from_le_bytes(names_raw[0..4].try_into().unwrap_or_default()) as usize;
+            let count =
+            u32::from_le_bytes(names_raw[0..4].try_into().unwrap_or_default()) as usize;
             for i in 0..count {
                 if let Some(loc) = maps_reader.get_location(region, i) {
                     let mx = (loc.world_x / 32768) as i32;
-                    // Inversione asse Y: in Daggerfall Y=0 è a sud, in Bevy e nelle mappe la riga 0 è a nord
                     let my = (MAP_HEIGHT_PIXELS - 1) - ((loc.world_y / 32768) as i32);
                     locations.insert((mx, my), loc);
                 }
             }
         }
     }
-    println!("Caricate {} località (città e villaggi) dalla mappa.", locations.len());
+    println!(
+        "Caricate {} località (città e villaggi) dalla mappa.",
+             locations.len()
+    );
 
     GameData {
         dir: args.dir.clone(),
@@ -160,9 +174,12 @@ fn find_start(data: &GameData) -> (i32, i32) {
                     continue;
                 }
                 let (x, y) = (cx + dx, cy + dy);
-                if in_map(x, y) && data.woods.height_value(x, y) >= 30 && climate_of(data, x, y) != 223 {
-                    return (x, y);
-                }
+                if in_map(x, y)
+                    && data.woods.height_value(x, y) >= 30
+                    && climate_of(data, x, y) != 223
+                    {
+                        return (x, y);
+                    }
             }
         }
     }
@@ -172,6 +189,7 @@ fn find_start(data: &GameData) -> (i32, i32) {
 fn main() {
     let args = parse_args();
     let data = load_data(&args);
+
     // Capitale Daggerfall: map_x = 207, map_y = 499 - 286 = 213
     let (mx, my) = args.pixel.unwrap_or_else(|| {
         if data.locations.contains_key(&(207, 213)) {
@@ -180,9 +198,10 @@ fn main() {
             find_start(&data)
         }
     });
-
     if !in_map(mx, my) {
-        fail(format!("il map pixel ({mx}, {my}) è fuori dalla mappa (0..999, 0..499)"));
+        fail(format!(
+            "il map pixel ({mx}, {my}) è fuori dalla mappa (0..999, 0..499)"
+        ));
     }
 
     println!("Partenza dal map pixel ({mx}, {my}), raggio {}.", args.radius);
@@ -195,14 +214,16 @@ fn main() {
     println!("         E = entra nella taverna vicina / esci vicino alla porta (Backspace = esci sempre).");
 
     App::new()
-    .add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "Daggerfall - terreno e città".into(),
-                             resolution: (1280.0_f32, 720.0_f32).into(),
-                             ..default()
+    .add_plugins(
+        DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Daggerfall - terreno e città".into(),
+                                 resolution: (1280.0_f32, 720.0_f32).into(),
+                                 ..default()
+            }),
+            ..default()
         }),
-        ..default()
-    }))
+    )
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(ModTexturesPlugin {
         dir: args.mods_dir.clone(),
@@ -224,7 +245,20 @@ fn main() {
         hour: args.hour,
         day_minutes: args.day_minutes,
     })
-    .add_systems(Startup, (setup, sky::setup_sky, map::setup_map_ui, local_map::setup_local_map).chain())
+    // --- Musica di Daggerfall ---
+    .add_event::<music::MusicEvent>()
+    .insert_resource(music::MusicController::default())
+    .add_systems(
+        Startup,
+        (
+            setup,
+         sky::setup_sky,
+         map::setup_map_ui,
+         local_map::setup_local_map,
+         music::start_music,
+        )
+        .chain(),
+    )
     .add_systems(
         Update,
         (
@@ -242,15 +276,14 @@ fn main() {
          map::update_map_marker,
          local_map::toggle_local_map,
          local_map::update_local_map,
+         music_zones::update_music_zone,
+         music::play_music,
          update_title,
         )
         .chain(),
     )
     .run();
 }
-
-#[derive(Resource)]
-struct RadiusSetting(i32);
 
 fn setup(
     mut commands: Commands,
@@ -265,7 +298,8 @@ fn setup(
         east: start.mx,
         north: MAP_HEIGHT_PIXELS - start.my,
     };
-    let samples = generate_default_samples(&data.woods, start.mx, start.my).unwrap_or_else(|e| fail(e));
+    let samples = generate_default_samples(&data.woods, start.mx, start.my)
+    .unwrap_or_else(|e| fail(e));
     let ground = terrain_height(&samples, 64.0, 64.0);
     commands.insert_resource(origin);
 
@@ -289,7 +323,6 @@ fn setup(
                     Transform::from_xyz(MAP_PIXEL_SIZE / 2.0, ground + EYE_HEIGHT, -MAP_PIXEL_SIZE / 2.0),
                     Player::new(ground),
     ));
-
     let _ = CELL_SIZE;
 }
 
@@ -299,6 +332,7 @@ fn update_title(
     streaming: Res<Streaming>,
     data: Res<GameData>,
     clock: Res<sky::SkyClock>,
+    music: Res<music::MusicController>,
     player: Query<(&Player, &Transform)>,
                 mut windows: Query<&mut Window, With<PrimaryWindow>>,
                 mut state: Local<(f32, f32)>,
@@ -309,11 +343,20 @@ fn update_title(
         return;
     }
     state.0 = 0.0;
-    let (Ok((p, tf)), Ok(mut window)) = (player.get_single(), windows.get_single_mut()) else { return };
+
+    let (Ok((p, tf)), Ok(mut window)) = (player.get_single(), windows.get_single_mut()) else {
+        return;
+    };
     let (mx, my) = map_pixel_of(&origin, tf.translation);
     let fps = if state.1 > 0.0 { 1.0 / state.1 } else { 0.0 };
+    let track = music
+    .current_track
+    .as_deref()
+    .map(|t| t.rsplit('/').next().unwrap_or(t))
+    .unwrap_or("nessuna");
+
     window.title = format!(
-        "Daggerfall - map pixel ({mx}, {my}) clima {} - quota {:.0} m - ore {:02}:{:02} - {}{} tile - {fps:.0} fps [M: mappa, L: mappa locale]",
+        "Daggerfall - map pixel ({mx}, {my}) clima {} - quota {:.0} m - ore {:02}:{:02} - {}{} tile - {fps:.0} fps - ♪ {track} [M: mappa, L: locale]",
                            climate_of(&data, mx, my),
                            p.feet_y,
                            clock.hours.floor() as i32,
@@ -322,5 +365,3 @@ fn update_title(
                                streaming.loaded_count(),
     );
 }
-
-

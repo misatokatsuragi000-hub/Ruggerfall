@@ -53,12 +53,11 @@ fn i16_at(d: &[u8], p: usize) -> i16 {
     i16::from_le_bytes(d[p..p + 2].try_into().unwrap())
 }
 
+/// UV grezza: intero a 16 bit con segno, in 1/16 di pixel. Non va tagliata a 12 bit: le pareti
+/// larghe hanno valori come 0x0800, 0x1000, 0x1800 (2, 4, 6 ripetizioni di una texture da 64 px)
+/// che il taglio a 12 bit azzererebbe o cambierebbe di segno.
 fn uv12(raw: i16) -> f32 {
-    let mut v = (raw as u16) & 0x0FFF;
-    if v & 0x0800 != 0 {
-        v |= 0xF000;
-    }
-    (v as i16) as f32
+    raw as f32
 }
 
 struct RawPlane {
@@ -245,6 +244,33 @@ impl Arch3dModel {
             .map(|p| [p[0] as f32 * MODEL_TO_METERS, -(p[1] as f32) * MODEL_TO_METERS, p[2] as f32 * MODEL_TO_METERS])
             .collect();
         let raw_pos: Vec<[f32; 3]> = raw_points.iter().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
+
+        // Diagnostica UV: con DF_UV_DEBUG=1 stampa i piani piu' larghi di 3 m
+        if std::env::var("DF_UV_DEBUG").is_ok() {
+            for (fi, pl) in planes.iter().enumerate() {
+                let n = pl.points.len();
+                let pos = |i: usize| raw_pos[pl.points[i].0 as usize];
+                let dist = |a: [f32; 3], b: [f32; 3]| {
+                    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() * MODEL_TO_METERS
+                };
+                let widest = (0..n).map(|i| dist(pos(i), pos((i + 1) % n))).fold(0.0, f32::max);
+                if widest > 3.0 {
+                    let raw: Vec<String> = pl
+                        .points
+                        .iter()
+                        .take(4)
+                        .map(|&(_, u, v)| format!("{:04X}/{:04X}", u as u16, v as u16))
+                        .collect();
+                    let uv = plane_uvs(&pl.points, &raw_pos);
+                    println!(
+                        "UV dbg modello {id} piano {fi}: tex {}/{} n={n} larghezza max {widest:.2} m, raw u/v {raw:?}, uv {:?}",
+                        pl.texture >> 7,
+                        pl.texture & 0x7F,
+                        &uv[..uv.len().min(4)]
+                    );
+                }
+            }
+        }
 
         let faces = planes
             .iter()

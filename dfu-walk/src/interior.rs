@@ -519,7 +519,10 @@ pub fn interior_move(
 }
 
 /// Gli sprite (tavoli, persone...) guardano sempre la camera.
-pub fn face_flats(player: Query<&Player>, mut flats: Query<&mut Transform, With<FlatBillboard>>) {
+pub fn face_flats(
+    player: Query<&Player>,
+    mut flats: Query<&mut Transform, (With<FlatBillboard>, Without<crate::tiles::NpcWalker>)>,
+) {
     let Ok(p) = player.get_single() else { return };
     let rot = Quat::from_rotation_y(p.yaw);
     for mut tf in &mut flats {

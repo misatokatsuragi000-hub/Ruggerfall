@@ -16,13 +16,14 @@ use std::collections::HashMap;
 pub struct WallTextures {
     /// (archivio dopo il clima, record) -> materiale
     cache: HashMap<(u32, u8), Handle<StandardMaterial>>,
-    /// flat (archivio, record) -> (materiale, larghezza scalata, altezza scalata)
+    /// flat frame 0: (archivio, record) -> (materiale, larghezza scalata, altezza scalata)
     flats: HashMap<(u16, u8), Option<(Handle<StandardMaterial>, f32, f32)>>,
+    /// frame animati: (archivio, record, frame) -> (materiale, larghezza scalata, altezza scalata)
+    flat_frames: HashMap<(u16, u8, u16), Option<(Handle<StandardMaterial>, f32, f32)>>,
     /// (archivio originale, record) -> dimensioni in pixel della texture originale
     sizes: HashMap<(u16, u8), (f32, f32)>,
 }
 
-/// Le UV delle mura superano 1: serve la ripetizione.
 fn repeat_sampler() -> ImageSampler {
     ImageSampler::Descriptor(ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
@@ -40,7 +41,6 @@ fn load_image(
     mods: &mut ModTextures,
     images: &mut Assets<Image>,
 ) -> Option<Handle<Image>> {
-    // versione HD delle mod, se c'e'
     let key = TextureKey { archive, record: record as u32, frame: 0, kind: MapKind::Albedo };
     if let Some(handle) = mods.image_by_key(&key, images) {
         if let Some(img) = images.get_mut(&handle) {
@@ -48,7 +48,6 @@ fn load_image(
         }
         return Some(handle);
     }
-    // texture originale da TEXTURE.nnn
     let path = find_file_ci(&data.dir, &archive_file_name(archive))?;
     let file = TextureFile::open(&path).ok()?;
     let frame = file.frame(record as usize, 0).ok()?;
@@ -68,8 +67,6 @@ fn load_image(
 }
 
 impl WallTextures {
-    /// Materiale per la texture `(archive, record)` del modello originale, nel clima e
-    /// nella stagione del map pixel.
     pub fn material(
         &mut self,
         archive: u16,
@@ -87,7 +84,6 @@ impl WallTextures {
         if let Some(handle) = self.cache.get(&key) {
             return handle.clone();
         }
-        // se la variante per clima/stagione non esiste, riprova con l'archivio del modello
         let image = load_image(final_archive, record, data, mods, images)
         .or_else(|| load_image(archive as u32, record, data, mods, images));
         let material = match image {
@@ -110,13 +106,7 @@ impl WallTextures {
         self.cache.insert(key, handle.clone());
         handle
     }
-}
 
-impl WallTextures {
-    /// Dimensioni in pixel del record originale di TEXTURE.nnn. Servono a normalizzare le UV
-    /// dei modelli ARCH3D (1/16 di pixel: dividere per 16 e poi per larghezza/altezza).
-    /// Si usa sempre la texture originale, anche se una mod fornisce la versione HD:
-    /// l'immagine HD copre comunque l'intervallo 0..1.
     pub fn original_size(&mut self, archive: u16, record: u8, data: &GameData) -> (f32, f32) {
         if let Some(size) = self.sizes.get(&(archive, record)) {
             return *size;
@@ -131,46 +121,40 @@ impl WallTextures {
         self.sizes.insert((archive, record), size);
         size
     }
-}
 
-impl WallTextures {
-    /// Materiale di un flat (sprite): l'indice di palette 0 e' trasparente.
-    /// Restituisce anche larghezza e altezza SCALATE (come in Daggerfall Unity),
-    /// applicando il fattore di scala letto dal record della texture.
-    /// `None` se l'archivio o il record non esistono.
-    pub fn flat_material(
+    /// Materiale di un flat con frame specifico (per animazioni NPC).
+    /// Applica il fattore di scala ScaleX/ScaleY dal record (come in Daggerfall Unity).
+    pub fn flat_material_frame(
         &mut self,
         archive: u16,
         record: u8,
+        frame: u16,
         data: &GameData,
         images: &mut Assets<Image>,
         materials: &mut Assets<StandardMaterial>,
     ) -> Option<(Handle<StandardMaterial>, f32, f32)> {
-        if let Some(cached) = self.flats.get(&(archive, record)) {
+        let key = (archive, record, frame);
+        if let Some(cached) = self.flat_frames.get(&key) {
             return cached.clone();
         }
         let result: Option<(Handle<StandardMaterial>, f32, f32)> = (|| {
             let path = find_file_ci(&data.dir, &archive_file_name(archive as u32))?;
             let file = TextureFile::open(&path).ok()?;
             let rec = file.record(record as usize)?;
-            let frame = file.frame(record as usize, 0).ok()?;
-            if frame.width == 0 || frame.height == 0 {
+            let img = file.frame(record as usize, frame as usize).ok()?;
+            if img.width == 0 || img.height == 0 {
                 return None;
             }
-            let rgba = frame.to_rgba(&data.palette, Some(0));
-            let w = frame.width as f32;
-            let h = frame.height as f32;
+            let rgba = img.to_rgba(&data.palette, Some(0));
 
-            // Applica il fattore di scala dal record della texture, come in Daggerfall Unity:
-            // finalSize = size + size * (scale / 256)
-            // Alcuni sprite hanno scale = 256 (raddoppio), altri scale = 0 (1:1).
+            // Applica il fattore di scala dal record (diviso 256 come in DFU).
             let scale_x = rec.scale_x as f32 / 256.0;
             let scale_y = rec.scale_y as f32 / 256.0;
-            let final_w = w * (1.0 + scale_x);
-            let final_h = h * (1.0 + scale_y);
+            let final_w = img.width as f32 * (1.0 + scale_x);
+            let final_h = img.height as f32 * (1.0 + scale_y);
 
             let mut image = Image::new(
-                Extent3d { width: frame.width as u32, height: frame.height as u32, depth_or_array_layers: 1 },
+                Extent3d { width: img.width as u32, height: img.height as u32, depth_or_array_layers: 1 },
                 TextureDimension::D2,
                 rgba,
                 TextureFormat::Rgba8UnormSrgb,
@@ -188,6 +172,23 @@ impl WallTextures {
             });
             Some((material, final_w, final_h))
         })();
+        self.flat_frames.insert(key, result.clone());
+        result
+    }
+
+    /// Versione semplificata: frame 0 (per decorazioni e flat statici).
+    pub fn flat_material(
+        &mut self,
+        archive: u16,
+        record: u8,
+        data: &GameData,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
+    ) -> Option<(Handle<StandardMaterial>, f32, f32)> {
+        if let Some(cached) = self.flats.get(&(archive, record)) {
+            return cached.clone();
+        }
+        let result = self.flat_material_frame(archive, record, 0, data, images, materials);
         self.flats.insert((archive, record), result.clone());
         result
     }

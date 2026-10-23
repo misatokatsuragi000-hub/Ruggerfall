@@ -2,6 +2,7 @@
 //! mod HD di D.R.E.A.M., mappa interattiva (tasto M), vegetazione 3D,
 //! città/villaggi e colonna sonora originale.
 mod data;
+mod grass;
 mod interior;
 mod local_map;
 mod map;
@@ -121,14 +122,11 @@ fn load_data(args: &Args) -> GameData {
         std::fs::read(&p)
         .unwrap_or_else(|e| fail(format!("impossibile leggere {}: {e}", p.display())))
     };
-
     let maps_buf = Arc::new(read_file("MAPS.BSA"));
     let blocks_buf = Arc::new(read_file("BLOCKS.BSA"));
     let arch3d_buf = Arc::new(read_file("ARCH3D.BSA"));
-
     let maps_bsa = BsaArchive::parse(&maps_buf).unwrap_or_else(|e| fail(e));
     let maps_reader = MapsReader::new(&maps_bsa);
-
     let mut locations = HashMap::new();
     for region in 0..62 {
         let name_file = format!("MAPNAMES.{:03}", region);
@@ -151,7 +149,6 @@ fn load_data(args: &Args) -> GameData {
         "Caricate {} località (città e villaggi) dalla mappa.",
              locations.len()
     );
-
     GameData {
         dir: args.dir.clone(),
         woods: Arc::new(WoodsFile::open(open("WOODS.WLD")).unwrap_or_else(|e| fail(e))),
@@ -189,7 +186,6 @@ fn find_start(data: &GameData) -> (i32, i32) {
 fn main() {
     let args = parse_args();
     let data = load_data(&args);
-
     // Capitale Daggerfall: map_x = 207, map_y = 499 - 286 = 213
     let (mx, my) = args.pixel.unwrap_or_else(|| {
         if data.locations.contains_key(&(207, 213)) {
@@ -203,7 +199,6 @@ fn main() {
             "il map pixel ({mx}, {my}) è fuori dalla mappa (0..999, 0..499)"
         ));
     }
-
     println!("Partenza dal map pixel ({mx}, {my}), raggio {}.", args.radius);
     println!("Cartella mod: {}", args.mods_dir.display());
     println!("Comandi: clic = cattura il mouse, Esc = rilascia, WASD = cammina, Maiusc = corri,");
@@ -211,6 +206,7 @@ fn main() {
     println!("         T = ferma/riprendi il tempo, , e . = un'ora indietro/avanti.");
     println!("         M = apri/chiudi mappa dell'Iliac Bay.");
     println!("         L = mappa locale della città (taverne verdi, negozi rossi, gilde blu).");
+    println!("         G = attiva/disattiva l'erba.");
     println!("         E = entra nella taverna vicina / esci vicino alla porta (Backspace = esci sempre).");
 
     App::new()
@@ -239,6 +235,7 @@ fn main() {
     .insert_resource(StartInfo { mx, my })
     .insert_resource(RadiusSetting(args.radius))
     .insert_resource(NaturePool::default())
+    .insert_resource(grass::GrassSettings::default())
     .insert_resource(wall_textures::WallTextures::default())
     .insert_resource(interior::InteriorState::default())
     .insert_resource(sky::SkyConfig {
@@ -256,6 +253,7 @@ fn main() {
          map::setup_map_ui,
          local_map::setup_local_map,
          music::start_music,
+         grass::setup_grass,
         )
         .chain(),
     )
@@ -267,6 +265,7 @@ fn main() {
          interior::interior_enter_exit,
          interior::interior_move,
          interior::face_flats,
+         tiles::update_npcs,  // <-- AGGIUNGI
          player::player_move,
          rebase_origin,
          stream_tiles,
@@ -282,6 +281,12 @@ fn main() {
         )
         .chain(),
     )
+    .add_systems(
+        Update,
+        (grass::grass_toggle, grass::update_grass.run_if(interior::outside))
+            .chain()
+            .after(collect_tiles),
+    )
     .run();
 }
 
@@ -293,7 +298,6 @@ fn setup(
 ) {
     let streaming = Streaming::new(radius.0, (1024, 1024));
     commands.insert_resource(streaming);
-
     let origin = Origin {
         east: start.mx,
         north: MAP_HEIGHT_PIXELS - start.my,
@@ -302,7 +306,6 @@ fn setup(
     .unwrap_or_else(|e| fail(e));
     let ground = terrain_height(&samples, 64.0, 64.0);
     commands.insert_resource(origin);
-
     let reach = (radius.0 as f32 + 0.3) * MAP_PIXEL_SIZE;
     commands.spawn((
         Camera3d::default(),
@@ -343,7 +346,6 @@ fn update_title(
         return;
     }
     state.0 = 0.0;
-
     let (Ok((p, tf)), Ok(mut window)) = (player.get_single(), windows.get_single_mut()) else {
         return;
     };
@@ -354,7 +356,6 @@ fn update_title(
     .as_deref()
     .map(|t| t.rsplit('/').next().unwrap_or(t))
     .unwrap_or("nessuna");
-
     window.title = format!(
         "Daggerfall - map pixel ({mx}, {my}) clima {} - quota {:.0} m - ore {:02}:{:02} - {}{} tile - {fps:.0} fps - ♪ {track} [M: mappa, L: locale]",
                            climate_of(&data, mx, my),

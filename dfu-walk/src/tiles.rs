@@ -303,6 +303,7 @@ pub struct TileResult {
     city_parts: Option<[MeshPart; MATERIAL_COUNT]>,
     city_textured: Vec<((u16, u8), MeshPart)>,
     city_rect: Option<CityTileRect>,
+    city_buildings: Vec<crate::data::city_map::MapBuilding>,
     /// Decorazioni statiche: (x, z, archive, record)
     exterior_flats: Vec<(f32, f32, u16, u8)>,
     /// NPC: (x, z, archivio persona, limiti di passeggiata)
@@ -457,6 +458,11 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
             }
             info!("  {} decorazioni + {} NPC in {}", exterior_flats.len(), exterior_npcs.len(), loc.name);
         }
+
+        let map = crate::data::city_map::collect_city_map(loc, &blocks_bsa, &arch3d_bsa);
+        let city_buildings = map.buildings;
+        // keep the value for returning below - if any later code needs it, it is stored here
+        let _ = city_buildings;
     }
 
     let tilemap = generate_default_tilemap(&samples, mx, my, tile_preset.as_deref()).ok()?;
@@ -489,8 +495,17 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
         }
     }
 
+    let city_buildings = if let Some(loc) = data.locations.get(&(mx, my)) {
+        let blocks_bsa = BsaArchive::parse(&data.blocks_buf).ok()?;
+        let arch3d_bsa = BsaArchive::parse(&data.arch3d_buf).ok()?;
+        let map = crate::data::city_map::collect_city_map(loc, &blocks_bsa, &arch3d_bsa);
+        map.buildings
+    } else {
+        Vec::new()
+    };
+
     Some(TileResult { archive, mesh, encoded_tilemap: encoded, samples: Arc::new(samples),
-        city_parts, city_textured, city_rect: city_rect_opt, exterior_flats, exterior_npcs,
+        city_parts, city_textured, city_rect: city_rect_opt, city_buildings, exterior_flats, exterior_npcs,
         exterior_enemies, water, grass_tilemap, grass_mask })
 }
 
@@ -513,7 +528,8 @@ pub fn rebase_origin(
 
 pub fn stream_tiles(
     mut commands: Commands, mut streaming: ResMut<Streaming>, mut field: ResMut<HeightField>,
-    data: Res<GameData>, origin: Res<Origin>, player: Query<&Transform, With<Player>>,
+    mut colliders: ResMut<BuildingColliders>, data: Res<GameData>, origin: Res<Origin>,
+    player: Query<&Transform, With<Player>>,
 ) {
     let Ok(tf) = player.get_single() else { return };
     let (pmx, pmy) = map_pixel_of(&origin, tf.translation);
@@ -525,6 +541,7 @@ pub fn stream_tiles(
     for key in far {
         if let Some(e) = streaming.loaded.remove(&key) { commands.entity(e).despawn_recursive(); }
         field.tiles.remove(&key);
+        colliders.chunks.remove(&key);
     }
     streaming.pending.retain(|k, _| near(*k, keep));
 
@@ -551,10 +568,9 @@ pub fn stream_tiles(
 #[allow(clippy::too_many_arguments)]
 pub fn collect_tiles(
     mut commands: Commands, mut streaming: ResMut<Streaming>, mut field: ResMut<HeightField>,
-    data: Res<GameData>, origin: Res<Origin>, mut mods: ResMut<ModTextures>,
-    mut nature_pool: ResMut<NaturePool>, mut meshes: ResMut<Assets<Mesh>>,
-    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
-    mut standard_materials: ResMut<Assets<StandardMaterial>>,
+    mut colliders: ResMut<BuildingColliders>, data: Res<GameData>, origin: Res<Origin>,
+    mut mods: ResMut<ModTextures>, mut nature_pool: ResMut<NaturePool>, mut meshes: ResMut<Assets<Mesh>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>, mut standard_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>, mut wall_textures: ResMut<WallTextures>,
     mut npc_sprites: Local<HashMap<u16, Option<Arc<NpcSpriteSet>>>>,
     mut enemy_sprites: Local<HashMap<u16, Option<Arc<EnemySpriteSet>>>>,
@@ -716,6 +732,7 @@ pub fn collect_tiles(
                               data.winter, &tile.samples, &data, &mut mods, &mut nature_pool,
                               &mut images, &mut meshes, &mut standard_materials, tile.city_rect);
 
+        colliders.chunks.insert(key, tile.city_buildings);
         streaming.loaded.insert(key, chunk_entity);
         field.tiles.insert(key, tile.samples);
     }
@@ -939,3 +956,28 @@ pub fn update_enemies(
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

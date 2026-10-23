@@ -1,4 +1,9 @@
-use crate::data::city_map::MapBuilding;
+//! Dati condivisi: archivi di gioco, origine mobile e altezze del suolo.
+//!
+//! Sistema di coordinate: in Bevy X = est, Y = su, Z = -nord. Le posizioni sono
+//! relative a un'origine mobile (in map pixel) così restano piccole anche a
+//! centinaia di chilometri dal punto di partenza (precisione degli f32).
+
 use bevy::prelude::*;
 use crate::data::maps::DFLocation;
 use crate::data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
@@ -40,11 +45,6 @@ pub struct HeightField {
     pub tiles: HashMap<(i32, i32), Arc<HeightSamples>>,
 }
 
-#[derive(Resource, Default)]
-pub struct BuildingColliders {
-    pub chunks: HashMap<(i32, i32), Vec<MapBuilding>>,
-}
-
 pub fn in_map(mx: i32, my: i32) -> bool {
     (0..MAP_WIDTH_PIXELS).contains(&mx) && (0..MAP_HEIGHT_PIXELS).contains(&my)
 }
@@ -53,7 +53,7 @@ pub fn in_map(mx: i32, my: i32) -> bool {
 pub fn absolute(origin: &Origin, pos: Vec3) -> (f64, f64) {
     (
         pos.x as f64 + origin.east as f64 * S,
-        -(pos.z as f64) + origin.north as f64 * S,
+     -(pos.z as f64) + origin.north as f64 * S,
     )
 }
 
@@ -67,8 +67,8 @@ pub fn map_pixel_of(origin: &Origin, pos: Vec3) -> (i32, i32) {
 pub fn tile_translation(origin: &Origin, mx: i32, my: i32) -> Vec3 {
     Vec3::new(
         (mx - origin.east) as f32 * MAP_PIXEL_SIZE,
-        0.0,
-        -(((MAP_HEIGHT_PIXELS - my) - origin.north) as f32) * MAP_PIXEL_SIZE,
+              0.0,
+              -(((MAP_HEIGHT_PIXELS - my) - origin.north) as f32) * MAP_PIXEL_SIZE,
     )
 }
 

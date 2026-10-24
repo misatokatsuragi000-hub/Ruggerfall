@@ -15,7 +15,6 @@
 //!
 //! Posizioni: gli oggetti dentro un Block sono relativi al sotto-record
 //! (X, Z, rotazione di `subrecords[i]`); quelli "misc" sono relativi al blocco.
-
 pub const RMB_HEADER_LEN: usize = 6776;
 const OFF_BLOCK_POS: usize = 3;
 const BLOCK_POS_SIZE: usize = 20;
@@ -34,9 +33,11 @@ const BUILDING_DATA_SIZE: usize = 26;
 /// blocco (n = 4096 - |z|); se false dal bordo SUD (n = |z|). Se gli edifici risultano
 /// specchiati nord/sud rispetto alle strade, inverti questo valore.
 pub const Z_FROM_NORTH_EDGE: bool = true;
+
 /// Segno della rotazione (+1 = antioraria vista dall'alto, come `Quat::from_rotation_y`
 /// con z = -nord). Se gli edifici a 90/270 gradi sono girati al contrario, metti -1.
 pub const ROTATION_SIGN: f32 = 1.0;
+
 const BLOCK_UNITS: f32 = 4096.0;
 
 /// Angoli Daggerfall: 2048 = 360 gradi.
@@ -86,6 +87,9 @@ pub struct RmbDoor {
 pub struct RmbInterior {
     pub objects_3d: Vec<RmbObject3D>,
     pub flats: Vec<RmbFlatObject>,
+    /// NPC / persone (oste, clienti, mercanti): hanno la stessa struttura dei flat
+    /// ma sono in una lista separata (BlockPeopleRecords in DFU).
+    pub people: Vec<RmbFlatObject>,
     pub doors: Vec<RmbDoor>,
 }
 
@@ -138,6 +142,11 @@ pub struct RmbFlatObject {
     pub x: i32,
     pub y: i32,
     pub z: i32,
+    /// FactionID: se != 0, questo flat e' un NPC (persona che cammina).
+    /// Usato da DFU per aggiungere StaticNPC al billboard.
+    pub faction_id: i16,
+    /// Flags dell'NPC (orientamento, comportamento, ecc.)
+    pub flags: u8,
     pub block: Option<u8>,
 }
 
@@ -153,6 +162,9 @@ pub struct RmbBlock {
     pub flats: Vec<RmbFlatObject>,
     /// interni, `interiors[i]` descrive l'interno del sotto-record `i`
     pub interiors: Vec<RmbInterior>,
+    /// People dell'esterno dei sotto-record (NPC che camminano per strada).
+    /// Stessa struttura dei flat; `block = Some(i)` indica il sotto-record.
+    pub exterior_people: Vec<RmbFlatObject>,
     /// byte consumati dal parsing (per controllo: dovrebbe essere = lunghezza del record)
     pub bytes_used: usize,
 }
@@ -191,11 +203,11 @@ fn parse_interior(d: &[u8], q: usize, end: usize, block: u8) -> RmbInterior {
     let np = d[q + 3] as usize;
     let nd = d[q + 4] as usize;
     let total = BLOCKDATA_HEADER
-        + nm * MODEL_SIZE
-        + nf * FLAT_SIZE
-        + ns * SECTION3_SIZE
-        + np * PERSON_SIZE
-        + nd * DOOR_SIZE;
+    + nm * MODEL_SIZE
+    + nf * FLAT_SIZE
+    + ns * SECTION3_SIZE
+    + np * PERSON_SIZE
+    + nd * DOOR_SIZE;
     if q + total > end {
         return out;
     }
@@ -208,9 +220,19 @@ fn parse_interior(d: &[u8], q: usize, end: usize, block: u8) -> RmbInterior {
         out.flats.push(parse_flat(d, p, Some(block)));
         p += FLAT_SIZE;
     }
-    p += ns * SECTION3_SIZE + np * PERSON_SIZE;
+    // Section3 (spawn points) - saltiamo, non ci servono ancora
+    p += ns * SECTION3_SIZE;
+    // People records dell'interno (oste, clienti, mercanti)
+    for _ in 0..np {
+        out.people.push(parse_flat(d, p, Some(block)));
+        p += PERSON_SIZE;
+    }
     for _ in 0..nd {
-        out.doors.push(RmbDoor { x: i32_at(d, p), y: i32_at(d, p + 4), z: i32_at(d, p + 8) });
+        out.doors.push(RmbDoor {
+            x: i32_at(d, p),
+                       y: i32_at(d, p + 4),
+                       z: i32_at(d, p + 8),
+        });
         p += DOOR_SIZE;
     }
     out
@@ -218,12 +240,23 @@ fn parse_interior(d: &[u8], q: usize, end: usize, block: u8) -> RmbInterior {
 
 fn parse_flat(d: &[u8], p: usize, block: Option<u8>) -> RmbFlatObject {
     let tex = u16::from_le_bytes([d[p + 12], d[p + 13]]);
+    // Layout del flat/people record (17 byte):
+    //   +0  i32  XPos
+    //   +4  i32  YPos
+    //   +8  i32  ZPos
+    //  +12  u16  TextureBitfield (archive = >>7, record = &0x7F)
+    //  +14  i16  FactionID
+    //  +16  u8   Flags
+    let faction_id = i16::from_le_bytes([d[p + 14], d[p + 15]]);
+    let flags = d[p + 16];
     RmbFlatObject {
         texture_archive: tex >> 7,
         texture_record: (tex & 0x7F) as u8,
         x: i32_at(d, p),
         y: i32_at(d, p + 4),
         z: i32_at(d, p + 8),
+        faction_id,
+        flags,
         block,
     }
 }
@@ -250,8 +283,8 @@ impl RmbBlock {
             let p = OFF_BLOCK_POS + i * BLOCK_POS_SIZE;
             subrecords.push(RmbSubRecord {
                 x: i32_at(data, p + 8),
-                z: i32_at(data, p + 12),
-                rotation_deg: i32_at(data, p + 16) as f32 * DA_TO_DEG,
+                            z: i32_at(data, p + 12),
+                            rotation_deg: i32_at(data, p + 16) as f32 * DA_TO_DEG,
             });
         }
 
@@ -264,6 +297,7 @@ impl RmbBlock {
         let mut objects_3d = Vec::new();
         let mut flats = Vec::new();
         let mut interiors = Vec::with_capacity(block_count);
+        let mut exterior_people = Vec::new();
         let mut pos = RMB_HEADER_LEN;
 
         for i in 0..block_count {
@@ -286,11 +320,11 @@ impl RmbBlock {
             let np = data[q + 3] as usize;
             let nd = data[q + 4] as usize;
             let total = BLOCKDATA_HEADER
-                + nm * MODEL_SIZE
-                + nf * FLAT_SIZE
-                + ns * SECTION3_SIZE
-                + np * PERSON_SIZE
-                + nd * DOOR_SIZE;
+            + nm * MODEL_SIZE
+            + nf * FLAT_SIZE
+            + ns * SECTION3_SIZE
+            + np * PERSON_SIZE
+            + nd * DOOR_SIZE;
             if q + total > end {
                 return Err("Esterno del Block oltre la sua dimensione");
             }
@@ -303,6 +337,14 @@ impl RmbBlock {
                 flats.push(parse_flat(data, p, Some(i as u8)));
                 p += FLAT_SIZE;
             }
+            // Salta section3 dell'esterno
+            p += ns * SECTION3_SIZE;
+            // People dell'esterno del sotto-record (NPC che camminano per strada)
+            for _ in 0..np {
+                exterior_people.push(parse_flat(data, p, Some(i as u8)));
+                p += PERSON_SIZE;
+            }
+            // Salta doors dell'esterno (gia' conteggiati in total)
             interiors.push(parse_interior(data, q + total, end, i as u8));
             pos = end;
         }
@@ -319,7 +361,17 @@ impl RmbBlock {
             pos += FLAT_SIZE;
         }
 
-        Ok(Self { ground_tiles, ground_decor, subrecords, buildings, objects_3d, flats, interiors, bytes_used: pos })
+        Ok(Self {
+            ground_tiles,
+            ground_decor,
+            subrecords,
+            buildings,
+            objects_3d,
+            flats,
+            interiors,
+            exterior_people,
+            bytes_used: pos,
+        })
     }
 
     /// Posizioni nel blocco di tutti gli oggetti 3D. Gli oggetti dei sotto-record sono
@@ -328,39 +380,43 @@ impl RmbBlock {
         // z "grezza" (negativa o positiva) -> verso nord
         let n_of = |z_raw: f32| if Z_FROM_NORTH_EDGE { BLOCK_UNITS + z_raw } else { -z_raw };
         self.objects_3d
-            .iter()
-            .map(|o| match o.block {
-                None => PlacedModel {
+        .iter()
+        .map(|o| match o.block {
+            None => PlacedModel {
+                model_id: o.model_id,
+                object_type: o.object_type,
+                x: o.x as f32,
+                n: n_of(o.z as f32),
+             y: o.y,
+             rotation_deg: o.rotation_y_deg * ROTATION_SIGN,
+             is_building: false,
+             subrecord: None,
+            },
+            Some(i) => {
+                let s = &self.subrecords[i as usize];
+                let anchor_n = if Z_FROM_NORTH_EDGE {
+                    BLOCK_UNITS - s.z as f32
+                } else {
+                    s.z as f32
+                };
+                let phi = (s.rotation_deg * ROTATION_SIGN).to_radians();
+                let (sn, cs) = phi.sin_cos();
+                // scostamento locale (di solito 0 o pochi punti): ruotato col sotto-record
+                let lx = o.x as f32;
+                let ln = if Z_FROM_NORTH_EDGE { o.z as f32 } else { -(o.z as f32) };
+                PlacedModel {
                     model_id: o.model_id,
                     object_type: o.object_type,
-                    x: o.x as f32,
-                    n: n_of(o.z as f32),
+                    x: s.x as f32 + lx * cs - ln * sn,
+                    n: anchor_n + lx * sn + ln * cs,
                     y: o.y,
-                    rotation_deg: o.rotation_y_deg * ROTATION_SIGN,
-                    is_building: false,
-                    subrecord: None,
-                },
-                Some(i) => {
-                    let s = &self.subrecords[i as usize];
-                    let anchor_n = if Z_FROM_NORTH_EDGE { BLOCK_UNITS - s.z as f32 } else { s.z as f32 };
-                    let phi = (s.rotation_deg * ROTATION_SIGN).to_radians();
-                    let (sn, cs) = phi.sin_cos();
-                    // scostamento locale (di solito 0 o pochi punti): ruotato col sotto-record
-                    let lx = o.x as f32;
-                    let ln = if Z_FROM_NORTH_EDGE { o.z as f32 } else { -(o.z as f32) };
-                    PlacedModel {
-                        model_id: o.model_id,
-                        object_type: o.object_type,
-                        x: s.x as f32 + lx * cs - ln * sn,
-                        n: anchor_n + lx * sn + ln * cs,
-                        y: o.y,
-                        rotation_deg: (s.rotation_deg + o.rotation_y_deg) * ROTATION_SIGN,
-                        is_building: true,
-                        subrecord: Some(i),
-                    }
+                    rotation_deg: (s.rotation_deg + o.rotation_y_deg) * ROTATION_SIGN,
+             is_building: true,
+             subrecord: Some(i),
                 }
-            })
-            .collect()
+            }
+        })
+        .collect()
     }
 }
 
@@ -381,7 +437,15 @@ mod tests {
         let b = parse_building_data(&rec);
         assert_eq!(
             b,
-            RmbBuildingData { name_seed: 0x1234, service_time_limit: 0xDEADBEEF, faction_id: 0x150, sector: -3, location_id: 0x42, building_type: 15, quality: 7 }
+            RmbBuildingData {
+                name_seed: 0x1234,
+                service_time_limit: 0xDEADBEEF,
+                faction_id: 0x0150,
+                sector: -3,
+                location_id: 0x0042,
+                building_type: 15,
+                quality: 7,
+            }
         );
     }
 
@@ -405,7 +469,6 @@ mod tests {
         data[OFF_BLOCK_SIZES..OFF_BLOCK_SIZES + 4].copy_from_slice(&size.to_le_bytes());
         data.extend(&ext);
         data.extend(&int);
-
         let rmb = RmbBlock::parse(&data).unwrap();
         assert_eq!(rmb.objects_3d.len(), 1, "l'esterno non deve includere l'interno");
         assert_eq!(rmb.interiors.len(), 1);
@@ -432,5 +495,47 @@ mod tests {
         data.extend(&int);
         let rmb = RmbBlock::parse(&data).unwrap();
         assert!(rmb.interiors[0].objects_3d.is_empty());
+    }
+
+    #[test]
+    fn flat_reads_faction_id_and_flags() {
+        let mut rec = vec![0u8; 17];
+        rec[12..14].copy_from_slice(&((210u16 << 7) | 5).to_le_bytes());
+        rec[14..16].copy_from_slice(&42i16.to_le_bytes());
+        rec[16] = 0x03;
+        let f = parse_flat(&rec, 0, None);
+        assert_eq!(f.texture_archive, 210);
+        assert_eq!(f.texture_record, 5);
+        assert_eq!(f.faction_id, 42);
+        assert_eq!(f.flags, 0x03);
+    }
+
+    #[test]
+    fn exterior_people_are_read() {
+        let mut data = vec![0u8; RMB_HEADER_LEN];
+        data[0] = 1; // un sotto-record
+        // Esterno: 0 modelli, 0 flat, 0 section3, 2 people, 0 doors
+        let mut ext = vec![0u8; BLOCKDATA_HEADER + 2 * PERSON_SIZE];
+        ext[3] = 2; // 2 people
+        // Person 1: archive 334, record 0, faction_id 100
+        let p1 = BLOCKDATA_HEADER;
+        ext[p1 + 12..p1 + 14].copy_from_slice(&((334u16 << 7) | 0).to_le_bytes());
+        ext[p1 + 14..p1 + 16].copy_from_slice(&100i16.to_le_bytes());
+        // Person 2: archive 334, record 1, faction_id 200
+        let p2 = BLOCKDATA_HEADER + PERSON_SIZE;
+        ext[p2 + 12..p2 + 14].copy_from_slice(&((334u16 << 7) | 1).to_le_bytes());
+        ext[p2 + 14..p2 + 16].copy_from_slice(&200i16.to_le_bytes());
+        // Interior vuoto
+        let int = vec![0u8; BLOCKDATA_HEADER];
+        let size = (ext.len() + int.len()) as u32;
+        data[OFF_BLOCK_SIZES..OFF_BLOCK_SIZES + 4].copy_from_slice(&size.to_le_bytes());
+        data.extend(&ext);
+        data.extend(&int);
+        let rmb = RmbBlock::parse(&data).unwrap();
+        assert_eq!(rmb.exterior_people.len(), 2);
+        assert_eq!(rmb.exterior_people[0].texture_archive, 334);
+        assert_eq!(rmb.exterior_people[0].faction_id, 100);
+        assert_eq!(rmb.exterior_people[1].faction_id, 200);
+        assert_eq!(rmb.bytes_used, data.len());
     }
 }

@@ -3,9 +3,7 @@
 //!
 //! Sistema locale dell'interno: metri, x est, y su, z come nelle coordinate grezze Daggerfall
 //! (la stessa convenzione delle citta': `z_mondo = -nord`).
-
 use std::collections::HashMap;
-
 use super::arch3d::Arch3dModel;
 use super::blocks::RmbBlock;
 use super::bsa::BsaArchive;
@@ -17,6 +15,7 @@ const EDITOR_FLATS_ARCHIVE: u16 = 199;
 
 /// Tipo di oggetto 3D che in Daggerfall Unity indica arredi e props.
 const PROP_OBJECT_TYPE: u8 = 3;
+
 /// Se true, gli arredi (tipo 3) si posizionano come in Daggerfall Unity: Y non negata e modello
 /// appoggiato sul suo punto piu' basso. Mettilo a false per tornare al comportamento precedente.
 const PROPS_LIKE_DFU: bool = true;
@@ -64,7 +63,11 @@ fn mesh_tris(mesh: &WorldMesh) -> Vec<Tri> {
     let mut out = Vec::new();
     for sm in &mesh.submeshes {
         for ch in sm.indices.chunks_exact(3) {
-            out.push([mesh.vertices[ch[0] as usize], mesh.vertices[ch[1] as usize], mesh.vertices[ch[2] as usize]]);
+            out.push([
+                mesh.vertices[ch[0] as usize],
+                mesh.vertices[ch[1] as usize],
+                mesh.vertices[ch[2] as usize],
+            ]);
         }
     }
     out
@@ -99,6 +102,8 @@ pub struct InteriorFlat {
 pub struct InteriorScene {
     pub mesh: WorldMesh,
     pub flats: Vec<InteriorFlat>,
+    /// NPC e persone (oste, clienti, mercanti): sprite come i flat ma dalla lista people
+    pub people: Vec<InteriorFlat>,
     /// dove compaiono i piedi del giocatore (sistema locale)
     pub spawn: [f32; 3],
     /// porta d'uscita, se il record delle porte e' plausibile
@@ -135,7 +140,11 @@ fn dist_segment_xz(x: f32, z: f32, a: [f32; 3], b: [f32; 3]) -> f32 {
     let (abx, abz) = (b[0] - a[0], b[2] - a[2]);
     let (apx, apz) = (x - a[0], z - a[2]);
     let len2 = abx * abx + abz * abz;
-    let t = if len2 < 1e-9 { 0.0 } else { ((apx * abx + apz * abz) / len2).clamp(0.0, 1.0) };
+    let t = if len2 < 1e-9 {
+        0.0
+    } else {
+        ((apx * abx + apz * abz) / len2).clamp(0.0, 1.0)
+    };
     let (cx, cz) = (a[0] + abx * t, a[2] + abz * t);
     ((x - cx).powi(2) + (z - cz).powi(2)).sqrt()
 }
@@ -144,7 +153,6 @@ impl InteriorScene {
     pub fn floor_count(&self) -> usize {
         self.floors.len()
     }
-
     pub fn wall_count(&self) -> usize {
         self.walls.len()
     }
@@ -208,14 +216,15 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
     if it.objects_3d.is_empty() {
         return None;
     }
-
     let debug_doors = std::env::var("DF_DOOR_DEBUG").is_ok();
     let mut cache: HashMap<u32, Option<Arch3dModel>> = HashMap::new();
     let mut mesh = WorldMesh::new();
     let mut doors: Vec<InteriorDoor> = Vec::new();
     for o in &it.objects_3d {
         let model = cache.entry(o.model_id).or_insert_with(|| {
-            arch3d.get_by_id(o.model_id).and_then(|raw| Arch3dModel::parse(o.model_id, raw).ok())
+            arch3d
+            .get_by_id(o.model_id)
+            .and_then(|raw| Arch3dModel::parse(o.model_id, raw).ok())
         });
         let Some(m) = model.as_ref() else { continue };
         let (x, z) = (o.x as f32 * DF_UNIT, o.z as f32 * DF_UNIT);
@@ -243,11 +252,11 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
                 o.model_id,
                 o.object_type,
                 m.faces.len(),
-                mx[0] - mn[0],
-                mx[1] - mn[1],
-                mx[2] - mn[2],
-                archives,
-                if is_door { "PORTA" } else { "-" }
+                     mx[0] - mn[0],
+                     mx[1] - mn[1],
+                     mx[2] - mn[2],
+                     archives,
+                     if is_door { "PORTA" } else { "-" }
             );
         }
         if is_door {
@@ -267,7 +276,11 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
                 mesh: local,
                 pos: [x, y, z],
                 yaw_deg: o.rotation_y_deg,
-                center: [(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5],
+                center: [
+                    (mn[0] + mx[0]) * 0.5,
+                       (mn[1] + mx[1]) * 0.5,
+                       (mn[2] + mx[2]) * 0.5,
+                ],
                 tris: mesh_tris(&placed),
             });
             continue;
@@ -280,7 +293,6 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
     if mesh.vertices.is_empty() {
         return None;
     }
-
     let mut mn = [f32::MAX; 3];
     let mut mx = [f32::MIN; 3];
     for v in &mesh.vertices {
@@ -289,7 +301,6 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
             mx[k] = mx[k].max(v[k]);
         }
     }
-
     let mut floors = Vec::new();
     let mut walls = Vec::new();
     for sm in &mesh.submeshes {
@@ -318,17 +329,28 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
             }
         }
     }
-
     let flats = it
-        .flats
-        .iter()
-        .filter(|f| f.texture_archive != EDITOR_FLATS_ARCHIVE)
-        .map(|f| InteriorFlat {
-            archive: f.texture_archive,
-            record: f.texture_record,
-            pos: [f.x as f32 * DF_UNIT, -(f.y as f32) * DF_UNIT, f.z as f32 * DF_UNIT],
-        })
-        .collect();
+    .flats
+    .iter()
+    .filter(|f| f.texture_archive != EDITOR_FLATS_ARCHIVE)
+    .map(|f| InteriorFlat {
+        archive: f.texture_archive,
+         record: f.texture_record,
+         pos: [f.x as f32 * DF_UNIT, -(f.y as f32) * DF_UNIT, f.z as f32 * DF_UNIT],
+    })
+    .collect();
+
+    // AGGIUNTA: costruisci la lista dei people (NPC) con la stessa logica dei flat
+    let people = it
+    .people
+    .iter()
+    .filter(|f| f.texture_archive != EDITOR_FLATS_ARCHIVE)
+    .map(|f| InteriorFlat {
+        archive: f.texture_archive,
+         record: f.texture_record,
+         pos: [f.x as f32 * DF_UNIT, -(f.y as f32) * DF_UNIT, f.z as f32 * DF_UNIT],
+    })
+    .collect();
 
     if debug_doors || !doors.is_empty() {
         println!("Interno: {} porte di stanza riconosciute.", doors.len());
@@ -337,6 +359,7 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
     let mut scene = InteriorScene {
         mesh,
         flats,
+        people,
         spawn: [0.0; 3],
         exit: None,
         bounds_min: mn,
@@ -346,15 +369,18 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
         floors,
         walls,
     };
-
     let (cx, cz) = ((mn[0] + mx[0]) * 0.5, (mn[2] + mx[2]) * 0.5);
     // porta valida solo se cade dentro (o appena fuori) dall'ingombro dei modelli
     let door = it
-        .doors
-        .first()
-        .map(|d| [d.x as f32 * DF_UNIT, -(d.y as f32) * DF_UNIT, d.z as f32 * DF_UNIT])
-        .filter(|d| d[0] >= mn[0] - 2.0 && d[0] <= mx[0] + 2.0 && d[2] >= mn[2] - 2.0 && d[2] <= mx[2] + 2.0);
-
+    .doors
+    .first()
+    .map(|d| [d.x as f32 * DF_UNIT, -(d.y as f32) * DF_UNIT, d.z as f32 * DF_UNIT])
+    .filter(|d| {
+        d[0] >= mn[0] - 2.0
+        && d[0] <= mx[0] + 2.0
+        && d[2] >= mn[2] - 2.0
+        && d[2] <= mx[2] + 2.0
+    });
     let (sx, sz, ref_y) = match door {
         Some(d) => {
             let (dx, dz) = (cx - d[0], cz - d[2]);
@@ -364,9 +390,9 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
         None => (cx, cz, mn[1] + 1.0),
     };
     let floor = scene
-        .floor_at(sx, sz, ref_y, 1.0)
-        .or_else(|| scene.floor_at(cx, cz, mn[1] + 1.0, 1.0))
-        .unwrap_or(mn[1]);
+    .floor_at(sx, sz, ref_y, 1.0)
+    .or_else(|| scene.floor_at(cx, cz, mn[1] + 1.0, 1.0))
+    .unwrap_or(mn[1]);
     scene.spawn = [sx, floor, sz];
     scene.exit = door;
     Some(scene)
@@ -380,6 +406,7 @@ mod tests {
         InteriorScene {
             mesh: WorldMesh::new(),
             flats: Vec::new(),
+            people: Vec::new(),
             spawn: [0.0; 3],
             exit: None,
             bounds_min: [0.0; 3],

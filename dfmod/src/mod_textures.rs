@@ -36,16 +36,18 @@ impl ModTextures {
             if let Some(k) = TextureKey::parse(name) {
                 self.by_key.insert(k, entry.clone());
             }
-            self.by_name.insert(name.to_owned(), entry);
+            // Indicizza con chiave minuscola per lookup case-insensitive
+            self.by_name.insert(name.to_ascii_lowercase(), entry);
             tex_count += 1;
         }
 
         let mut array_count = 0;
         for name in m.texture_array_names() {
             let entry = (idx, name.to_owned());
-            self.arrays_by_name.insert(name.to_owned(), entry.clone());
+            self.arrays_by_name.insert(name.to_ascii_lowercase(), entry.clone());
 
-            if let Some(num_str) = name.strip_suffix("-texarray") {
+            let lower = name.to_ascii_lowercase();
+            if let Some(num_str) = lower.strip_suffix("-texarray") {
                 if let Ok(archive_id) = num_str.parse::<u32>() {
                     self.terrain_by_archive.insert(archive_id, entry);
                 }
@@ -56,8 +58,8 @@ impl ModTextures {
         info!(
             "Mod caricata `{}`: {} texture 2D, {} array di terreno",
             path.display(),
-            tex_count,
-            array_count
+              tex_count,
+              array_count
         );
 
         self.archives.push(m);
@@ -70,10 +72,10 @@ impl ModTextures {
             return;
         };
         let mut paths: Vec<PathBuf> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dfmod")))
-            .collect();
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dfmod")))
+        .collect();
         paths.sort();
         for p in paths {
             if let Err(e) = self.add(&p) {
@@ -145,6 +147,15 @@ impl ModTextures {
         self.load_2d(entry, true, images)
     }
 
+    /// Dimensioni in pixel (larghezza, altezza) di una texture 2D della mod, senza caricarla
+    /// in `Assets<Image>`. Utile perche' le immagini create con `RENDER_WORLD` spariscono da
+    /// `Assets<Image>` dopo il primo upload sulla GPU e `images.get()` non le trova piu'.
+    pub fn size_by_name(&self, name: &str) -> Option<(u32, u32)> {
+        let (idx, entry_name) = self.by_name.get(&name.to_ascii_lowercase())?;
+        let tex = self.archives[*idx].texture(entry_name).ok()??;
+        Some((tex.width, tex.height))
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.by_name.keys().map(String::as_str)
     }
@@ -179,8 +190,8 @@ impl ModTextures {
                 },
                 TextureDimension::D2,
                 tex.data.clone(),
-                if srgb { BevyFormat::Bc7RgbaUnormSrgb } else { BevyFormat::Bc7RgbaUnorm },
-                RenderAssetUsages::RENDER_WORLD,
+                                       if srgb { BevyFormat::Bc7RgbaUnormSrgb } else { BevyFormat::Bc7RgbaUnorm },
+                                           RenderAssetUsages::RENDER_WORLD,
             );
             image.texture_descriptor.mip_level_count = tex.mip_count;
             image.sampler = if self.nearest_filter { ImageSampler::nearest() } else { ImageSampler::linear() };
@@ -201,7 +212,7 @@ impl ModTextures {
             TextureDimension::D2,
             rgba,
             if srgb { BevyFormat::Rgba8UnormSrgb } else { BevyFormat::Rgba8Unorm },
-            RenderAssetUsages::RENDER_WORLD,
+                RenderAssetUsages::RENDER_WORLD,
         );
         image.sampler = if self.nearest_filter { ImageSampler::nearest() } else { ImageSampler::linear() };
         Some(image)

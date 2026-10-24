@@ -5,6 +5,7 @@ mod data;
 mod grass;
 mod interior;
 mod local_map;
+mod dialog;
 mod map;
 mod mod_textures;
 mod music;
@@ -220,6 +221,7 @@ fn main() {
             ..default()
         }),
     )
+    .add_plugins(dialog::DialogPlugin)
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(ModTexturesPlugin {
         dir: args.mods_dir.clone(),
@@ -266,6 +268,7 @@ fn main() {
          interior::interior_move,
          interior::face_flats,
          tiles::update_npcs,  // <-- AGGIUNGI
+         tiles::update_enemies,
          player::player_move,
          rebase_origin,
          stream_tiles,

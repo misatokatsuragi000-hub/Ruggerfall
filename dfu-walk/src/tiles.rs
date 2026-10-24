@@ -57,6 +57,7 @@ const NPC_SPEED: f32 = 1.3; // m/s, come DFU movementSpeed
 const NPC_STEP: f32 = 4.0; // lunghezza di un passo "di griglia" in metri
 const NPC_IDLE_DISTANCE: f32 = 2.5; // si fermano se il giocatore è fermo qui vicino
 const NPC_RANDOM_TURN_CHANCE: f32 = 0.025; // probabilità di cambiare direzione a ogni passo
+const NPC_RADIUS: f32 = 0.35; // raggio del corpo per le collisioni
 
 const CARDINALS: [Vec2; 4] = [Vec2::X, Vec2::NEG_X, Vec2::Y, Vec2::NEG_Y];
 
@@ -66,6 +67,9 @@ pub struct NpcSpriteSet {
     walk_size: [Vec2; 5],
     idle: Vec<Handle<StandardMaterial>>,
     idle_size: Vec2,
+    /// Immagine del frame frontale (record 0) e sue dimensioni in pixel: ritratto per i dialoghi.
+    portrait: Handle<Image>,
+    portrait_size: Vec2,
 }
 
 /// Carica tutti i frame di un record con UNA sola apertura del file.
@@ -121,7 +125,9 @@ fn build_npc_sprites(
     }
     let (idle, idle_size) = load_record(&file, IDLE_RECORD as usize, data, images, materials)
         .unwrap_or_else(|| (vec![walk[0][0].clone()], walk_size[0]));
-    Some(NpcSpriteSet { walk, walk_size, idle, idle_size })
+    let portrait = materials.get(&walk[0][0]).and_then(|m| m.base_color_texture.clone())?;
+    let portrait_size = images.get(&portrait).map(|i| i.size_f32()).unwrap_or(Vec2::new(64.0, 64.0));
+    Some(NpcSpriteSet { walk, walk_size, idle, idle_size, portrait, portrait_size })
 }
 
 fn next_rand(state: &mut u64) -> f32 {
@@ -130,20 +136,325 @@ fn next_rand(state: &mut u64) -> f32 {
     ((*state >> 11) & 0xFF_FFFF) as f32 / 16_777_215.0
 }
 
-/// Sceglie il prossimo bersaglio sulla griglia cardinale (N/S/E/O), restando nei limiti.
-/// Di norma continua dritto; cambia direzione con piccola probabilità o se è bloccato.
-fn pick_target(pos: Vec2, heading: &mut Vec2, bounds: (Vec2, Vec2), rng: &mut u64, force_new: bool) -> Vec2 {
+/// Sceglie il prossimo bersaglio sulla griglia cardinale (N/S/E/O), restando nei limiti
+/// e senza puntare dentro muri. Di norma continua dritto; cambia direzione con piccola
+/// probabilità o se è bloccato.
+fn pick_target(
+    pos: Vec2, heading: &mut Vec2, bounds: (Vec2, Vec2), rng: &mut u64, force_new: bool,
+    blocked: &dyn Fn(Vec2) -> bool,
+) -> Vec2 {
     let inside = |p: Vec2| p.x >= bounds.0.x && p.x <= bounds.1.x && p.y >= bounds.0.y && p.y <= bounds.1.y;
-    let keep = !force_new && inside(pos + *heading * NPC_STEP) && next_rand(rng) >= NPC_RANDOM_TURN_CHANCE;
+    let free = |p: Vec2| inside(p) && !blocked(p) && !blocked((pos + p) * 0.5);
+    let keep = !force_new && free(pos + *heading * NPC_STEP) && next_rand(rng) >= NPC_RANDOM_TURN_CHANCE;
     if !keep {
         let first = (next_rand(rng) * 4.0) as usize % 4;
         for k in 0..4 {
             let d = CARDINALS[(first + k) % 4];
-            if inside(pos + d * NPC_STEP) { *heading = d; break; }
+            if free(pos + d * NPC_STEP) { *heading = d; break; }
         }
     }
     let target = pos + *heading * NPC_STEP;
-    if inside(target) { target } else { pos }
+    if free(target) { target } else { pos }
+}
+
+fn npc_blocked(colliders: Option<&Colliders>, samples: &HeightSamples, p: Vec2) -> bool {
+    colliders.is_some_and(|c| {
+        let ground = terrain_height(samples, p.x / CELL_SIZE, -p.y / CELL_SIZE);
+        c.hits(p, ground, NPC_RADIUS + 0.2)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Collisioni statiche: edifici e mura
+// ---------------------------------------------------------------------------
+
+const COLLISION_GRID: usize = 64; // celle per lato nella griglia spaziale del tile
+const COLLIDER_MARGIN: f32 = 1.0; // >= del raggio massimo dei corpi che collidono
+const STEP_HEIGHT: f32 = 0.6; // ostacoli più bassi (zoccoli, gradini) si scavalcano
+const BODY_HEIGHT: f32 = 1.8; // ostacoli più alti di così non toccano la testa
+const MIN_WALL_LEN: f32 = 0.05;
+
+struct WallSegment {
+    a: Vec2,
+    b: Vec2,
+    y_min: f32,
+    y_max: f32,
+}
+
+/// Triangolo (quasi) orizzontale su cui si può stare in piedi: tetti, cime di muri e mura.
+struct SurfaceTri {
+    v: [Vec3; 3],
+}
+
+impl SurfaceTri {
+    /// Quota del triangolo sotto (x, z), se il punto cade al suo interno.
+    fn height_at(&self, p: Vec2) -> Option<f32> {
+        let [a, b, c] = self.v;
+        let d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+        if d.abs() < 1e-8 { return None; }
+        let w0 = ((b.z - c.z) * (p.x - c.x) + (c.x - b.x) * (p.y - c.z)) / d;
+        let w1 = ((c.z - a.z) * (p.x - c.x) + (a.x - c.x) * (p.y - c.z)) / d;
+        let w2 = 1.0 - w0 - w1;
+        const EPS: f32 = -1e-4;
+        (w0 >= EPS && w1 >= EPS && w2 >= EPS).then(|| w0 * a.y + w1 * b.y + w2 * c.y)
+    }
+}
+
+/// Muri di un tile (coordinate locali del tile), derivati dai triangoli verticali dei
+/// modelli di edifici e mura, con griglia spaziale per interrogazioni veloci.
+pub struct Colliders {
+    segments: Vec<WallSegment>,
+    grid: Vec<Vec<u32>>,
+    surfaces: Vec<SurfaceTri>,
+    surf_grid: Vec<Vec<u32>>,
+    cell: f32,
+}
+
+/// Collisioni del tile, attaccate all'entità del chunk.
+#[derive(Component)]
+pub struct TileCollision(pub Arc<Colliders>);
+
+/// Muro trovato da `probe`: base per la scalata (presa, altezza del bordo, direzione di spinta).
+#[derive(Clone, Copy, Debug)]
+pub struct WallHit {
+    /// Punto di contatto sul muro (x, z).
+    pub point: Vec2,
+    /// Normale orizzontale, sempre rivolta verso chi sta guardando il muro.
+    pub normal: Vec2,
+    /// Distanza dal punto di partenza lungo la direzione sondata.
+    pub distance: f32,
+    /// Quota della base e della sommità del muro.
+    pub y_min: f32,
+    pub y_max: f32,
+}
+
+impl WallHit {
+    /// Altezza del bordo superiore rispetto ai piedi: decide se il muro è scalabile.
+    pub fn ledge_height(&self, feet_y: f32) -> f32 {
+        self.y_max - feet_y
+    }
+}
+
+impl Colliders {
+    /// `parts`: (mesh, usarlo per i muri, modo superfici: 0 = no, 1 = solo rivolte in su, 2 = qualsiasi
+    /// verso, per le parti a doppia faccia come i tetti).
+    fn from_parts<'a>(parts: impl Iterator<Item = (&'a MeshPart, bool, u8)>) -> Self {
+        // (estremi quantizzati) -> indice, per fondere i duplicati dei quad (2 triangoli = stesso muro)
+        let mut index: HashMap<(i32, i32, i32, i32), usize> = HashMap::new();
+        let mut segments: Vec<WallSegment> = Vec::new();
+        let mut surfaces: Vec<SurfaceTri> = Vec::new();
+        let q = |v: f32| (v * 20.0).round() as i32;
+
+        for (part, as_walls, surface_mode) in parts {
+            for tri in part.indices.chunks_exact(3) {
+                let v = |i: u32| Vec3::from(part.positions[i as usize]);
+                let (p0, p1, p2) = (v(tri[0]), v(tri[1]), v(tri[2]));
+                let n = (p1 - p0).cross(p2 - p0);
+                let len = n.length();
+                if len < 1e-6 { continue; }
+                let ny = n.y / len;
+                // superfici orizzontali su cui stare: tetti, cime dei muri
+                let walkable = match surface_mode { 1 => ny > 0.35, 2 => ny.abs() > 0.35, _ => false };
+                if walkable {
+                    surfaces.push(SurfaceTri { v: [p0, p1, p2] });
+                    continue;
+                }
+                if !as_walls || ny.abs() > 0.35 { continue; } // solo superfici verticali
+                let pts = [Vec2::new(p0.x, p0.z), Vec2::new(p1.x, p1.z), Vec2::new(p2.x, p2.z)];
+                let mut best = (0usize, 1usize, 0.0f32);
+                for (i, j) in [(0, 1), (1, 2), (0, 2)] {
+                    let d = pts[i].distance_squared(pts[j]);
+                    if d > best.2 { best = (i, j, d); }
+                }
+                if best.2.sqrt() < MIN_WALL_LEN { continue; }
+                let (mut a, mut b) = (pts[best.0], pts[best.1]);
+                if (q(a.x), q(a.y)) > (q(b.x), q(b.y)) { std::mem::swap(&mut a, &mut b); }
+                let y_min = p0.y.min(p1.y).min(p2.y);
+                let y_max = p0.y.max(p1.y).max(p2.y);
+                let key = (q(a.x), q(a.y), q(b.x), q(b.y));
+                match index.get(&key) {
+                    Some(&i) => {
+                        segments[i].y_min = segments[i].y_min.min(y_min);
+                        segments[i].y_max = segments[i].y_max.max(y_max);
+                    }
+                    None => {
+                        index.insert(key, segments.len());
+                        segments.push(WallSegment { a, b, y_min, y_max });
+                    }
+                }
+            }
+        }
+
+        let cell = 128.0 * CELL_SIZE / COLLISION_GRID as f32;
+        let mut grid: Vec<Vec<u32>> = vec![Vec::new(); COLLISION_GRID * COLLISION_GRID];
+        let to_cell = |v: f32| ((v / cell).floor() as i32).clamp(0, COLLISION_GRID as i32 - 1) as usize;
+        for (i, s) in segments.iter().enumerate() {
+            let (min_x, max_x) = (s.a.x.min(s.b.x) - COLLIDER_MARGIN, s.a.x.max(s.b.x) + COLLIDER_MARGIN);
+            // z locale è negativo: la riga della griglia usa -z
+            let (min_z, max_z) = (-(s.a.y.max(s.b.y) + COLLIDER_MARGIN), -(s.a.y.min(s.b.y) - COLLIDER_MARGIN));
+            for iz in to_cell(min_z)..=to_cell(max_z) {
+                for ix in to_cell(min_x)..=to_cell(max_x) {
+                    grid[iz * COLLISION_GRID + ix].push(i as u32);
+                }
+            }
+        }
+
+        let mut surf_grid: Vec<Vec<u32>> = vec![Vec::new(); COLLISION_GRID * COLLISION_GRID];
+        for (i, t) in surfaces.iter().enumerate() {
+            let xs = t.v.map(|v| v.x);
+            let zs = t.v.map(|v| -v.z);
+            let (min_x, max_x) = (xs[0].min(xs[1]).min(xs[2]), xs[0].max(xs[1]).max(xs[2]));
+            let (min_z, max_z) = (zs[0].min(zs[1]).min(zs[2]), zs[0].max(zs[1]).max(zs[2]));
+            for iz in to_cell(min_z)..=to_cell(max_z) {
+                for ix in to_cell(min_x)..=to_cell(max_x) {
+                    surf_grid[iz * COLLISION_GRID + ix].push(i as u32);
+                }
+            }
+        }
+        Colliders { segments, grid, surfaces, surf_grid, cell }
+    }
+
+    fn cell_index(&self, p: Vec2) -> Option<usize> {
+        let ix = (p.x / self.cell).floor() as i32;
+        let iz = (-p.y / self.cell).floor() as i32;
+        let n = COLLISION_GRID as i32;
+        (ix >= 0 && iz >= 0 && ix < n && iz < n).then(|| iz as usize * COLLISION_GRID + ix as usize)
+    }
+
+    fn relevant(s: &WallSegment, feet_y: f32) -> bool {
+        s.y_max > feet_y + STEP_HEIGHT && s.y_min < feet_y + BODY_HEIGHT
+    }
+
+    fn closest(s: &WallSegment, p: Vec2) -> Vec2 {
+        let ab = s.b - s.a;
+        let t = ((p - s.a).dot(ab) / ab.length_squared().max(1e-8)).clamp(0.0, 1.0);
+        s.a + ab * t
+    }
+
+    /// Un cerchio di raggio `radius` in `p` tocca un muro?
+    pub fn hits(&self, p: Vec2, feet_y: f32, radius: f32) -> bool {
+        let Some(ci) = self.cell_index(p) else { return false };
+        self.grid[ci].iter().any(|&i| {
+            let s = &self.segments[i as usize];
+            Self::relevant(s, feet_y) && Self::closest(s, p).distance(p) < radius
+        })
+    }
+
+    /// Spinge il cerchio fuori dai muri toccati (scorre lungo pareti di qualsiasi angolo).
+    pub fn resolve(&self, mut p: Vec2, feet_y: f32, radius: f32) -> Vec2 {
+        let Some(ci) = self.cell_index(p) else { return p };
+        let list = &self.grid[ci];
+        if list.is_empty() { return p; }
+        for _ in 0..4 {
+            let mut moved = false;
+            for &i in list {
+                let s = &self.segments[i as usize];
+                if !Self::relevant(s, feet_y) { continue; }
+                let d = p - Self::closest(s, p);
+                let dist = d.length();
+                if dist < radius {
+                    let ab = s.b - s.a;
+                    let push = if dist > 1e-4 { d / dist } else { Vec2::new(-ab.y, ab.x).normalize_or_zero() };
+                    p += push * (radius - dist);
+                    moved = true;
+                }
+            }
+            if !moved { break; }
+        }
+        p
+    }
+
+    /// Sonda orizzontale: primo muro incontrato da `p` lungo `dir` (normalizzata) entro `reach`
+    /// metri (al massimo `COLLIDER_MARGIN`). A differenza di `resolve`/`hits` non ignora i muri
+    /// bassi: serve a riconoscere appigli e bordi per la scalata.
+    pub fn probe(&self, p: Vec2, dir: Vec2, reach: f32, feet_y: f32) -> Option<WallHit> {
+        let ci = self.cell_index(p)?;
+        let reach = reach.min(COLLIDER_MARGIN);
+        let cross = |a: Vec2, b: Vec2| a.x * b.y - a.y * b.x;
+        let mut best: Option<WallHit> = None;
+        for &i in &self.grid[ci] {
+            let s = &self.segments[i as usize];
+            // il muro deve attraversare la quota del corpo (anche se più basso di STEP_HEIGHT)
+            if s.y_max <= feet_y || s.y_min >= feet_y + BODY_HEIGHT { continue; }
+            let ab = s.b - s.a;
+            let denom = cross(dir, ab);
+            if denom.abs() < 1e-6 { continue; }
+            let t = cross(s.a - p, ab) / denom;
+            let u = cross(s.a - p, dir) / denom;
+            if !(0.0..=reach).contains(&t) || !(0.0..=1.0).contains(&u) { continue; }
+            if best.map_or(true, |b| t < b.distance) {
+                let mut normal = Vec2::new(-ab.y, ab.x).normalize_or_zero();
+                if normal.dot(dir) > 0.0 { normal = -normal; }
+                best = Some(WallHit { point: p + dir * t, normal, distance: t, y_min: s.y_min, y_max: s.y_max });
+            }
+        }
+        best
+    }
+
+    /// Quota della superficie più alta sotto `p` che non supera `max_y` (tetti, cime di muri).
+    pub fn surface_height(&self, p: Vec2, max_y: f32) -> Option<f32> {
+        let ci = self.cell_index(p)?;
+        self.surf_grid[ci].iter()
+            .filter_map(|&i| self.surfaces[i as usize].height_at(p))
+            .filter(|&h| h <= max_y)
+            .fold(None, |best: Option<f32>, h| Some(best.map_or(h, |b| b.max(h))))
+    }
+
+    /// Il punto è dentro un edificio? Parità dei muri incrociati da un raggio verso +x,
+    /// usata solo per non far nascere gli NPC dentro le case.
+    pub fn inside_building(&self, p: Vec2, ground_y: f32) -> bool {
+        let (lo, hi) = (ground_y + 0.5, ground_y + 1.5);
+        let mut crossings = 0;
+        for s in &self.segments {
+            if s.y_max < lo || s.y_min > hi { continue; }
+            if (s.a.y > p.y) != (s.b.y > p.y) {
+                let x = s.a.x + (p.y - s.a.y) / (s.b.y - s.a.y) * (s.b.x - s.a.x);
+                if x > p.x { crossings += 1; }
+            }
+        }
+        crossings % 2 == 1
+    }
+}
+
+/// Applica le collisioni di tutti i tile con muri a una posizione in coordinate mondo (x, z).
+pub fn resolve_world<'a>(
+    chunks: impl Iterator<Item = (&'a TileCollision, &'a Transform)>,
+    mut p: Vec2, feet_y: f32, radius: f32,
+) -> Vec2 {
+    for (collision, tf) in chunks {
+        let origin = Vec2::new(tf.translation.x, tf.translation.z);
+        p = collision.0.resolve(p - origin, feet_y, radius) + origin;
+    }
+    p
+}
+
+/// Quota della superficie più alta sotto la posizione mondo (x, z) che non supera `max_y`.
+pub fn surface_height_world<'a>(
+    chunks: impl Iterator<Item = (&'a TileCollision, &'a Transform)>,
+    p: Vec2, max_y: f32,
+) -> Option<f32> {
+    chunks
+        .filter_map(|(collision, tf)| {
+            collision.0.surface_height(p - Vec2::new(tf.translation.x, tf.translation.z), max_y - tf.translation.y)
+                .map(|h| h + tf.translation.y)
+        })
+        .fold(None, |best: Option<f32>, h| Some(best.map_or(h, |b| b.max(h))))
+}
+
+/// Come `Colliders::probe` ma in coordinate mondo, sul muro più vicino fra tutti i tile caricati.
+pub fn probe_world<'a>(
+    chunks: impl Iterator<Item = (&'a TileCollision, &'a Transform)>,
+    p: Vec2, dir: Vec2, reach: f32, feet_y: f32,
+) -> Option<WallHit> {
+    let mut best: Option<WallHit> = None;
+    for (collision, tf) in chunks {
+        let origin = Vec2::new(tf.translation.x, tf.translation.z);
+        if let Some(mut hit) = collision.0.probe(p - origin, dir, reach, feet_y) {
+            hit.point += origin;
+            if best.map_or(true, |b| hit.distance < b.distance) { best = Some(hit); }
+        }
+    }
+    best
 }
 
 /// NPC che cammina su griglia cardinale con animazioni direzionali (come DFU).
@@ -159,6 +470,14 @@ pub struct NpcWalker {
     rng: u64,
     bounds: (Vec2, Vec2),
     samples: Arc<HeightSamples>,
+    colliders: Option<Arc<Colliders>>,
+}
+
+impl NpcWalker {
+    /// Ritratto per i dialoghi: immagine frontale dell'NPC e dimensioni in pixel.
+    pub fn portrait(&self) -> (Handle<Image>, Vec2) {
+        (self.sprites.portrait.clone(), self.sprites.portrait_size)
+    }
 }
 
 #[derive(Component)]
@@ -309,11 +628,10 @@ pub struct TileResult {
     exterior_npcs: Vec<(f32, f32, u16, (Vec2, Vec2))>,
     /// Nemici selvatici: (x, z, indice in ENEMY_SPECIES)
     exterior_enemies: Vec<(f32, f32, usize)>,
+    /// Muri di edifici e mura (solo tile con città)
+    colliders: Option<Arc<Colliders>>,
     /// Celle d'acqua della tilemap (128×128, indice y*128+x)
     water: Vec<bool>,
-    /// Per l'erba: tilemap nel formato dello shader e mappa di "verde" delle tile
-    grass_tilemap: Arc<Vec<u8>>,
-    grass_mask: Option<Arc<crate::grass::GrassMask>>,
 }
 
 #[derive(Resource)]
@@ -387,6 +705,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
     let mut city_parts = None;
     let mut city_textured = Vec::new();
     let mut city_rect_opt = None;
+    let mut city_colliders: Option<Arc<Colliders>> = None;
     let mut tile_preset = None;
     let mut exterior_flats: Vec<(f32, f32, u16, u8)> = Vec::new();
     let mut exterior_npcs: Vec<(f32, f32, u16, (Vec2, Vec2))> = Vec::new();
@@ -405,6 +724,19 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
               loc.name, stats.objects, stats.built, stats.skipped, stats.missing_models);
         if !builder.is_empty() {
             let (parts, textured) = builder.into_all();
+            // Muri: parte Wall + parti con texture (i tetti inclinati li scarta il filtro di pendenza).
+            let (wall_i, roof_i, trim_i) = (
+                MaterialKind::Wall.index(), MaterialKind::Roof.index(), MaterialKind::Trim.index(),
+            );
+            city_colliders = Some(Arc::new(Colliders::from_parts(
+                parts.iter().enumerate()
+                    .filter_map(|(i, p)| {
+                        if i == wall_i { Some((p, true, 1u8)) }                       // muri + cime dei muri
+                        else if i == roof_i || i == trim_i { Some((p, false, 2u8)) } // tetti: solo superfici
+                        else { None }
+                    })
+                    .chain(textured.iter().map(|(_, p)| (p, true, 2u8))),
+            )));
             city_parts = Some(parts);
             city_textured = textured;
         }
@@ -444,7 +776,9 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
             if seed == 0 { seed = 0x9E37_79B9_7F4A_7C15; }
 
             let npc_count = 50 + bw as usize * bh as usize * 5;
-            for _ in 0..npc_count {
+            let mut attempts = 0;
+            while exterior_npcs.len() < npc_count && attempts < npc_count * 6 {
+                attempts += 1;
                 let x = bounds.0.x + ((seed & 0xFFFFFF) as f32 / 16_777_215.0) * (bounds.1.x - bounds.0.x);
                 seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
                 let z = bounds.0.y + ((seed & 0xFFFFFF) as f32 / 16_777_215.0) * (bounds.1.y - bounds.0.y);
@@ -453,6 +787,12 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                 let archive = PERSON_ARCHIVES[((seed & 0xFFFFFF) as usize) % PERSON_ARCHIVES.len()];
                 seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
 
+                // niente NPC dentro o attaccati agli edifici
+                if let Some(c) = city_colliders.as_deref() {
+                    let p = Vec2::new(x, z);
+                    let g = terrain_height(&samples, x / CELL_SIZE, -z / CELL_SIZE);
+                    if c.inside_building(p, g) || c.hits(p, g, NPC_RADIUS + 0.5) { continue; }
+                }
                 exterior_npcs.push((x, z, archive, bounds));
             }
             info!("  {} decorazioni + {} NPC in {}", exterior_flats.len(), exterior_npcs.len(), loc.name);
@@ -463,8 +803,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
     let encoded = encode_for_shader(&tilemap, true);
     let mesh = build_terrain_mesh(&samples, &encoded, tile_px);
     let archive = ground_archive(climate_of(data, mx, my), data.winter);
-    let grass_mask = crate::grass::grass_mask(data, archive);
-    let grass_tilemap = Arc::new(encoded.clone());
 
     // --- Nemici selvatici: celle di terra, fuori dalla città ---
     let water: Vec<bool> = tilemap.iter().map(|&t| t == 0xFF || (t & 0x3F) == 0).collect();
@@ -491,7 +829,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
 
     Some(TileResult { archive, mesh, encoded_tilemap: encoded, samples: Arc::new(samples),
         city_parts, city_textured, city_rect: city_rect_opt, exterior_flats, exterior_npcs,
-        exterior_enemies, water, grass_tilemap, grass_mask })
+        exterior_enemies, water, colliders: city_colliders })
 }
 
 pub fn rebase_origin(
@@ -588,11 +926,8 @@ pub fn collect_tiles(
                                            TerrainTile { mx: key.0, my: key.1 },
         )).id();
 
-        if let Some(mask) = tile.grass_mask.clone() {
-            commands.entity(chunk_entity).insert(crate::grass::GrassSource::new(
-                key.0, key.1, Arc::clone(&tile.samples),
-                Arc::clone(&tile.grass_tilemap), mask, tile.city_rect,
-            ));
+        if let Some(c) = &tile.colliders {
+            commands.entity(chunk_entity).insert(TileCollision(Arc::clone(c)));
         }
 
         if let Some(parts) = tile.city_parts {
@@ -646,7 +981,8 @@ pub fn collect_tiles(
             let mut rng = ((fx.to_bits() as u64) << 32) ^ (fz.to_bits() as u64) ^ 0x9E37_79B9_7F4A_7C15;
             let mut heading = CARDINALS[(next_rand(&mut rng) * 4.0) as usize % 4];
             let pos = Vec2::new(*fx, *fz);
-            let target = pick_target(pos, &mut heading, *bounds, &mut rng, true);
+            let target = pick_target(pos, &mut heading, *bounds, &mut rng, true,
+                &|p| npc_blocked(tile.colliders.as_deref(), &tile.samples, p));
             let frame_timer = next_rand(&mut rng) * NPC_FRAME_SECONDS;
             let frame = (next_rand(&mut rng) * sprites.walk[0].len() as f32) as usize;
 
@@ -658,6 +994,7 @@ pub fn collect_tiles(
             let walker = NpcWalker {
                 sprites: Arc::clone(&sprites), heading, target, frame, frame_timer,
                 shown: None, rng, bounds: *bounds, samples: Arc::clone(&tile.samples),
+                colliders: tile.colliders.clone(),
             };
 
             commands.entity(chunk_entity).with_children(|parent| {
@@ -761,15 +1098,25 @@ pub fn update_npcs(
             let pos = tf.translation.xz();
             let to_target = npc.target - pos;
             let step = NPC_SPEED * dt;
-            let new_pos = if to_target.length() > step {
+            let mut new_pos = if to_target.length() > step {
                 pos + to_target.normalize() * step
             } else {
                 npc.target
             };
+
+            // Collisione con muri: se spinto fuori da un muro sceglie un'altra direzione.
+            let mut hit = false;
+            if let Some(c) = npc.colliders.as_deref() {
+                let feet = terrain_height(&npc.samples, new_pos.x / CELL_SIZE, -new_pos.y / CELL_SIZE);
+                let fixed = c.resolve(new_pos, feet, NPC_RADIUS);
+                hit = fixed.distance(new_pos) > 0.01;
+                new_pos = fixed;
+            }
             tf.translation.x = new_pos.x;
             tf.translation.z = new_pos.y;
-            if (npc.target - new_pos).length() < 0.1 {
-                npc.target = pick_target(new_pos, &mut npc.heading, npc.bounds, &mut npc.rng, false);
+            if hit || (npc.target - new_pos).length() < 0.1 {
+                let blocked = |p: Vec2| npc_blocked(npc.colliders.as_deref(), &npc.samples, p);
+                npc.target = pick_target(new_pos, &mut npc.heading, npc.bounds, &mut npc.rng, hit, &blocked);
             }
 
             // --- Avanzamento frame ---

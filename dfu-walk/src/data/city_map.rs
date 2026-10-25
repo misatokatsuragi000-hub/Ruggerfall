@@ -69,8 +69,6 @@ pub struct MapBuilding {
     pub rot_deg: f32,
     pub kind: Option<PoiKind>,
     pub building_type: u8,
-    /// (colonna, riga) del blocco nella location e indice del sotto-record, per ritrovare
-    /// il BlockData dell'edificio (interno incluso). `None` per palazzo e mura.
     pub source: Option<(usize, usize, u8)>,
 }
 
@@ -146,27 +144,31 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
                 buildings.push(MapBuilding {
                     cx: bx0 + BLOCK_SIZE_M * 0.5,
                     cz: -(bz0 + BLOCK_SIZE_M * 0.5),
-                    half_w: 37.0,
-                    half_d: 27.0,
-                    rot_deg: 0.0,
-                    kind: Some(PoiKind::Palace),
-                    building_type: 16,
-                    source: None,
+                               half_w: 37.0,
+                               half_d: 27.0,
+                               rot_deg: 0.0,
+                               kind: Some(PoiKind::Palace),
+                               building_type: 16,
+                               source: None,
                 });
                 seen[PoiKind::Palace.index()].insert((gx, gz, 0));
                 palace_marked = true;
                 continue;
             }
 
-            for obj in rmb.placed_models().iter().filter(|o| o.is_building) {
+            for obj in rmb.placed_models() {
                 let fp = footprints.entry(obj.model_id).or_insert_with(|| {
                     arch3d_bsa
-                        .get_by_id(obj.model_id)
-                        .and_then(|raw| Arch3dModel::parse(obj.model_id, raw).ok())
-                        .and_then(|m| Footprint::from_model(&m))
+                    .get_by_id(obj.model_id)
+                    .and_then(|raw| Arch3dModel::parse(obj.model_id, raw).ok())
+                    .and_then(|m| Footprint::from_model(&m))
                 });
                 let Some(fp) = *fp else { continue };
-                let passes = if is_wall_block { classify_wall(&fp).is_some() } else { fp.classify().is_some() };
+                let passes = if is_wall_block {
+                    classify_wall(&fp).is_some()
+                } else {
+                    obj.is_building || fp.classify().is_some()
+                };
                 if !passes {
                     continue;
                 }
@@ -450,5 +452,3 @@ fn draw_text(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, text: &str, sca
     }
     cx - x
 }
-
-

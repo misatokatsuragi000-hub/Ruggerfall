@@ -5,12 +5,16 @@ use super::arch3d::{Arch3dModel, BuildingTextures};
 pub const DF_UNIT: f32 = 0.025;
 pub const BLOCK_SIZE_M: f32 = 4096.0 * DF_UNIT;
 
-pub const MIN_SIDE: f32 = 3.0;
-pub const MAX_SIDE: f32 = 75.0;
-pub const MAX_ASPECT: f32 = 3.5;
-pub const MIN_HEIGHT: f32 = 2.4;
-pub const HOUSE_AREA: f32 = 120.0;
-pub const HALL_AREA: f32 = 400.0;
+// =========================================================================
+// VALORI DI FINE TUNING (Regola 2 vs Regola 3)
+// =========================================================================
+pub const MIN_SIDE: f32 = 4.2;      // Lato minimo: sotto i 4.2m (porte singole, bancarelle, pozzi, staccionate) -> ARCH3D
+pub const MAX_SIDE: f32 = 75.0;     // Lato massimo
+pub const MAX_ASPECT: f32 = 2.5;    // Rapporto max lati (oggetti troppo allungati non sono case)
+pub const MIN_HEIGHT: f32 = 3.2;    // Altezza minima edificio (sotto i 3.2m sono tettoie, porte, carretti) -> ARCH3D
+pub const MIN_AREA: f32 = 25.0;     // Area minima ingombro per una vera casa (m²)
+pub const HOUSE_AREA: f32 = 120.0;  // Area casa
+pub const HALL_AREA: f32 = 400.0;   // Area grande edificio
 
 pub const BUILDING_TEXTURE_METERS: f32 = 3.2;
 pub const ROOF_TEXTURE_METERS: f32 = 3.5;
@@ -181,6 +185,9 @@ impl Footprint {
             return Err("troppo basso");
         }
         let area = self.width * self.depth;
+        if area < MIN_AREA {
+            return Err("area troppo piccola");
+        }
         Ok(if area >= HALL_AREA {
             BuildingKind::Hall
         } else if area >= HOUSE_AREA || self.height >= 9.0 {
@@ -607,10 +614,7 @@ pub fn generate_building(
                 roof.push_face(&[map(-ea, eave_y, eb), map(ea, eave_y, eb), rp, rm], roof_col, roof_inside);
                 roof.push_face(&[map(ea, eave_y, -eb), map(-ea, eave_y, -eb), rm, rp], roof_col, roof_inside);
             }
-            // Lato est
             roof.push_face(&[map(ea, eave_y, eb), map(ea, eave_y, -eb), rp], roof_col, roof_inside);
-            // Lato ovest — prima aveva due vertici identici e la faccia veniva scartata.
-            // Ora il secondo vertice è map(-ea, eave_y, eb), che chiude correttamente il triangolo.
             roof.push_face(&[map(-ea, eave_y, -eb), map(-ea, eave_y, eb), rm], roof_col, roof_inside);
         }
     }
@@ -780,6 +784,90 @@ impl CityBuilder {
                 None => &mut self.parts[MaterialKind::Opening.index()],
             };
             append_transformed(dst, &b.windows, offset, s, c, position);
+        }
+    }
+
+    /// Istanzia direttamente una mesh originale ARCH3D (stalle, carretti, tettoie, pozzi)
+    /// indirizzando ciascuna faccia sul materiale con texture HD della mod.
+    pub fn add_arch3d_instance(
+        &mut self,
+        model: &Arch3dModel,
+        rot_deg: f32,
+        position: [f32; 3],
+    ) {
+        let (s, c) = rot_deg.to_radians().sin_cos();
+
+        let trans = |v: [f32; 3]| -> [f32; 3] {
+            [
+                v[0] * c + v[2] * s + position[0],
+                v[1] + position[1],
+                -v[0] * s + v[2] * c + position[2],
+            ]
+        };
+
+        for face in &model.faces {
+            let n_pts = face.vertex_indices.len();
+            if n_pts < 3 {
+                continue;
+            }
+
+            let key = (face.texture_archive, face.texture_record);
+            let dst = self.textured_part(key);
+
+            let v0_raw = model.vertices.get(face.vertex_indices[0] as usize).copied().unwrap_or([0.0; 3]);
+            let v1_raw = model.vertices.get(face.vertex_indices[1] as usize).copied().unwrap_or([0.0; 3]);
+            let v2_raw = model.vertices.get(face.vertex_indices[2] as usize).copied().unwrap_or([0.0; 3]);
+
+            let p0 = trans(v0_raw);
+            let p1 = trans(v1_raw);
+            let p2 = trans(v2_raw);
+
+            // Calcolo normale geometrica CCW (0, k+1, k)
+            let v01 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+            let v02 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+            let nx = v01[1] * v02[2] - v01[2] * v02[1];
+            let ny = v01[2] * v02[0] - v01[0] * v02[2];
+            let nz = v01[0] * v02[1] - v01[1] * v02[0];
+            let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-5);
+            let normal = [nx / len, ny / len, nz / len];
+
+            for k in 1..(n_pts - 1) {
+                let idx0 = face.vertex_indices[0] as usize;
+                let idx1 = face.vertex_indices[k] as usize;
+                let idx2 = face.vertex_indices[k + 1] as usize;
+
+                let vert0 = trans(model.vertices.get(idx0).copied().unwrap_or([0.0; 3]));
+                let vert1 = trans(model.vertices.get(idx1).copied().unwrap_or([0.0; 3]));
+                let vert2 = trans(model.vertices.get(idx2).copied().unwrap_or([0.0; 3]));
+
+                let raw_uv0 = face.uvs.get(0).copied().unwrap_or([0.0, 0.0]);
+                let raw_uv1 = face.uvs.get(k).copied().unwrap_or([1.0, 0.0]);
+                let raw_uv2 = face.uvs.get(k + 1).copied().unwrap_or([0.0, 1.0]);
+
+                // Normalizzazione UV su 64 pixel (ripetizione texture 1:1)
+                let uv0 = [raw_uv0[0] / 64.0, raw_uv0[1] / 64.0];
+                let uv1 = [raw_uv1[0] / 64.0, raw_uv1[1] / 64.0];
+                let uv2 = [raw_uv2[0] / 64.0, raw_uv2[1] / 64.0];
+
+                let base = dst.positions.len() as u32;
+
+                dst.positions.push(vert0);
+                dst.normals.push(normal);
+                dst.uvs.push(uv0);
+                dst.colors.push([1.0, 1.0, 1.0, 1.0]);
+
+                dst.positions.push(vert2);
+                dst.normals.push(normal);
+                dst.uvs.push(uv2);
+                dst.colors.push([1.0, 1.0, 1.0, 1.0]);
+
+                dst.positions.push(vert1);
+                dst.normals.push(normal);
+                dst.uvs.push(uv1);
+                dst.colors.push([1.0, 1.0, 1.0, 1.0]);
+
+                dst.indices.extend_from_slice(&[base, base + 1, base + 2]);
+            }
         }
     }
 }

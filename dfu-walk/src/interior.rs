@@ -1,8 +1,7 @@
-//! Interni delle taverne: con E vicino a una taverna si entra, con E vicino alla porta
-//! (o Backspace ovunque) si esce. L'interno e' costruito con i modelli originali del
-//! secondo BlockData del sotto-record e messo 6000 m sopra il punto d'ingresso, cosi' non si
-//! sovrappone a nulla e il resto del mondo resta caricato. Dentro si cammina sui pavimenti dei
-//! modelli (scale comprese) e le pareti bloccano.
+//! Interni degli edifici: con E vicino a una Taverna, una Gilda o un Negozio si entra.
+//! Con E vicino alla porta (o Backspace ovunque) si esce.
+//! Riconosce la vera porta d'ingresso/uscita ed esce con certezza premendo E entro 3.5 metri.
+use crate::dialog::DialogState;
 use crate::mod_textures::ModTextures;
 use crate::player::{Player, EYE_HEIGHT};
 use crate::tiles::climate_of;
@@ -15,47 +14,123 @@ use crate::data::blocks::RmbBlock;
 use crate::data::bsa::BsaArchive;
 use crate::data::building_gen::DF_UNIT;
 use crate::data::city_map::{collect_city_map, MapBuilding, PoiKind};
+use crate::data::find_file_ci;
 use crate::data::interior::{build_interior, InteriorScene};
 use crate::data::mesh_builder::{Submesh, WorldMesh};
 use crate::data::terrain_mesh::MAP_PIXEL_SIZE;
 use std::collections::HashMap;
 
-/// Quota (m) a cui si costruisce l'interno.
 const INTERIOR_Y: f32 = 6000.0;
-
-/// Distanza massima dal perimetro della taverna per poter entrare.
-const ENTER_DISTANCE: f32 = 3.5;
-
-/// Distanza dalla porta interna entro cui E fa uscire.
-const EXIT_DISTANCE: f32 = 2.5;
-
+const ENTER_DISTANCE: f32 = 4.5;
+// Raggio di uscita generoso: 3.5 metri
+const EXIT_DISTANCE: f32 = 3.5;
 const WALK_SPEED: f32 = 4.0;
 const RUN_MULTIPLIER: f32 = 2.0;
 const GRAVITY: f32 = 20.0;
 const JUMP_SPEED: f32 = 5.5;
 const RADIUS: f32 = 0.3;
-
-/// Salita massima di un gradino e discesa a cui si resta incollati al pavimento.
 const STEP_UP: f32 = 0.6;
 const SNAP_DOWN: f32 = 0.5;
-
-/// Distanza massima dalla porta di una stanza per aprirla/chiuderla con E.
 const DOOR_REACH: f32 = 2.2;
 const DOOR_OPEN_SECONDS: f32 = 1.5;
-
-/// Verso di apertura: 1.0 come in Daggerfall Unity (angolo -90). Se le porte si aprono verso
-/// il muro invece che verso la stanza, metti -1.0.
 const DOOR_OPEN_SIGN: f32 = 1.0;
+
+// =============================================================================
+// FLATS.CFG: mappa (texture_archive, texture_record) del flat -> indice volto
+// =============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct FlatInfo {
+    face: usize,
+}
+
+#[derive(Default)]
+pub struct FlatsFaceMap {
+    entries: HashMap<(u16, u8), Vec<FlatInfo>>,
+}
+
+impl FlatsFaceMap {
+    fn load(data: &GameData) -> Self {
+        let mut map = Self::default();
+        let Some(path) = find_file_ci(&data.dir, "FLATS.CFG") else {
+            info!("FLATS.CFG non trovato: i volti interni useranno la generazione procedurale");
+            return map;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            warn!("FLATS.CFG: impossibile leggere {}", path.display());
+            return map;
+        };
+        let mut valid = 0usize;
+        let mut skipped = 0usize;
+        let mut lines = text.lines().peekable();
+        while let Some(line) = lines.next() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() >= 6
+                && tokens[0].parse::<u16>().is_ok()
+                && tokens[2].parse::<u32>().is_ok()
+                && tokens[3].parse::<usize>().is_ok()
+                {
+                    let archive = tokens[0].parse::<u16>().unwrap();
+                    let record = tokens[1].parse::<u8>().unwrap();
+                    let face = tokens[3].parse::<usize>().unwrap();
+                    if archive <= 999 && record <= 255 {
+                        map.entries.entry((archive, record)).or_default().push(FlatInfo { face });
+                        valid += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                } else if tokens.len() == 2
+                    && tokens[0].parse::<u16>().is_ok()
+                    && tokens[1].parse::<u8>().is_ok()
+                    {
+                        let archive = tokens[0].parse::<u16>().unwrap();
+                        let record = tokens[1].parse::<u8>().unwrap();
+                        for _ in 0..4 {
+                            if lines.next().is_none() { break; }
+                        }
+                        if let Some(face_line) = lines.next() {
+                            if let Ok(face) = face_line.trim().parse::<usize>() {
+                                if archive <= 999 && record <= 255 {
+                                    map.entries.entry((archive, record)).or_default().push(FlatInfo { face });
+                                    valid += 1;
+                                } else {
+                                    skipped += 1;
+                                }
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+                    } else {
+                        skipped += 1;
+                    }
+        }
+        if valid == 0 {
+            warn!("FLATS.CFG: nessuna voce valida dopo il parsing. I volti interni useranno la generazione procedurale.");
+        } else {
+            info!("FLATS.CFG: {} voci valide, {} scartate, {} flat distinti mappati", valid, skipped, map.entries.len());
+        }
+        map
+    }
+
+    fn face_for(&self, archive: u16, record: u8) -> Option<usize> {
+        let entries = self.entries.get(&(archive, record))?;
+        entries.first().map(|e| e.face)
+    }
+}
 
 struct Active {
     root: Entity,
-    /// posizione nel mondo del punto (0,0,0) dell'interno
     origin: Vec3,
     scene: InteriorScene,
     saved_translation: Vec3,
     saved_feet_y: f32,
     saved_yaw: f32,
     saved_origin: (i32, i32),
+    kind: PoiKind,
 }
 
 #[derive(Resource, Default)]
@@ -67,9 +142,12 @@ impl InteriorState {
     pub fn is_inside(&self) -> bool {
         self.active.is_some()
     }
+
+    pub fn kind(&self) -> Option<PoiKind> {
+        self.active.as_ref().map(|a| a.kind)
+    }
 }
 
-/// Condizione per i sistemi che valgono solo all'aperto (il cielo).
 pub fn outside(state: Res<InteriorState>) -> bool {
     !state.is_inside()
 }
@@ -77,7 +155,13 @@ pub fn outside(state: Res<InteriorState>) -> bool {
 #[derive(Component)]
 pub struct FlatBillboard;
 
-/// Porta di una stanza: ruota attorno alla sua origine tra `closed_y` e `closed_y - 90 gradi`.
+#[derive(Component)]
+pub struct InteriorNpc {
+    pub face_record: usize,
+    pub flat_archive: u16,
+    pub flat_record: u8,
+}
+
 #[derive(Component)]
 pub struct RoomDoor {
     index: usize,
@@ -86,7 +170,6 @@ pub struct RoomDoor {
 }
 
 fn distance_to_building(b: &MapBuilding, px: f32, pz: f32) -> f32 {
-    // inverso della rotazione usata da CityBuilder: x' = x c + z s, z' = -x s + z c
     let (s, c) = b.rot_deg.to_radians().sin_cos();
     let (dx, dz) = (px - b.cx, pz - b.cz);
     let lx = dx * c - dz * s;
@@ -96,9 +179,6 @@ fn distance_to_building(b: &MapBuilding, px: f32, pz: f32) -> f32 {
     ox.hypot(oz)
 }
 
-/// Mesh Bevy di una sola texture: tiene solo i vertici usati dal submesh.
-/// Le UV di ARCH3D arrivano in pixel (gia' divise per 16): si dividono per le dimensioni
-/// della texture originale per portarle in 0..1.
 fn submesh_to_bevy(mesh: &WorldMesh, sm: &Submesh, size: (f32, f32)) -> Mesh {
     let mut remap: HashMap<u32, u32> = HashMap::new();
     let mut positions: Vec<[f32; 3]> = Vec::new();
@@ -124,16 +204,13 @@ fn submesh_to_bevy(mesh: &WorldMesh, sm: &Submesh, size: (f32, f32)) -> Mesh {
     out
 }
 
-/// Diagnostica: metri di parete per ogni ripetizione della texture (mediana sugli spigoli).
-/// Per una texture da 64 px ci si aspetta circa 1.6 m.
 fn debug_uv_scale(mesh: &WorldMesh, sm: &Submesh, size: (f32, f32)) {
     let mut ratios = Vec::new();
     for t in sm.indices.chunks_exact(3) {
         for (a, b) in [(0, 1), (1, 2), (2, 0)] {
             let (ia, ib) = (t[a] as usize, t[b] as usize);
             let (pa, pb) = (mesh.vertices[ia], mesh.vertices[ib]);
-            let d = ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2))
-            .sqrt();
+            let d = ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt();
             let (ua, ub) = (mesh.uvs[ia], mesh.uvs[ib]);
             let (du, dv) = ((ua[0] - ub[0]) / size.0, (ua[1] - ub[1]) / size.1);
             let duv = (du * du + dv * dv).sqrt();
@@ -146,11 +223,7 @@ fn debug_uv_scale(mesh: &WorldMesh, sm: &Submesh, size: (f32, f32)) {
     if let Some(m) = ratios.get(ratios.len() / 2) {
         println!(
             "UV dbg {}/{} size {:?}: {} spigoli, metri per ripetizione (mediana) = {:.4}",
-                 sm.texture_archive,
-                 sm.texture_record,
-                 size,
-                 ratios.len(),
-                 m
+                 sm.texture_archive, sm.texture_record, size, ratios.len(), m
         );
     }
 }
@@ -169,6 +242,7 @@ pub fn interior_enter_exit(
     mut wall_textures: ResMut<WallTextures>,
     mut mods: ResMut<ModTextures>,
     mut player: Query<(&mut Player, &mut Transform)>,
+                           mut flats_face_map: Local<Option<FlatsFaceMap>>,
 ) {
     let leave = keys.just_pressed(KeyCode::Backspace);
     let act = keys.just_pressed(KeyCode::KeyE);
@@ -178,18 +252,21 @@ pub fn interior_enter_exit(
     let Ok((mut p, mut tf)) = player.get_single_mut() else {
         return;
     };
-    // ---- uscita ----
+
+    // ---- USCITA DALL'INTERNO ----
     if state.active.is_some() {
         let near_exit = {
             let a = state.active.as_ref().unwrap();
             let local = tf.translation - a.origin;
-            a.scene
-            .exit
-            .map_or(false, |e| (local.x - e[0]).hypot(local.z - e[2]) < EXIT_DISTANCE)
+            // Esci se sei vicino alla porta d'uscita OPPURE vicino al punto in cui sei spawnato all'entrata
+            let d_spawn = (local.x - a.scene.spawn[0]).hypot(local.z - a.scene.spawn[2]);
+            let d_exit = a.scene.exit.map_or(f32::MAX, |e| {
+                (local.x - e[0]).hypot(local.z - e[2])
+            });
+            d_spawn < EXIT_DISTANCE || d_exit < EXIT_DISTANCE
         };
         if leave || near_exit {
             let a = state.active.take().unwrap();
-            // se nel frattempo e' cambiata l'origine del mondo, si corregge come `rebase_origin`
             let (de, dn) = (origin.east - a.saved_origin.0, origin.north - a.saved_origin.1);
             let mut pos = a.saved_translation;
             pos.x -= de as f32 * MAP_PIXEL_SIZE;
@@ -197,17 +274,21 @@ pub fn interior_enter_exit(
             p.feet_y = a.saved_feet_y;
             p.vel_y = 0.0;
             p.on_ground = true;
-            p.yaw = a.saved_yaw + std::f32::consts::PI; // si esce guardando la strada
+            p.yaw = a.saved_yaw + std::f32::consts::PI;
             tf.translation = pos;
             commands.entity(a.root).despawn_recursive();
             clear.0 = Color::srgb(0.55, 0.72, 0.92);
-            println!("Sei uscito dalla taverna.");
+            println!("Sei uscito dall'edificio.");
         }
         return;
     }
-    // ---- ingresso ----
+
+    // ---- INGRESSO NELL'EDIFICIO ----
     if !act {
         return;
+    }
+    if flats_face_map.is_none() {
+        *flats_face_map = Some(FlatsFaceMap::load(&data));
     }
     let (mx, my) = map_pixel_of(&origin, tf.translation);
     let Some(loc) = data.locations.get(&(mx, my)) else {
@@ -224,30 +305,30 @@ pub fn interior_enter_exit(
     let map = collect_city_map(loc, &blocks, &arch);
     let tile = tile_translation(&origin, mx, my);
     let (px, pz) = (tf.translation.x - tile.x, tf.translation.z - tile.z);
-    let mut best: Option<(f32, (usize, usize, u8))> = None;
-    let (mut taverns, mut nearest) = (0usize, f32::MAX);
+    let mut best: Option<(f32, (usize, usize, u8), PoiKind)> = None;
+    let (mut places, mut nearest) = (0usize, f32::MAX);
     for b in &map.buildings {
-        if b.kind != Some(PoiKind::Tavern) {
+        let Some(kind) = b.kind.filter(|k| matches!(k, PoiKind::Tavern | PoiKind::Shop | PoiKind::Guild)) else {
             continue;
-        }
+        };
         let Some(src) = b.source else { continue };
         let d = distance_to_building(b, px, pz);
-        taverns += 1;
+        places += 1;
         nearest = nearest.min(d);
-        if d <= ENTER_DISTANCE && best.map_or(true, |(bd, _)| d < bd) {
-            best = Some((d, src));
+        if d <= ENTER_DISTANCE && best.map_or(true, |(bd, _, _)| d < bd) {
+            best = Some((d, src, kind));
         }
     }
-    let Some((_, (bx, by, sub))) = best else {
-        if taverns == 0 {
+    let Some((_, (bx, by, sub), kind)) = best else {
+        if places == 0 {
             println!(
-                "Interni: nessuna taverna trovata in {} (map pixel {mx},{my}).",
+                "Interni: nessuna taverna, gilda o negozio trovato in {} (map pixel {mx},{my}).",
                      loc.name
             );
         } else {
             println!(
-                "Interni: {} taverne in {}, la piu' vicina a {:.1} m (serve entro {ENTER_DISTANCE} m).",
-                     taverns, loc.name, nearest
+                "Interni: {} edifici accessibili in {}, il piu' vicino a {:.1} m (serve entro {ENTER_DISTANCE} m).",
+                     places, loc.name, nearest
             );
         }
         return;
@@ -268,11 +349,15 @@ pub fn interior_enter_exit(
         println!("L'interno di {name} (sotto-record {sub}) non ha modelli 3D.");
         return;
     };
+
     let origin_world = Vec3::new(tf.translation.x, INTERIOR_Y, tf.translation.z);
     let climate = climate_of(&data, mx, my);
+    let face_lookup = flats_face_map.as_ref().expect("inizializzata sopra");
+
     let root = commands
     .spawn((Transform::from_translation(origin_world), Visibility::default()))
     .with_children(|parent| {
+        // ---- MURI ----
         for sm in &scene.mesh.submeshes {
             if sm.indices.is_empty() {
                 continue;
@@ -288,19 +373,23 @@ pub fn interior_enter_exit(
                 &mut images,
                 &mut materials,
             );
-            // il verso delle facce dei modelli non e' garantito: si disegnano da entrambi i lati
             if let Some(m) = materials.get_mut(&handle) {
                 m.double_sided = true;
                 m.cull_mode = None;
             }
+            // >>> Normal map: senza tangenti Bevy ignora la normal map (da File 1)
+            let mut bevy_mesh = submesh_to_bevy(&scene.mesh, sm, size);
+            if wall_textures.has_normal_map(&handle) {
+                let _ = bevy_mesh.generate_tangents();
+            }
             parent.spawn((
-                Mesh3d(meshes.add(submesh_to_bevy(&scene.mesh, sm, size))),
+                Mesh3d(meshes.add(bevy_mesh)),
                           MeshMaterial3d(handle),
                           Transform::IDENTITY,
             ));
         }
+        // ---- PORTE ----
         for (i, d) in scene.doors.iter().enumerate() {
-            // la porta ruota attorno al proprio punto d'origine (la cerniera)
             let closed = -d.yaw_deg.to_radians();
             parent
             .spawn((
@@ -339,20 +428,26 @@ pub fn interior_enter_exit(
                         m.double_sided = true;
                         m.cull_mode = None;
                     }
+                    // >>> Normal map anche per le porte (da File 1)
+                    let mut bevy_mesh = submesh_to_bevy(&d.mesh, sm, size);
+                    if wall_textures.has_normal_map(&handle) {
+                        let _ = bevy_mesh.generate_tangents();
+                    }
                     door.spawn((
-                        Mesh3d(meshes.add(submesh_to_bevy(&d.mesh, sm, size))),
+                        Mesh3d(meshes.add(bevy_mesh)),
                                 MeshMaterial3d(handle),
                                 Transform::IDENTITY,
                     ));
                 }
             });
         }
-        // Flat (arredi statici: tavoli, barili, quadri, luci)
+        // Flat (arredi statici: tavoli, barili, quadri, luci) con supporto HD mod
         for f in &scene.flats {
             let Some((material, w_px, h_px)) = wall_textures.flat_material(
                 f.archive,
                 f.record,
                 &data,
+                &mut mods,
                 &mut images,
                 &mut materials,
             ) else {
@@ -366,26 +461,36 @@ pub fn interior_enter_exit(
                           FlatBillboard,
             ));
         }
-        // AGGIUNTA: People (NPC - oste, clienti, mercanti) come billboard
-        for f in &scene.people {
+        // People (NPC - oste, clienti, mercanti, membri di gilda) con supporto HD mod e dialogo.
+        for (i, f) in scene.people.iter().enumerate() {
             let Some((material, w_px, h_px)) = wall_textures.flat_material(
                 f.archive,
                 f.record,
                 &data,
+                &mut mods,
                 &mut images,
                 &mut materials,
             ) else {
                 continue;
             };
             let (w, h) = (w_px * DF_UNIT, h_px * DF_UNIT);
+            let face_record = face_lookup
+            .face_for(f.archive, f.record)
+            .unwrap_or_else(|| {
+                ((f.archive as usize * 37) + (f.record as usize * 13) + (i * 7)) % 500
+            });
             parent.spawn((
                 Mesh3d(meshes.add(Rectangle::new(w, h))),
                           MeshMaterial3d(material),
                           Transform::from_xyz(f.pos[0], f.pos[1] + h * 0.5, f.pos[2]),
                           FlatBillboard,
+                          InteriorNpc {
+                              face_record,
+                              flat_archive: f.archive,
+                              flat_record: f.record,
+                          },
             ));
         }
-        // luce calda al centro della sala
         let cx = (scene.bounds_min[0] + scene.bounds_max[0]) * 0.5;
         let cz = (scene.bounds_min[2] + scene.bounds_max[2]) * 0.5;
         parent.spawn((
@@ -400,11 +505,17 @@ pub fn interior_enter_exit(
         ));
     })
     .id();
-    // il giocatore compare davanti alla porta, rivolto verso la sala
+
     let spawn = Vec3::from(scene.spawn);
-    let cx = (scene.bounds_min[0] + scene.bounds_max[0]) * 0.5;
-    let cz = (scene.bounds_min[2] + scene.bounds_max[2]) * 0.5;
-    let (dx, dz) = (cx - spawn.x, cz - spawn.z);
+    let exit = scene.exit.map(Vec3::from).unwrap_or(spawn);
+    // Orienta la visuale in avanti voltando le spalle alla porta d'uscita
+    let look_dir = if scene.exit.is_some() {
+        Vec3::new(spawn.x - exit.x, 0.0, spawn.z - exit.z)
+    } else {
+        let cx = (scene.bounds_min[0] + scene.bounds_max[0]) * 0.5;
+        let cz = (scene.bounds_min[2] + scene.bounds_max[2]) * 0.5;
+        Vec3::new(cx - spawn.x, 0.0, cz - spawn.z)
+    };
     let saved = Active {
         root,
         origin: origin_world,
@@ -412,14 +523,16 @@ pub fn interior_enter_exit(
         saved_feet_y: p.feet_y,
         saved_yaw: p.yaw,
         saved_origin: (origin.east, origin.north),
+        kind,
         scene,
     };
     p.feet_y = origin_world.y + spawn.y;
     p.vel_y = 0.0;
     p.on_ground = true;
     p.fly = false;
-    if dx.hypot(dz) > 0.5 {
-        p.yaw = (-dx).atan2(-dz);
+    if look_dir.length_squared() > 0.01 {
+        let norm = look_dir.normalize();
+        p.yaw = (-norm.x).atan2(-norm.z);
     }
     tf.translation = Vec3::new(
         origin_world.x + spawn.x,
@@ -428,15 +541,24 @@ pub fn interior_enter_exit(
     );
     clear.0 = Color::BLACK;
     state.active = Some(saved);
-    println!("Sei entrato in {name} (sotto-record {sub}). E vicino alla porta o Backspace per uscire.");
+    let what = match kind {
+        PoiKind::Shop => "negozio",
+        PoiKind::Guild => "gilda",
+        _ => "taverna",
+    };
+    println!("Sei entrato in {name} ({what}, sotto-record {sub}). E vicino alla porta o Backspace per uscire.");
 }
 
 pub fn interior_move(
+    dialog: Res<DialogState>,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     state: Res<InteriorState>,
     mut player: Query<(&mut Player, &mut Transform)>,
 ) {
+    if dialog.open {
+        return;
+    }
     let Some(active) = state.active.as_ref() else {
         return;
     };
@@ -455,7 +577,6 @@ pub fn interior_move(
     .normalize_or_zero();
     let running = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let speed = WALK_SPEED * if running { RUN_MULTIPLIER } else { 1.0 };
-    // passi da al massimo 10 cm, cosi' non si attraversano le pareti sottili
     let total = speed * dt;
     let steps = (total / 0.1).ceil().max(1.0) as i32;
     let step = wish * (total / steps as f32);
@@ -463,7 +584,6 @@ pub fn interior_move(
     if step != Vec3::ZERO {
         for _ in 0..steps {
             let feet = p.feet_y - o.y;
-            // prima il passo intero, poi scorrimento lungo un solo asse
             for cand in [
                 step,
                 Vec3::new(step.x, 0.0, 0.0),
@@ -480,7 +600,6 @@ pub fn interior_move(
             }
         }
     }
-    // verticale: pavimento dei modelli, gravita' e salto
     let (lx, lz) = (pos.x - o.x, pos.z - o.z);
     let feet_local = p.feet_y - o.y;
     let floor = scene.floor_at(lx, lz, feet_local, STEP_UP);
@@ -507,7 +626,6 @@ pub fn interior_move(
             }
         }
     }
-    // caduto nel vuoto: si riparte dall'ingresso
     if p.feet_y - o.y < scene.bounds_min[1] - 5.0 {
         pos = Vec3::new(o.x + scene.spawn[0], 0.0, o.z + scene.spawn[2]);
         p.feet_y = o.y + scene.spawn[1];
@@ -518,7 +636,6 @@ pub fn interior_move(
     tf.translation = pos;
 }
 
-/// Gli sprite (tavoli, persone...) guardano sempre la camera.
 pub fn face_flats(
     player: Query<&Player>,
     mut flats: Query<&mut Transform, (With<FlatBillboard>, Without<crate::tiles::NpcWalker>)>,
@@ -530,7 +647,6 @@ pub fn face_flats(
     }
 }
 
-/// E vicino a una porta di stanza: la apre o la chiude.
 pub fn interior_toggle_doors(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<InteriorState>,
@@ -552,7 +668,6 @@ pub fn interior_toggle_doors(
     }
 }
 
-/// Anima le porte verso lo stato (aperta/chiusa) indicato dalla scena.
 pub fn animate_doors(
     time: Res<Time>,
     state: Res<InteriorState>,

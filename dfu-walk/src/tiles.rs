@@ -1,11 +1,12 @@
 //! Caricamento e streaming dei map pixel: terreno, città, vegetazione,
-//! flat esterni (decorazioni) e NPC animati.
+//! flat esterni (decorazioni) e NPC animati con supporto texture HD (.dfmod).
 use crate::mod_textures::ModTextures;
 use crate::player::Player;
 use crate::terrain_material::{TerrainExtension, TerrainMaterial};
 use crate::trees::{spawn_trees_for_chunk, NaturePool};
 use crate::wall_textures::WallTextures;
 use crate::world::*;
+use bevy::math::Affine2;
 use bevy::pbr::ExtendedMaterial;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
@@ -23,6 +24,7 @@ use crate::data::{
     encode_for_shader, generate_default_samples, generate_default_tilemap,
     ground_archive, HeightSamples,
 };
+use dfmod::{MapKind, TextureKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -36,15 +38,31 @@ const DEFAULT_CLIMATE: i32 = 231;
 /// Le direzioni verso est si ottengono specchiando i record 3, 2 e 1.
 const PERSON_ARCHIVES: [u16; 24] = [
     381, 382, 383, 384, // maschi Redguard
-    385, 386, 391, 394, // maschi Breton
-    387, 388, 389, 390, // maschi Nord
-    392, 393, 451, 452, // femmine Nord
-    395, 396, 397, 398, // femmine Redguard
-    453, 454, 455, 456, // femmine Breton
+385, 386, 391, 394, // maschi Breton
+387, 388, 389, 390, // maschi Nord
+392, 393, 451, 452, // femmine Nord
+395, 396, 397, 398, // femmine Redguard
+453, 454, 455, 456, // femmine Breton
 ];
 
+/// Volti per i dialoghi: `TFAC00I0.RCI` contiene 360 volti 64x64. Per ogni archivio persona
+/// questa tabella dà il primo volto del blocco giusto (razza, sesso, vestiti); i 24 record
+/// successivi sono le varianti di volto. Valori da DFU `MobilePersonNPC`.
+const PERSON_FACE_BASE: [(u16, usize); 24] = [
+    (381, 336), (382, 312), (383, 336), (384, 312), // maschi Redguard
+    (385, 192), (386, 216), (391, 240), (394, 240), // maschi Breton
+    (387, 240), (388, 264), (389, 264), (390, 216), // maschi Nord
+    (392, 72), (393, 0), (451, 48), (452, 72),      // femmine Nord
+    (395, 144), (396, 144), (397, 120), (398, 96),  // femmine Redguard
+    (453, 72), (454, 72), (455, 24), (456, 72),     // femmine Breton
+];
+const FACE_VARIANTS: usize = 24;
+
+fn person_face_record(archive: u16, variant: usize) -> Option<usize> {
+    PERSON_FACE_BASE.iter().find(|(a, _)| *a == archive).map(|(_, base)| base + variant % FACE_VARIANTS)
+}
+
 /// Per ognuna degli 8 orientamenti rispetto alla camera: (record, specchiato).
-/// Indice 0 = la persona cammina verso la camera, 4 = di spalle (tabella DFU `MoveAnims`).
 const ORIENTATIONS: [(usize, bool); 8] = [
     (0, false), (1, false), (2, false), (3, false),
     (4, false), (3, true), (2, true), (1, true),
@@ -52,12 +70,12 @@ const ORIENTATIONS: [(usize, bool); 8] = [
 const IDLE_RECORD: u8 = 5;
 const NPC_MAX_FRAMES: usize = 32;
 
-const NPC_FRAME_SECONDS: f32 = 0.25; // 4 fps come DFU (MoveAnimSpeed)
-const NPC_SPEED: f32 = 1.3; // m/s, come DFU movementSpeed
-const NPC_STEP: f32 = 4.0; // lunghezza di un passo "di griglia" in metri
-const NPC_IDLE_DISTANCE: f32 = 2.5; // si fermano se il giocatore è fermo qui vicino
-const NPC_RANDOM_TURN_CHANCE: f32 = 0.025; // probabilità di cambiare direzione a ogni passo
-const NPC_RADIUS: f32 = 0.35; // raggio del corpo per le collisioni
+const NPC_FRAME_SECONDS: f32 = 0.25;
+const NPC_SPEED: f32 = 1.3;
+const NPC_STEP: f32 = 4.0;
+const NPC_IDLE_DISTANCE: f32 = 2.5;
+const NPC_RANDOM_TURN_CHANCE: f32 = 0.025;
+const NPC_RADIUS: f32 = 0.35;
 
 const CARDINALS: [Vec2; 4] = [Vec2::X, Vec2::NEG_X, Vec2::Y, Vec2::NEG_Y];
 
@@ -67,66 +85,100 @@ pub struct NpcSpriteSet {
     walk_size: [Vec2; 5],
     idle: Vec<Handle<StandardMaterial>>,
     idle_size: Vec2,
-    /// Immagine del frame frontale (record 0) e sue dimensioni in pixel: ritratto per i dialoghi.
     portrait: Handle<Image>,
     portrait_size: Vec2,
 }
 
-/// Carica tutti i frame di un record con UNA sola apertura del file.
+/// Carica tutti i frame di un record verificando se è presente una sostituzione HD (.dfmod).
 fn load_record(
-    file: &TextureFile, record: usize, data: &GameData,
-    images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>,
+    archive: u16,
+    file: &TextureFile,
+    record: usize,
+    data: &GameData,
+    mods: &mut ModTextures,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
 ) -> Option<(Vec<Handle<StandardMaterial>>, Vec2)> {
     let rec = file.record(record)?;
     let frame_count = file.frame_count(record)?.min(NPC_MAX_FRAMES);
-    // Fattore di scala del record (diviso 256 come in DFU).
     let (sx, sy) = (rec.scale_x as f32 / 256.0, rec.scale_y as f32 / 256.0);
     let mut handles = Vec::new();
     let mut size = Vec2::ONE;
+
     for frame in 0..frame_count {
         let Ok(img) = file.frame(record, frame) else { break };
         if img.width == 0 || img.height == 0 { break; }
         if frame == 0 {
             size = Vec2::new(img.width as f32 * (1.0 + sx), img.height as f32 * (1.0 + sy)) * DF_UNIT;
         }
-        let mut image = Image::new(
-            Extent3d { width: img.width as u32, height: img.height as u32, depth_or_array_layers: 1 },
-            TextureDimension::D2,
-            img.to_rgba(&data.palette, Some(0)),
-            TextureFormat::Rgba8UnormSrgb,
-            RenderAssetUsages::default(),
-        );
-        image.sampler = bevy::image::ImageSampler::nearest();
+
+        let key = TextureKey {
+            archive: archive as u32,
+            record: record as u32,
+            frame: frame as u32,
+            kind: MapKind::Albedo,
+        };
+
+        let (image_handle, is_hd) = if let Some(hd_handle) = mods.image_by_key(&key, images) {
+            (hd_handle, true)
+        } else {
+            let mut image = Image::new(
+                Extent3d { width: img.width as u32, height: img.height as u32, depth_or_array_layers: 1 },
+                TextureDimension::D2,
+                img.to_rgba(&data.palette, Some(0)),
+                                       TextureFormat::Rgba8UnormSrgb,
+                                       RenderAssetUsages::default(),
+            );
+            image.sampler = bevy::image::ImageSampler::nearest();
+            (images.add(image), false)
+        };
+
+        // Solo le immagini BC7 vanno capovolte: PNG e DXT delle mod sono gia' nel verso giusto.
+        let uv_transform = if is_hd && mods.needs_v_flip(&image_handle) {
+            Affine2::from_scale_angle_translation(Vec2::new(1.0, -1.0), 0.0, Vec2::new(0.0, 1.0))
+        } else {
+            Affine2::IDENTITY
+        };
+
         handles.push(materials.add(StandardMaterial {
-            base_color_texture: Some(images.add(image)),
-            alpha_mode: AlphaMode::Mask(0.5),
-            cull_mode: None,
-            double_sided: true,
-            perceptual_roughness: 0.9,
-            reflectance: 0.1,
-            ..default()
+            base_color_texture: Some(image_handle),
+                                   alpha_mode: AlphaMode::Mask(0.5),
+                                   cull_mode: None,
+                                   double_sided: true,
+                                   perceptual_roughness: 0.9,
+                                   reflectance: 0.1,
+                                   uv_transform,
+                                   ..default()
         }));
     }
     (!handles.is_empty()).then_some((handles, size))
 }
 
 fn build_npc_sprites(
-    archive: u16, data: &GameData,
-    images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>,
+    archive: u16,
+    data: &GameData,
+    mods: &mut ModTextures,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
 ) -> Option<NpcSpriteSet> {
     let path = find_file_ci(&data.dir, &archive_file_name(archive as u32))?;
     let file = TextureFile::open(&path).ok()?;
     let mut walk: [Vec<Handle<StandardMaterial>>; 5] = Default::default();
     let mut walk_size = [Vec2::ONE; 5];
     for rec in 0..5 {
-        let (frames, size) = load_record(&file, rec, data, images, materials)?;
+        let (frames, size) = load_record(archive, &file, rec, data, mods, images, materials)?;
         walk[rec] = frames;
         walk_size[rec] = size;
     }
-    let (idle, idle_size) = load_record(&file, IDLE_RECORD as usize, data, images, materials)
-        .unwrap_or_else(|| (vec![walk[0][0].clone()], walk_size[0]));
+    let (idle, idle_size) = load_record(archive, &file, IDLE_RECORD as usize, data, mods, images, materials)
+    .unwrap_or_else(|| (vec![walk[0][0].clone()], walk_size[0]));
     let portrait = materials.get(&walk[0][0]).and_then(|m| m.base_color_texture.clone())?;
-    let portrait_size = images.get(&portrait).map(|i| i.size_f32()).unwrap_or(Vec2::new(64.0, 64.0));
+    // Le immagini HD spariscono da `Assets<Image>` dopo l'upload sulla GPU: le dimensioni si
+    // chiedono prima alle mod, che le hanno memorizzate al caricamento.
+    let portrait_size = mods
+    .image_size(&portrait)
+    .or_else(|| images.get(&portrait).map(|i| i.size_f32()))
+    .unwrap_or(Vec2::new(64.0, 64.0));
     Some(NpcSpriteSet { walk, walk_size, idle, idle_size, portrait, portrait_size })
 }
 
@@ -136,12 +188,9 @@ fn next_rand(state: &mut u64) -> f32 {
     ((*state >> 11) & 0xFF_FFFF) as f32 / 16_777_215.0
 }
 
-/// Sceglie il prossimo bersaglio sulla griglia cardinale (N/S/E/O), restando nei limiti
-/// e senza puntare dentro muri. Di norma continua dritto; cambia direzione con piccola
-/// probabilità o se è bloccato.
 fn pick_target(
     pos: Vec2, heading: &mut Vec2, bounds: (Vec2, Vec2), rng: &mut u64, force_new: bool,
-    blocked: &dyn Fn(Vec2) -> bool,
+               blocked: &dyn Fn(Vec2) -> bool,
 ) -> Vec2 {
     let inside = |p: Vec2| p.x >= bounds.0.x && p.x <= bounds.1.x && p.y >= bounds.0.y && p.y <= bounds.1.y;
     let free = |p: Vec2| inside(p) && !blocked(p) && !blocked((pos + p) * 0.5);
@@ -168,10 +217,10 @@ fn npc_blocked(colliders: Option<&Colliders>, samples: &HeightSamples, p: Vec2) 
 // Collisioni statiche: edifici e mura
 // ---------------------------------------------------------------------------
 
-const COLLISION_GRID: usize = 64; // celle per lato nella griglia spaziale del tile
-const COLLIDER_MARGIN: f32 = 1.0; // >= del raggio massimo dei corpi che collidono
-const STEP_HEIGHT: f32 = 0.6; // ostacoli più bassi (zoccoli, gradini) si scavalcano
-const BODY_HEIGHT: f32 = 1.8; // ostacoli più alti di così non toccano la testa
+const COLLISION_GRID: usize = 64;
+const COLLIDER_MARGIN: f32 = 1.0;
+const STEP_HEIGHT: f32 = 0.6;
+const BODY_HEIGHT: f32 = 1.8;
 const MIN_WALL_LEN: f32 = 0.05;
 
 struct WallSegment {
@@ -181,13 +230,11 @@ struct WallSegment {
     y_max: f32,
 }
 
-/// Triangolo (quasi) orizzontale su cui si può stare in piedi: tetti, cime di muri e mura.
 struct SurfaceTri {
     v: [Vec3; 3],
 }
 
 impl SurfaceTri {
-    /// Quota del triangolo sotto (x, z), se il punto cade al suo interno.
     fn height_at(&self, p: Vec2) -> Option<f32> {
         let [a, b, c] = self.v;
         let d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
@@ -200,8 +247,6 @@ impl SurfaceTri {
     }
 }
 
-/// Muri di un tile (coordinate locali del tile), derivati dai triangoli verticali dei
-/// modelli di edifici e mura, con griglia spaziale per interrogazioni veloci.
 pub struct Colliders {
     segments: Vec<WallSegment>,
     grid: Vec<Vec<u32>>,
@@ -210,36 +255,26 @@ pub struct Colliders {
     cell: f32,
 }
 
-/// Collisioni del tile, attaccate all'entità del chunk.
 #[derive(Component)]
 pub struct TileCollision(pub Arc<Colliders>);
 
-/// Muro trovato da `probe`: base per la scalata (presa, altezza del bordo, direzione di spinta).
 #[derive(Clone, Copy, Debug)]
 pub struct WallHit {
-    /// Punto di contatto sul muro (x, z).
     pub point: Vec2,
-    /// Normale orizzontale, sempre rivolta verso chi sta guardando il muro.
     pub normal: Vec2,
-    /// Distanza dal punto di partenza lungo la direzione sondata.
     pub distance: f32,
-    /// Quota della base e della sommità del muro.
     pub y_min: f32,
     pub y_max: f32,
 }
 
 impl WallHit {
-    /// Altezza del bordo superiore rispetto ai piedi: decide se il muro è scalabile.
     pub fn ledge_height(&self, feet_y: f32) -> f32 {
         self.y_max - feet_y
     }
 }
 
 impl Colliders {
-    /// `parts`: (mesh, usarlo per i muri, modo superfici: 0 = no, 1 = solo rivolte in su, 2 = qualsiasi
-    /// verso, per le parti a doppia faccia come i tetti).
     fn from_parts<'a>(parts: impl Iterator<Item = (&'a MeshPart, bool, u8)>) -> Self {
-        // (estremi quantizzati) -> indice, per fondere i duplicati dei quad (2 triangoli = stesso muro)
         let mut index: HashMap<(i32, i32, i32, i32), usize> = HashMap::new();
         let mut segments: Vec<WallSegment> = Vec::new();
         let mut surfaces: Vec<SurfaceTri> = Vec::new();
@@ -253,13 +288,12 @@ impl Colliders {
                 let len = n.length();
                 if len < 1e-6 { continue; }
                 let ny = n.y / len;
-                // superfici orizzontali su cui stare: tetti, cime dei muri
                 let walkable = match surface_mode { 1 => ny > 0.35, 2 => ny.abs() > 0.35, _ => false };
                 if walkable {
                     surfaces.push(SurfaceTri { v: [p0, p1, p2] });
                     continue;
                 }
-                if !as_walls || ny.abs() > 0.35 { continue; } // solo superfici verticali
+                if !as_walls || ny.abs() > 0.35 { continue; }
                 let pts = [Vec2::new(p0.x, p0.z), Vec2::new(p1.x, p1.z), Vec2::new(p2.x, p2.z)];
                 let mut best = (0usize, 1usize, 0.0f32);
                 for (i, j) in [(0, 1), (1, 2), (0, 2)] {
@@ -290,7 +324,6 @@ impl Colliders {
         let to_cell = |v: f32| ((v / cell).floor() as i32).clamp(0, COLLISION_GRID as i32 - 1) as usize;
         for (i, s) in segments.iter().enumerate() {
             let (min_x, max_x) = (s.a.x.min(s.b.x) - COLLIDER_MARGIN, s.a.x.max(s.b.x) + COLLIDER_MARGIN);
-            // z locale è negativo: la riga della griglia usa -z
             let (min_z, max_z) = (-(s.a.y.max(s.b.y) + COLLIDER_MARGIN), -(s.a.y.min(s.b.y) - COLLIDER_MARGIN));
             for iz in to_cell(min_z)..=to_cell(max_z) {
                 for ix in to_cell(min_x)..=to_cell(max_x) {
@@ -331,7 +364,6 @@ impl Colliders {
         s.a + ab * t
     }
 
-    /// Un cerchio di raggio `radius` in `p` tocca un muro?
     pub fn hits(&self, p: Vec2, feet_y: f32, radius: f32) -> bool {
         let Some(ci) = self.cell_index(p) else { return false };
         self.grid[ci].iter().any(|&i| {
@@ -340,7 +372,6 @@ impl Colliders {
         })
     }
 
-    /// Spinge il cerchio fuori dai muri toccati (scorre lungo pareti di qualsiasi angolo).
     pub fn resolve(&self, mut p: Vec2, feet_y: f32, radius: f32) -> Vec2 {
         let Some(ci) = self.cell_index(p) else { return p };
         let list = &self.grid[ci];
@@ -364,9 +395,6 @@ impl Colliders {
         p
     }
 
-    /// Sonda orizzontale: primo muro incontrato da `p` lungo `dir` (normalizzata) entro `reach`
-    /// metri (al massimo `COLLIDER_MARGIN`). A differenza di `resolve`/`hits` non ignora i muri
-    /// bassi: serve a riconoscere appigli e bordi per la scalata.
     pub fn probe(&self, p: Vec2, dir: Vec2, reach: f32, feet_y: f32) -> Option<WallHit> {
         let ci = self.cell_index(p)?;
         let reach = reach.min(COLLIDER_MARGIN);
@@ -374,7 +402,6 @@ impl Colliders {
         let mut best: Option<WallHit> = None;
         for &i in &self.grid[ci] {
             let s = &self.segments[i as usize];
-            // il muro deve attraversare la quota del corpo (anche se più basso di STEP_HEIGHT)
             if s.y_max <= feet_y || s.y_min >= feet_y + BODY_HEIGHT { continue; }
             let ab = s.b - s.a;
             let denom = cross(dir, ab);
@@ -391,17 +418,14 @@ impl Colliders {
         best
     }
 
-    /// Quota della superficie più alta sotto `p` che non supera `max_y` (tetti, cime di muri).
     pub fn surface_height(&self, p: Vec2, max_y: f32) -> Option<f32> {
         let ci = self.cell_index(p)?;
         self.surf_grid[ci].iter()
-            .filter_map(|&i| self.surfaces[i as usize].height_at(p))
-            .filter(|&h| h <= max_y)
-            .fold(None, |best: Option<f32>, h| Some(best.map_or(h, |b| b.max(h))))
+        .filter_map(|&i| self.surfaces[i as usize].height_at(p))
+        .filter(|&h| h <= max_y)
+        .fold(None, |best: Option<f32>, h| Some(best.map_or(h, |b| b.max(h))))
     }
 
-    /// Il punto è dentro un edificio? Parità dei muri incrociati da un raggio verso +x,
-    /// usata solo per non far nascere gli NPC dentro le case.
     pub fn inside_building(&self, p: Vec2, ground_y: f32) -> bool {
         let (lo, hi) = (ground_y + 0.5, ground_y + 1.5);
         let mut crossings = 0;
@@ -416,10 +440,9 @@ impl Colliders {
     }
 }
 
-/// Applica le collisioni di tutti i tile con muri a una posizione in coordinate mondo (x, z).
 pub fn resolve_world<'a>(
     chunks: impl Iterator<Item = (&'a TileCollision, &'a Transform)>,
-    mut p: Vec2, feet_y: f32, radius: f32,
+                         mut p: Vec2, feet_y: f32, radius: f32,
 ) -> Vec2 {
     for (collision, tf) in chunks {
         let origin = Vec2::new(tf.translation.x, tf.translation.z);
@@ -428,23 +451,21 @@ pub fn resolve_world<'a>(
     p
 }
 
-/// Quota della superficie più alta sotto la posizione mondo (x, z) che non supera `max_y`.
 pub fn surface_height_world<'a>(
     chunks: impl Iterator<Item = (&'a TileCollision, &'a Transform)>,
-    p: Vec2, max_y: f32,
+                                p: Vec2, max_y: f32,
 ) -> Option<f32> {
     chunks
-        .filter_map(|(collision, tf)| {
-            collision.0.surface_height(p - Vec2::new(tf.translation.x, tf.translation.z), max_y - tf.translation.y)
-                .map(|h| h + tf.translation.y)
-        })
-        .fold(None, |best: Option<f32>, h| Some(best.map_or(h, |b| b.max(h))))
+    .filter_map(|(collision, tf)| {
+        collision.0.surface_height(p - Vec2::new(tf.translation.x, tf.translation.z), max_y - tf.translation.y)
+        .map(|h| h + tf.translation.y)
+    })
+    .fold(None, |best: Option<f32>, h| Some(best.map_or(h, |b| b.max(h))))
 }
 
-/// Come `Colliders::probe` ma in coordinate mondo, sul muro più vicino fra tutti i tile caricati.
 pub fn probe_world<'a>(
     chunks: impl Iterator<Item = (&'a TileCollision, &'a Transform)>,
-    p: Vec2, dir: Vec2, reach: f32, feet_y: f32,
+                       p: Vec2, dir: Vec2, reach: f32, feet_y: f32,
 ) -> Option<WallHit> {
     let mut best: Option<WallHit> = None;
     for (collision, tf) in chunks {
@@ -457,7 +478,6 @@ pub fn probe_world<'a>(
     best
 }
 
-/// NPC che cammina su griglia cardinale con animazioni direzionali (come DFU).
 #[derive(Component)]
 pub struct NpcWalker {
     sprites: Arc<NpcSpriteSet>,
@@ -465,16 +485,19 @@ pub struct NpcWalker {
     target: Vec2,
     frame: usize,
     frame_timer: f32,
-    /// (record, specchiato, frame) attualmente mostrato; None = da assegnare.
     shown: Option<(usize, bool, usize)>,
     rng: u64,
     bounds: (Vec2, Vec2),
     samples: Arc<HeightSamples>,
     colliders: Option<Arc<Colliders>>,
+    face_record: Option<usize>,
 }
 
 impl NpcWalker {
-    /// Ritratto per i dialoghi: immagine frontale dell'NPC e dimensioni in pixel.
+    pub fn face_record(&self) -> Option<usize> {
+        self.face_record
+    }
+
     pub fn portrait(&self) -> (Handle<Image>, Vec2) {
         (self.sprites.portrait.clone(), self.sprites.portrait_size)
     }
@@ -490,51 +513,43 @@ pub struct TerrainTile {
 // Nemici selvatici (fuori dalle città)
 // ---------------------------------------------------------------------------
 
-const ENEMIES_PER_TILE: usize = 4; // nemici per map pixel selvaggio
-const ENEMY_NOTICE_DISTANCE: f32 = 25.0; // distanza a cui notano il giocatore (m)
-const ENEMY_LOSE_DISTANCE: f32 = 60.0; // distanza a cui smettono di inseguire (m)
-const ENEMY_MELEE_RANGE: f32 = 2.0; // distanza di attacco (m)
-const ENEMY_HOVER: f32 = 1.5; // quota extra dei nemici volanti (m)
+const ENEMIES_PER_TILE: usize = 4;
+const ENEMY_NOTICE_DISTANCE: f32 = 25.0;
+const ENEMY_LOSE_DISTANCE: f32 = 60.0;
+const ENEMY_MELEE_RANGE: f32 = 2.0;
+const ENEMY_HOVER: f32 = 1.5;
 
-// Velocità animazioni in fotogrammi/secondo (EnemyBasics di DFU).
 const ENEMY_MOVE_FPS: f32 = 6.0;
 const ENEMY_FLY_FPS: f32 = 10.0;
 const ENEMY_ATTACK_FPS: f32 = 10.0;
 const ENEMY_IDLE_FPS: f32 = 4.0;
 
-/// Record di un archivio nemico (EnemyBasics): 0-4 movimento, 5-9 attacco,
-/// 10-14 colpito, 15-19 idle (solo se `has_idle`). Come per i passanti, i 5 record
-/// coprono gli angoli sud..nord e le direzioni a est si ottengono specchiando.
 const ENEMY_ATTACK_FIRST: usize = 5;
 const ENEMY_IDLE_FIRST: usize = 15;
 
 struct EnemySpecies {
-    /// Archivio texture (= `MaleTexture` in EnemyBasics di DFU).
     archive: u16,
     has_idle: bool,
     flying: bool,
-    /// Velocità in m/s: valori stimati, DFU le legge da MONSTER.BSA.
     wander_speed: f32,
     chase_speed: f32,
 }
 
 static ENEMY_SPECIES: [EnemySpecies; 12] = [
-    EnemySpecies { archive: 257, has_idle: true,  flying: false, wander_speed: 1.2, chase_speed: 3.0 }, // 0 Spriggan
-    EnemySpecies { archive: 259, has_idle: true,  flying: false, wander_speed: 1.5, chase_speed: 4.5 }, // 1 Orso grizzly
-    EnemySpecies { archive: 260, has_idle: true,  flying: false, wander_speed: 1.8, chase_speed: 5.5 }, // 2 Tigre dai denti a sciabola
-    EnemySpecies { archive: 261, has_idle: true,  flying: false, wander_speed: 1.4, chase_speed: 3.5 }, // 3 Ragno
-    EnemySpecies { archive: 262, has_idle: true,  flying: false, wander_speed: 1.2, chase_speed: 3.0 }, // 4 Orco
-    EnemySpecies { archive: 263, has_idle: true,  flying: false, wander_speed: 2.0, chase_speed: 5.5 }, // 5 Centauro
-    EnemySpecies { archive: 265, has_idle: true,  flying: false, wander_speed: 1.0, chase_speed: 2.5 }, // 6 Ninfa
-    EnemySpecies { archive: 267, has_idle: true,  flying: false, wander_speed: 1.3, chase_speed: 3.2 }, // 7 Sergente orco
-    EnemySpecies { archive: 268, has_idle: false, flying: true,  wander_speed: 1.8, chase_speed: 4.5 }, // 8 Arpia
-    EnemySpecies { archive: 271, has_idle: true,  flying: false, wander_speed: 1.0, chase_speed: 2.5 }, // 9 Gigante
-    EnemySpecies { archive: 275, has_idle: false, flying: false, wander_speed: 1.2, chase_speed: 3.0 }, // 10 Scorpione gigante
-    EnemySpecies { archive: 276, has_idle: true,  flying: false, wander_speed: 1.2, chase_speed: 3.0 }, // 11 Sciamano orco
+    EnemySpecies { archive: 257, has_idle: true,  flying: false, wander_speed: 1.2, chase_speed: 3.0 },
+EnemySpecies { archive: 259, has_idle: true,  flying: false, wander_speed: 1.5, chase_speed: 4.5 },
+EnemySpecies { archive: 260, has_idle: true,  flying: false, wander_speed: 1.8, chase_speed: 5.5 },
+EnemySpecies { archive: 261, has_idle: true,  flying: false, wander_speed: 1.4, chase_speed: 3.5 },
+EnemySpecies { archive: 262, has_idle: true,  flying: false, wander_speed: 1.2, chase_speed: 3.0 },
+EnemySpecies { archive: 263, has_idle: true,  flying: false, wander_speed: 2.0, chase_speed: 5.5 },
+EnemySpecies { archive: 265, has_idle: true,  flying: false, wander_speed: 1.0, chase_speed: 2.5 },
+EnemySpecies { archive: 267, has_idle: true,  flying: false, wander_speed: 1.3, chase_speed: 3.2 },
+EnemySpecies { archive: 268, has_idle: false, flying: true,  wander_speed: 1.8, chase_speed: 4.5 },
+EnemySpecies { archive: 271, has_idle: true,  flying: false, wander_speed: 1.0, chase_speed: 2.5 },
+EnemySpecies { archive: 275, has_idle: false, flying: false, wander_speed: 1.2, chase_speed: 3.0 },
+EnemySpecies { archive: 276, has_idle: true,  flying: false, wander_speed: 1.2, chase_speed: 3.0 },
 ];
 
-/// Specie possibili all'aperto per clima. Elenco approssimato (animali, mostri e orchi
-/// degli incontri nelle terre selvagge): le tabelle esatte di FALL.EXE non sono leggibili da qui.
 fn enemy_table(climate: ClimateBase) -> &'static [usize] {
     match climate {
         ClimateBase::Temperate => &[1, 2, 3, 4, 7, 5, 0, 6, 9],
@@ -546,15 +561,19 @@ fn enemy_table(climate: ClimateBase) -> &'static [usize] {
 
 type RecordSet = ([Vec<Handle<StandardMaterial>>; 5], [Vec2; 5]);
 
-/// Carica 5 record consecutivi (le 5 direzioni di una stessa animazione).
 fn load_record_set(
-    file: &TextureFile, first: usize, data: &GameData,
-    images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>,
+    archive: u16,
+    file: &TextureFile,
+    first: usize,
+    data: &GameData,
+    mods: &mut ModTextures,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
 ) -> Option<RecordSet> {
     let mut frames: [Vec<Handle<StandardMaterial>>; 5] = Default::default();
     let mut sizes = [Vec2::ONE; 5];
     for i in 0..5 {
-        let (f, s) = load_record(file, first + i, data, images, materials)?;
+        let (f, s) = load_record(archive, file, first + i, data, mods, images, materials)?;
         frames[i] = f;
         sizes[i] = s;
     }
@@ -568,15 +587,23 @@ pub struct EnemySpriteSet {
 }
 
 fn build_enemy_sprites(
-    archive: u16, has_idle: bool, data: &GameData,
-    images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>,
+    archive: u16,
+    has_idle: bool,
+    data: &GameData,
+    mods: &mut ModTextures,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
 ) -> Option<EnemySpriteSet> {
     let path = find_file_ci(&data.dir, &archive_file_name(archive as u32))?;
     let file = TextureFile::open(&path).ok()?;
-    let walk = load_record_set(&file, 0, data, images, materials)?;
-    let attack = load_record_set(&file, ENEMY_ATTACK_FIRST, data, images, materials)
-        .unwrap_or_else(|| walk.clone());
-    let idle = if has_idle { load_record_set(&file, ENEMY_IDLE_FIRST, data, images, materials) } else { None };
+    let walk = load_record_set(archive, &file, 0, data, mods, images, materials)?;
+    let attack = load_record_set(archive, &file, ENEMY_ATTACK_FIRST, data, mods, images, materials)
+    .unwrap_or_else(|| walk.clone());
+    let idle = if has_idle {
+        load_record_set(archive, &file, ENEMY_IDLE_FIRST, data, mods, images, materials)
+    } else {
+        None
+    };
     Some(EnemySpriteSet { walk, attack, idle })
 }
 
@@ -588,7 +615,6 @@ enum EnemyMode {
     Attack,
 }
 
-/// Nemico selvatico: vaga, nota il giocatore, lo insegue e attacca.
 #[derive(Component)]
 pub struct Enemy {
     sprites: Arc<EnemySpriteSet>,
@@ -598,9 +624,7 @@ pub struct Enemy {
     timer: f32,
     frame: usize,
     frame_timer: f32,
-    /// 0 = camminata, 1 = attacco, 2 = idle
     kind: u8,
-    /// (tipo, record, specchiato, frame) attualmente mostrato; None = da assegnare.
     shown: Option<(u8, usize, bool, usize)>,
     rng: u64,
     bounds: (Vec2, Vec2),
@@ -622,16 +646,13 @@ pub struct TileResult {
     city_parts: Option<[MeshPart; MATERIAL_COUNT]>,
     city_textured: Vec<((u16, u8), MeshPart)>,
     city_rect: Option<CityTileRect>,
-    /// Decorazioni statiche: (x, z, archive, record)
     exterior_flats: Vec<(f32, f32, u16, u8)>,
-    /// NPC: (x, z, archivio persona, limiti di passeggiata)
     exterior_npcs: Vec<(f32, f32, u16, (Vec2, Vec2))>,
-    /// Nemici selvatici: (x, z, indice in ENEMY_SPECIES)
     exterior_enemies: Vec<(f32, f32, usize)>,
-    /// Muri di edifici e mura (solo tile con città)
     colliders: Option<Arc<Colliders>>,
-    /// Celle d'acqua della tilemap (128×128, indice y*128+x)
     water: Vec<bool>,
+    grass_tilemap: Arc<Vec<u8>>,
+    grass_mask: Option<Arc<crate::grass::GrassMask>>,
 }
 
 #[derive(Resource)]
@@ -724,18 +745,17 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
               loc.name, stats.objects, stats.built, stats.skipped, stats.missing_models);
         if !builder.is_empty() {
             let (parts, textured) = builder.into_all();
-            // Muri: parte Wall + parti con texture (i tetti inclinati li scarta il filtro di pendenza).
             let (wall_i, roof_i, trim_i) = (
                 MaterialKind::Wall.index(), MaterialKind::Roof.index(), MaterialKind::Trim.index(),
             );
             city_colliders = Some(Arc::new(Colliders::from_parts(
                 parts.iter().enumerate()
-                    .filter_map(|(i, p)| {
-                        if i == wall_i { Some((p, true, 1u8)) }                       // muri + cime dei muri
-                        else if i == roof_i || i == trim_i { Some((p, false, 2u8)) } // tetti: solo superfici
-                        else { None }
-                    })
-                    .chain(textured.iter().map(|(_, p)| (p, true, 2u8))),
+                .filter_map(|(i, p)| {
+                    if i == wall_i { Some((p, true, 1u8)) }
+                    else if i == roof_i || i == trim_i { Some((p, false, 2u8)) }
+                    else { None }
+                })
+                .chain(textured.iter().map(|(_, p)| (p, true, 2u8))),
             )));
             city_parts = Some(parts);
             city_textured = textured;
@@ -746,7 +766,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
         let start_bx = (8 - bw) / 2;
         let start_by = (8 - bh) / 2;
 
-        // --- Decorazioni stradali dai record misc dei blocchi RMB ---
         for by in 0..bh {
             for bx in 0..bw {
                 let Some(name) = loc.block_names.get(by * loc.width + bx) else { continue };
@@ -766,7 +785,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
             }
         }
 
-        // --- NPC procedurali: FREQUENZA MOLTO ALTA ---
         if let Some(rect) = city_rect_opt.as_ref() {
             let bounds = (
                 Vec2::new(rect.min_x as f32 * CELL_SIZE, -((rect.max_y as f32 + 1.0) * CELL_SIZE)),
@@ -787,7 +805,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                 let archive = PERSON_ARCHIVES[((seed & 0xFFFFFF) as usize) % PERSON_ARCHIVES.len()];
                 seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
 
-                // niente NPC dentro o attaccati agli edifici
                 if let Some(c) = city_colliders.as_deref() {
                     let p = Vec2::new(x, z);
                     let g = terrain_height(&samples, x / CELL_SIZE, -z / CELL_SIZE);
@@ -803,8 +820,9 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
     let encoded = encode_for_shader(&tilemap, true);
     let mesh = build_terrain_mesh(&samples, &encoded, tile_px);
     let archive = ground_archive(climate_of(data, mx, my), data.winter);
+    let grass_mask = crate::grass::grass_mask(data, archive);
+    let grass_tilemap = Arc::new(encoded.clone());
 
-    // --- Nemici selvatici: celle di terra, fuori dalla città ---
     let water: Vec<bool> = tilemap.iter().map(|&t| t == 0xFF || (t & 0x3F) == 0).collect();
     let mut exterior_enemies: Vec<(f32, f32, usize)> = Vec::new();
     {
@@ -816,7 +834,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                 let cy = (next_rand(&mut seed) * 120.0) as usize + 4;
                 let species = table[(next_rand(&mut seed) * table.len() as f32) as usize % table.len()];
                 if water[cy * 128 + cx] { continue; }
-                // lontano dalla città (margine di 6 celle)
                 let near_city = city_rect_opt.as_ref().is_some_and(|r| {
                     cx + 6 >= r.min_x && cx <= r.max_x + 6 && cy + 6 >= r.min_y && cy <= r.max_y + 6
                 });
@@ -829,7 +846,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
 
     Some(TileResult { archive, mesh, encoded_tilemap: encoded, samples: Arc::new(samples),
         city_parts, city_textured, city_rect: city_rect_opt, exterior_flats, exterior_npcs,
-        exterior_enemies, water, colliders: city_colliders })
+         exterior_enemies, water, colliders: city_colliders, grass_tilemap, grass_mask })
 }
 
 pub fn rebase_origin(
@@ -930,6 +947,13 @@ pub fn collect_tiles(
             commands.entity(chunk_entity).insert(TileCollision(Arc::clone(c)));
         }
 
+        if let Some(mask) = tile.grass_mask.clone() {
+            commands.entity(chunk_entity).insert(crate::grass::GrassSource::new(
+                key.0, key.1, Arc::clone(&tile.samples),
+                                                                                Arc::clone(&tile.grass_tilemap), mask, tile.city_rect,
+            ));
+        }
+
         if let Some(parts) = tile.city_parts {
             commands.entity(chunk_entity).with_children(|parent| {
                 for (kind, part) in MaterialKind::ALL.iter().zip(parts) {
@@ -943,19 +967,52 @@ pub fn collect_tiles(
         let textured: Vec<_> = tile.city_textured.into_iter().map(|((archive, record), part)| {
             let mat = wall_textures.material(archive, record, climate_of(&data, key.0, key.1),
                                              &data, &mut mods, &mut images, &mut standard_materials);
-            (mat, part)
+            let has_normal = wall_textures.has_normal_map(&mat);
+            (mat, has_normal, part)
         }).collect();
         if !textured.is_empty() {
             commands.entity(chunk_entity).with_children(|parent| {
-                for (mat, part) in textured {
-                    parent.spawn((Mesh3d(meshes.add(to_bevy_part(part))), MeshMaterial3d(mat), Transform::IDENTITY));
+                for (mat, has_normal, part) in textured {
+                    let mut mesh = to_bevy_part(part);
+                    if has_normal {
+                        // senza tangenti Bevy ignora la normal map
+                        let _ = mesh.generate_tangents();
+                    }
+                    parent.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), Transform::IDENTITY));
                 }
             });
         }
 
-        // --- Decorazioni stradali (billboard statici) ---
+        // --- Dungeon ---
+        // TODO: scaffold pronto quando `GameData::dungeons` e i moduli `dungeon*`
+        // esisteranno. Come per le città, il lavoro CPU (parse BSA, generazione
+        // mesh) andrebbe fatto in `build_tile` (off-thread), qui va solo lo spawn.
+        // Quando `TileResult` avrà un campo tipo `dungeon_textured: Vec<((u16, u8), MeshPart)>`,
+        // basta replicare il pattern di `tile.city_textured` qui sotto.
+        //
+        // if let Some(dungeon_data) = data.dungeons.get(&(key.0, key.1)) {
+        //     let Ok(blocks_bsa) = BsaArchive::parse(&data.blocks_buf) else { continue };
+        //     let Ok(arch3d_bsa) = BsaArchive::parse(&data.arch3d_buf) else { continue };
+        //
+        //     let dungeon_block_names = get_dungeon_block_names(dungeon_data);
+        //     let chunks = dungeon::load_dungeon_blocks(&blocks_bsa, &dungeon_block_names);
+        //     let layout = dungeon_gen::DungeonLayout::assemble_linear(chunks);
+        //     let dungeon_mesh = dungeon_loader::build_dungeon_mesh(&layout, &arch3d_bsa);
+        //
+        //     commands.entity(chunk_entity).with_children(|parent| {
+        //         spawn_dungeon_geometry(parent, &dungeon_mesh);
+        //     });
+        // }
+
         for (fx, fz, archive, record) in &tile.exterior_flats {
-            let Some((mat, w_px, h_px)) = wall_textures.flat_material(*archive, *record, &data, &mut images, &mut standard_materials) else { continue };
+            let Some((mat, w_px, h_px)) = wall_textures.flat_material(
+                *archive,
+                *record,
+                &data,
+                &mut mods,
+                &mut images,
+                &mut standard_materials,
+            ) else { continue };
             let (w, h) = (w_px * DF_UNIT, h_px * DF_UNIT);
             let gx = (fx / CELL_SIZE).clamp(0.0, 128.0);
             let gy = (-fz / CELL_SIZE).clamp(0.0, 128.0);
@@ -969,20 +1026,24 @@ pub fn collect_tiles(
             });
         }
 
-        // --- NPC animati (passanti DFU: un archivio = una persona) ---
+        // --- NPC animati con texture HD (.dfmod) ---
         let mut spawned = 0usize;
         let npc_quad = meshes.add(Rectangle::new(1.0, 1.0));
         for (fx, fz, archive, bounds) in &tile.exterior_npcs {
-            let sprites = npc_sprites.entry(*archive)
-                .or_insert_with(|| build_npc_sprites(*archive, &data, &mut images, &mut standard_materials).map(Arc::new))
-                .clone();
+            let sprites = if let Some(cached) = npc_sprites.get(archive) {
+                cached.clone()
+            } else {
+                let s = build_npc_sprites(*archive, &data, &mut mods, &mut images, &mut standard_materials).map(Arc::new);
+                npc_sprites.insert(*archive, s.clone());
+                s
+            };
             let Some(sprites) = sprites else { continue };
 
             let mut rng = ((fx.to_bits() as u64) << 32) ^ (fz.to_bits() as u64) ^ 0x9E37_79B9_7F4A_7C15;
             let mut heading = CARDINALS[(next_rand(&mut rng) * 4.0) as usize % 4];
             let pos = Vec2::new(*fx, *fz);
             let target = pick_target(pos, &mut heading, *bounds, &mut rng, true,
-                &|p| npc_blocked(tile.colliders.as_deref(), &tile.samples, p));
+                                     &|p| npc_blocked(tile.colliders.as_deref(), &tile.samples, p));
             let frame_timer = next_rand(&mut rng) * NPC_FRAME_SECONDS;
             let frame = (next_rand(&mut rng) * sprites.walk[0].len() as f32) as usize;
 
@@ -991,7 +1052,10 @@ pub fn collect_tiles(
             let gy = (-fz / CELL_SIZE).clamp(0.0, 128.0);
             let y = terrain_height(&tile.samples, gx, gy);
 
+            let mut face_rng = ((fx.to_bits() as u64) << 32) ^ (fz.to_bits() as u64) ^ 0xFACE_0000_0000_F00D;
+            let face_variant = (next_rand(&mut face_rng) * FACE_VARIANTS as f32) as usize;
             let walker = NpcWalker {
+                face_record: person_face_record(*archive, face_variant),
                 sprites: Arc::clone(&sprites), heading, target, frame, frame_timer,
                 shown: None, rng, bounds: *bounds, samples: Arc::clone(&tile.samples),
                 colliders: tile.colliders.clone(),
@@ -1000,23 +1064,27 @@ pub fn collect_tiles(
             commands.entity(chunk_entity).with_children(|parent| {
                 parent.spawn((
                     Mesh3d(npc_quad.clone()),
-                    MeshMaterial3d(sprites.walk[0][0].clone()),
-                    Transform::from_xyz(*fx, y + size.y * 0.5, *fz).with_scale(size.extend(1.0)),
-                    crate::interior::FlatBillboard,
-                    walker,
+                              MeshMaterial3d(sprites.walk[0][0].clone()),
+                              Transform::from_xyz(*fx, y + size.y * 0.5, *fz).with_scale(size.extend(1.0)),
+                              crate::interior::FlatBillboard,
+                              walker,
                 ));
             });
             spawned += 1;
         }
         if spawned > 0 { debug!("  {} NPC animati nel tile ({},{})", spawned, key.0, key.1); }
 
-        // --- Nemici selvatici ---
+        // --- Nemici selvatici (con supporto HD se presente) ---
         let mut enemies_spawned = 0usize;
         for (fx, fz, species) in &tile.exterior_enemies {
             let sp = &ENEMY_SPECIES[*species];
-            let sprites = enemy_sprites.entry(sp.archive)
-                .or_insert_with(|| build_enemy_sprites(sp.archive, sp.has_idle, &data, &mut images, &mut standard_materials).map(Arc::new))
-                .clone();
+            let sprites = if let Some(cached) = enemy_sprites.get(&sp.archive) {
+                cached.clone()
+            } else {
+                let s = build_enemy_sprites(sp.archive, sp.has_idle, &data, &mut mods, &mut images, &mut standard_materials).map(Arc::new);
+                enemy_sprites.insert(sp.archive, s.clone());
+                s
+            };
             let Some(sprites) = sprites else { continue };
 
             let mut rng = ((fx.to_bits() as u64) << 32) ^ (fz.to_bits() as u64) ^ 0x5DEE_CE66_D1CE_4E5B;
@@ -1040,9 +1108,9 @@ pub fn collect_tiles(
             commands.entity(chunk_entity).with_children(|parent| {
                 parent.spawn((
                     Mesh3d(npc_quad.clone()),
-                    MeshMaterial3d(sprites.walk.0[0][0].clone()),
-                    Transform::from_xyz(*fx, y + size.y * 0.5, *fz).with_scale(size.extend(1.0)),
-                    enemy,
+                              MeshMaterial3d(sprites.walk.0[0][0].clone()),
+                              Transform::from_xyz(*fx, y + size.y * 0.5, *fz).with_scale(size.extend(1.0)),
+                              enemy,
                 ));
             });
             enemies_spawned += 1;
@@ -1058,13 +1126,10 @@ pub fn collect_tiles(
     }
 }
 
-/// Indice di orientamento (0-7) della persona rispetto alla camera, come DFU
-/// `UpdateOrientation`: 0 = cammina verso la camera, 4 = di spalle, 1-3 = verso la
-/// sinistra dello schermo, 5-7 = verso destra (record specchiati).
 fn orientation_index(heading: Vec2, to_camera: Vec2) -> usize {
     let dir = to_camera.normalize_or_zero();
     if dir == Vec2::ZERO { return 0; }
-    let right = Vec2::new(dir.y, -dir.x); // destra della camera (guarda lungo -dir)
+    let right = Vec2::new(dir.y, -dir.x);
     let angle = (-heading.dot(right)).atan2(heading.dot(dir));
     ((angle / std::f32::consts::FRAC_PI_4).round() as i32).rem_euclid(8) as usize
 }
@@ -1072,8 +1137,8 @@ fn orientation_index(heading: Vec2, to_camera: Vec2) -> usize {
 pub fn update_npcs(
     time: Res<Time>,
     player: Query<&Transform, (With<Player>, Without<NpcWalker>)>,
-    mut npcs: Query<(&mut NpcWalker, &mut Transform, &GlobalTransform, &mut MeshMaterial3d<StandardMaterial>)>,
-    mut last_player_pos: Local<Option<Vec3>>,
+                   mut npcs: Query<(&mut NpcWalker, &mut Transform, &GlobalTransform, &mut MeshMaterial3d<StandardMaterial>)>,
+                   mut last_player_pos: Local<Option<Vec3>>,
 ) {
     let real_dt = time.delta_secs();
     let dt = real_dt.min(0.1);
@@ -1088,13 +1153,11 @@ pub fn update_npcs(
 
     for (mut npc, mut tf, gtf, mut material) in &mut npcs {
         let npc = &mut *npc;
-        // Posizioni in spazio mondo per distanza/orientamento (il Transform dell'NPC è locale al tile).
         let world = gtf.translation();
         let to_player = Vec2::new(player_pos.x - world.x, player_pos.z - world.z);
         let idle = player_still && to_player.length() < NPC_IDLE_DISTANCE;
 
         if !idle {
-            // --- Movimento verso il bersaglio sulla griglia cardinale ---
             let pos = tf.translation.xz();
             let to_target = npc.target - pos;
             let step = NPC_SPEED * dt;
@@ -1104,7 +1167,6 @@ pub fn update_npcs(
                 npc.target
             };
 
-            // Collisione con muri: se spinto fuori da un muro sceglie un'altra direzione.
             let mut hit = false;
             if let Some(c) = npc.colliders.as_deref() {
                 let feet = terrain_height(&npc.samples, new_pos.x / CELL_SIZE, -new_pos.y / CELL_SIZE);
@@ -1119,7 +1181,6 @@ pub fn update_npcs(
                 npc.target = pick_target(new_pos, &mut npc.heading, npc.bounds, &mut npc.rng, hit, &blocked);
             }
 
-            // --- Avanzamento frame ---
             npc.frame_timer += dt;
             if npc.frame_timer >= NPC_FRAME_SECONDS {
                 npc.frame_timer -= NPC_FRAME_SECONDS;
@@ -1127,7 +1188,6 @@ pub fn update_npcs(
             }
         }
 
-        // --- Scelta dello sprite ---
         let (record, flip, frame, handle, size) = if idle {
             (5, false, 0, &npc.sprites.idle[0], npc.sprites.idle_size)
         } else {
@@ -1141,13 +1201,11 @@ pub fn update_npcs(
             npc.shown = Some((record, flip, frame));
         }
 
-        // --- Dimensione per record, specchio e altezza sul terreno ---
         tf.scale = Vec3::new(if flip { -size.x } else { size.x }, size.y, 1.0);
         let gx = (tf.translation.x / CELL_SIZE).clamp(0.0, 128.0);
         let gy = (-tf.translation.z / CELL_SIZE).clamp(0.0, 128.0);
         tf.translation.y = terrain_height(&npc.samples, gx, gy) + size.y * 0.5;
 
-        // --- Billboard: il piano guarda la camera (come DFU, lungo la vista) ---
         if let Some(yaw) = yaw {
             tf.rotation = Quat::from_rotation_y(yaw);
         }
@@ -1157,7 +1215,7 @@ pub fn update_npcs(
 pub fn update_enemies(
     time: Res<Time>,
     player: Query<&Transform, (With<Player>, Without<Enemy>)>,
-    mut enemies: Query<(&mut Enemy, &mut Transform, &GlobalTransform, &mut MeshMaterial3d<StandardMaterial>)>,
+                      mut enemies: Query<(&mut Enemy, &mut Transform, &GlobalTransform, &mut MeshMaterial3d<StandardMaterial>)>,
 ) {
     let dt = time.delta_secs().min(0.1);
     let Ok(player_tf) = player.get_single() else { return };
@@ -1171,12 +1229,10 @@ pub fn update_enemies(
         let e = &mut *enemy;
         let sp = &ENEMY_SPECIES[e.species];
 
-        // Posizioni in spazio mondo (il Transform dell'entità è locale al tile).
         let world = gtf.translation();
         let to_player = Vec2::new(player_pos.x - world.x, player_pos.z - world.z);
         let dist = to_player.length();
 
-        // --- Transizioni di stato ---
         let engaged = matches!(e.mode, EnemyMode::Chase | EnemyMode::Attack);
         let aware = dist < ENEMY_NOTICE_DISTANCE || (engaged && dist < ENEMY_LOSE_DISTANCE);
         let new_mode = if aware {
@@ -1194,8 +1250,6 @@ pub fn update_enemies(
         match e.mode {
             EnemyMode::Chase | EnemyMode::Attack => {
                 if dist > 0.01 { e.heading = to_player / dist; }
-                // TODO danno: quando in Attack applicare il danno al giocatore
-                // (nel progetto non esiste ancora un sistema di salute).
             }
             EnemyMode::Idle | EnemyMode::Walk => {
                 e.timer -= dt;
@@ -1213,7 +1267,6 @@ pub fn update_enemies(
             }
         }
 
-        // --- Movimento (senza uscire dal tile né entrare in acqua) ---
         let speed = match e.mode {
             EnemyMode::Chase => sp.chase_speed,
             EnemyMode::Walk => sp.wander_speed,
@@ -1228,19 +1281,16 @@ pub fn update_enemies(
                 tf.translation.x = next.x;
                 tf.translation.z = next.y;
             } else if e.mode == EnemyMode::Walk {
-                // bloccato: si volta verso il centro del tile
                 e.heading = ((min + max) * 0.5 - pos).normalize_or_zero();
                 e.timer = e.timer.min(1.0);
             }
         }
 
-        // --- Animazione ---
         let has_idle_anim = e.sprites.idle.is_some();
         let (kind, fps) = match e.mode {
             EnemyMode::Attack => (1u8, ENEMY_ATTACK_FPS),
             EnemyMode::Chase | EnemyMode::Walk => (0u8, if sp.flying { ENEMY_FLY_FPS } else { ENEMY_MOVE_FPS }),
             EnemyMode::Idle if has_idle_anim => (2u8, ENEMY_IDLE_FPS),
-            // senza animazione idle DFU riusa quella di movimento, ferma sul primo frame
             EnemyMode::Idle => (0u8, ENEMY_MOVE_FPS),
         };
         let hold = e.mode == EnemyMode::Idle && !has_idle_anim;
@@ -1258,7 +1308,6 @@ pub fn update_enemies(
             }
         }
 
-        // --- Scelta dello sprite ---
         let (offset, flip) = ORIENTATIONS[orientation_index(e.heading, to_player)];
         let set: &RecordSet = match kind {
             1 => &e.sprites.attack,
@@ -1273,14 +1322,12 @@ pub fn update_enemies(
             e.shown = Some((kind, offset, flip, frame));
         }
 
-        // --- Dimensione per record, specchio e altezza sul terreno ---
         tf.scale = Vec3::new(if flip { -size.x } else { size.x }, size.y, 1.0);
         let gx = (tf.translation.x / CELL_SIZE).clamp(0.0, 128.0);
         let gy = (-tf.translation.z / CELL_SIZE).clamp(0.0, 128.0);
         let hover = if sp.flying { ENEMY_HOVER } else { 0.0 };
         tf.translation.y = terrain_height(&e.samples, gx, gy) + size.y * 0.5 + hover;
 
-        // --- Billboard verso la camera ---
         if let Some(yaw) = yaw {
             tf.rotation = Quat::from_rotation_y(yaw);
         }

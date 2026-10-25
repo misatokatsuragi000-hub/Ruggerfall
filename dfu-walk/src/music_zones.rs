@@ -1,5 +1,6 @@
 //! Rileva la situazione di gioco e cambia musica di conseguenza,
 //! replicando la logica del SongManager di Daggerfall Unity.
+use crate::data::city_map::PoiKind;
 use crate::interior::InteriorState;
 use crate::music::{MusicContext, MusicEnvironment, MusicEvent, MusicTime, MusicWeather};
 use crate::sky::SkyClock;
@@ -24,8 +25,11 @@ pub fn update_music_zone(
 
     // Determina l'ambiente
     let environment = if interior.is_inside() {
-        // Per ora, dentro una taverna
-        MusicEnvironment::Tavern
+        // Dentro un locale: musica del negozio nei negozi, della taverna nelle taverne
+        match interior.kind() {
+            Some(PoiKind::Shop) => MusicEnvironment::Shop,
+            _ => MusicEnvironment::Tavern,
+        }
     } else {
         // Fuori: determina se è in città o wilderness
         let (mx, my) = map_pixel_of(&origin, player_tf.translation);

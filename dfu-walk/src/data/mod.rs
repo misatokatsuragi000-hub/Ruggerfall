@@ -28,6 +28,7 @@ pub mod terrain_mesh;
 pub mod tilemap;
 pub mod texture;
 pub mod woods;
+pub mod flats;
 
 #[cfg(test)]
 mod test_support;

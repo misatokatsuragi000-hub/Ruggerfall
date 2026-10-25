@@ -40,6 +40,10 @@ const MASK_RES: usize = 16;
 /// continuamente camminando al limite.
 const HYSTERESIS: f32 = 25.0;
 
+/// Margine (in celle da 6,4 m) intorno al rettangolo di una città/località dove
+/// non cresce erba: copre mura, porte e strade d'ingresso.
+const CITY_MARGIN_CELLS: usize = 2;
+
 const MAX_PENDING_PATCHES: usize = 6;
 const MAX_SPAWNS_PER_FRAME: usize = 3;
 
@@ -237,7 +241,7 @@ struct PatchJob {
     samples: Arc<HeightSamples>,
     tilemap: Arc<Vec<u8>>,
     mask: Arc<GrassMask>,
-    _city_rect: Option<CityTileRect>,
+    city_rect: Option<CityTileRect>,
 }
 
 struct Rng(u64);
@@ -328,6 +332,13 @@ fn build_patch(job: PatchJob) -> Option<PatchMesh> {
 
     for cy in job.py * PATCH_CELLS..(job.py + 1) * PATCH_CELLS {
         for cx in job.px * PATCH_CELLS..(job.px + 1) * PATCH_CELLS {
+            // niente erba dentro la città (strade, piazze, edifici, mura) e intorno
+            if let Some(r) = job.city_rect {
+                let m = CITY_MARGIN_CELLS;
+                if cx + m >= r.min_x && cx <= r.max_x + m && cy + m >= r.min_y && cy <= r.max_y + m {
+                    continue;
+                }
+            }
             let value = job.tilemap[cx + cy * 128];
             let tile = ((value >> 2) as usize).min(TILE_COUNT - 1);
             if !job.mask.tile_has_grass(tile) {
@@ -528,7 +539,7 @@ pub fn update_grass(
             samples: Arc::clone(&src.samples),
             tilemap: Arc::clone(&src.tilemap),
             mask: Arc::clone(&src.mask),
-            _city_rect: src.city_rect,
+            city_rect: src.city_rect,
         };
         let task = pool.spawn(async move { build_patch(job) });
         src.patches.insert(key, PatchState::Building(task));

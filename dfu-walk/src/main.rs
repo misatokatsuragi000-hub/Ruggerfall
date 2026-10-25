@@ -2,7 +2,9 @@
 //! mod HD di D.R.E.A.M., mappa interattiva (tasto M), vegetazione 3D,
 //! città/villaggi e colonna sonora originale.
 mod data;
+mod equipment;
 mod grass;
+mod fps_weapon;
 mod interior;
 mod local_map;
 mod dialog;
@@ -11,12 +13,15 @@ mod mod_textures;
 mod music;
 mod music_zones;
 mod player;
+mod quests;
 mod sky;
 mod terrain_material;
 mod tiles;
 mod trees;
 mod wall_textures;
 mod world;
+mod compass;
+mod vitals;
 
 use crate::data::bsa::BsaArchive;
 use crate::data::maps::MapsReader;
@@ -222,6 +227,11 @@ fn main() {
         }),
     )
     .add_plugins(dialog::DialogPlugin)
+    .add_plugins(quests::QuestPlugin)
+    .add_plugins(fps_weapon::FpsWeaponPlugin)
+    .add_plugins(compass::CompassPlugin)
+    .add_plugins(vitals::VitalsPlugin)
+    .add_plugins(equipment::EquipmentPlugin)
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(ModTexturesPlugin {
         dir: args.mods_dir.clone(),

@@ -10,16 +10,14 @@ const RMB_PREFIXES: [&str; 45] = [
 
 const LETTER2_ARRAY: [char; 4] = ['A', 'L', 'M', 'S'];
 
-/// Prima lettera usata se `letter1_for_rmb_name` non e' ancora letto dal record e il
-/// bit 0x10 e' acceso: riproduce la vecchia mappa (B per 0x3F/0x5F/0x7F, altrimenti A).
+/// Prima lettera usata se `letter1_for_rmb_name` non è ancora letto dal record e il
+/// bit 0x10 è acceso: riproduce la mappa originale (B per 0x3F/0x5F/0x7F, altrimenti A).
 fn legacy_letter1(char_byte: u8) -> char {
     if matches!(char_byte, 0x3F | 0x5F | 0x7F) { 'B' } else { 'A' }
 }
 
-/// Porting di `resolveRmbBlockName` del JS, con il fallback del vecchio parser per i
-/// `char_byte` non standard (0x0F, 0x1F, 0x8F, 0x9F, 0x11, 0x13, 0x15) che altrimenti
-/// produrrebbero un nome diverso da quello presente in BLOCKS.BSA.
-/// `letter1_for_rmb_name`: `dfLocation.exterior.exteriorData.letter1ForRMBName` (None = non letto).
+/// Porting di `resolveRmbBlockName` da Daggerfall Unity, con fallback legacy per i
+/// byte non standard per garantire che i nomi coincidano con quelli presenti in BLOCKS.BSA.
 pub fn decode_rmb_name(
     index: u8,
     number: u8,
@@ -28,27 +26,26 @@ pub fn decode_rmb_name(
 ) -> Option<String> {
     let prefix = RMB_PREFIXES.get(index as usize)?;
 
-    // Letter 1.
+    // Letter 1
     let letter1 = if char_byte & 0x10 != 0 {
         match letter1_for_rmb_name {
-            Some(c) => c as char,
-            None => legacy_letter1(char_byte),
+            Some(c) if c != 0 => c as char,
+            _ => legacy_letter1(char_byte),
         }
     } else {
         'A'
     };
 
-    // Letter 2: ((2 * char) & 0xff) >> 6 == bit 5-6 del byte, ma i valori del vecchio
-    // match restano "AA" (letter2 = 'A') per non cambiare i nomi gia' funzionanti.
+    // Letter 2: bit 5-6 del byte, con salvaguardia sui vecchi codici Daggerfall
     let letter2 = if matches!(char_byte, 0x0F | 0x1F | 0x8F | 0x9F | 0x11 | 0x13 | 0x15) {
         'A'
     } else {
         LETTER2_ARRAY[(char_byte.wrapping_mul(2) >> 6) as usize]
     };
 
-    // Numero del blocco.
+    // Numero del blocco
     let numbers = if index == 13 || index == 14 {
-        // Templi: lettera dal nibble basso + numero senza padding (come nel JS).
+        // Templi: lettera dal nibble basso + numero senza padding (es. TEMPAAA0.RMB)
         format!("{}{}", (b'A' + (char_byte & 0x0F)) as char, number)
     } else {
         format!("{:02}", number)
@@ -61,12 +58,13 @@ pub fn decode_rmb_name(
 pub struct DFLocation {
     pub name: String,
     pub region_index: usize,
+    pub location_id: u32,
     pub world_x: i32,
     pub world_y: i32,
     pub width: usize,
     pub height: usize,
     pub block_names: Vec<String>,
-    /// `letter1ForRMBName` del record (codice ASCII); None finche' non e' letto.
+    /// `letter1ForRMBName` letto da ExteriorData (codice ASCII)
     pub letter1_for_rmb_name: Option<u8>,
 }
 
@@ -96,7 +94,7 @@ impl<'a> MapsReader<'a> {
             return None;
         }
 
-        // Estrazione nome
+        // Estrazione nome località (32 byte null-terminated)
         let name_p = 4 + loc_idx * 32;
         if name_p + 32 > names_raw.len() {
             return None;
@@ -112,7 +110,7 @@ impl<'a> MapsReader<'a> {
         }
 
         let rel_offset = u32::from_le_bytes(
-            pitem_raw[ptr_in_offsets..ptr_in_offsets + 4].try_into().ok()?
+            pitem_raw[ptr_in_offsets..ptr_in_offsets + 4].try_into().ok()?,
         ) as usize;
 
         let loc_offset = offset_table_size + rel_offset;
@@ -121,19 +119,28 @@ impl<'a> MapsReader<'a> {
         }
         let data = &pitem_raw[loc_offset..];
 
+        // DoorCount (u32 @0) * 6 byte per porta
         let prerecord_count = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
         let mut p = 4 + prerecord_count * 6;
 
         if p + 71 > data.len() {
             return None;
         }
+
+        // LocationRecordElementHeader:
+        // +7..+11: X (world_x)
+        // +15..+19: Y (world_y)
+        // +33..+35: LocationId (u16)
         let world_x = i32::from_le_bytes(data[p + 7..p + 11].try_into().ok()?);
         let world_y = i32::from_le_bytes(data[p + 15..p + 19].try_into().ok()?);
+        let location_id = u16::from_le_bytes(data[p + 33..p + 35].try_into().ok()?) as u32;
+
         p += 71 + 32 + 9;
 
         if p + 2 > data.len() {
             return None;
         }
+        // BuildingCount (u16) * 26 byte per edificio
         let postrecord_count = u16::from_le_bytes(data[p..p + 2].try_into().ok()?) as usize;
         p += 2 + 5 + postrecord_count * 26 + 32 + 4 + 4;
 
@@ -142,11 +149,18 @@ impl<'a> MapsReader<'a> {
         }
         let width = data[p] as usize;
         let height = data[p + 1] as usize;
-        p += 2 + 7;
 
         if width == 0 || height == 0 || width > 8 || height > 8 {
             return None;
         }
+
+        // ExteriorData:
+        // +0: Width, +1: Height
+        // +2..+6: Unknown2 (4 byte)
+        // +6: Letter1ForRMBName (1 byte)
+        let letter1_for_rmb_name = data.get(p + 6).copied();
+
+        p += 2 + 7;
 
         if p + 192 > data.len() {
             return None;
@@ -155,15 +169,16 @@ impl<'a> MapsReader<'a> {
         let block_numbers = &data[p + 64..p + 128];
         let block_chars = &data[p + 128..p + 192];
 
-        // `letter1ForRMBName` non e' ancora mappato con certezza: lasciamo None.
-        // Il fallback legacy garantisce i nomi gia' funzionanti.
-        let letter1_for_rmb_name: Option<u8> = None;
-
         let mut block_names = Vec::with_capacity(width * height);
         for y in 0..height {
             for x in 0..width {
                 let i = y * width + x;
-                let blk = decode_rmb_name(block_indices[i], block_numbers[i], block_chars[i], letter1_for_rmb_name)
+                let blk = decode_rmb_name(
+                    block_indices[i],
+                    block_numbers[i],
+                    block_chars[i],
+                    letter1_for_rmb_name,
+                )
                 .unwrap_or_else(|| "EMPTY.RMB".to_string());
                 block_names.push(blk);
             }
@@ -172,6 +187,7 @@ impl<'a> MapsReader<'a> {
         Some(DFLocation {
             name: loc_name,
             region_index,
+            location_id,
             world_x,
             world_y,
             width,
@@ -192,7 +208,9 @@ impl<'a> MapsReader<'a> {
         let total_locations = u32::from_le_bytes(names_raw[0..4].try_into().ok()?) as usize;
         for i in 0..total_locations {
             let p = 4 + i * 32;
-            if p + 32 > names_raw.len() { break; }
+            if p + 32 > names_raw.len() {
+                break;
+            }
             let chunk = &names_raw[p..p + 32];
             let len = chunk.iter().position(|&b| b == 0).unwrap_or(32);
             let name = String::from_utf8_lossy(&chunk[..len]).trim().to_ascii_uppercase();

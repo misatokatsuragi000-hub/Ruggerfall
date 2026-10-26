@@ -1,6 +1,7 @@
-//! Terreno percorribile di Daggerfall con supporto per shader WGSL,
-//! mod HD di D.R.E.A.M., mappa interattiva (tasto M), vegetazione 3D,
-//! città/villaggi e colonna sonora originale.
+//! Terreno e città di Daggerfall in Bevy con shader WGSL,
+//! mod HD di D.R.E.A.M., dungeon procedurali (RDB), mappa interattiva (tasto M),
+//! mappa locale (tasto L), vegetazione 3D e colonna sonora originale.
+
 mod data;
 mod equipment;
 mod grass;
@@ -22,6 +23,7 @@ mod wall_textures;
 mod world;
 mod compass;
 mod vitals;
+mod dungeon;
 
 use crate::data::bsa::BsaArchive;
 use crate::data::maps::MapsReader;
@@ -40,8 +42,13 @@ use tiles::*;
 use trees::NaturePool;
 use world::*;
 
-const USAGE: &str = "uso: dfu-walk <cartella ARENA2> [--mods <cartella>] [--pixel X Y] [--radius N] [--winter] [--hour H] [--day-minutes M]";
+const USAGE: &str = "uso: dfu-walk <cartella ARENA2> [--mods <cartella>] [--pixel X Y] [--radius N] [--winter] [--hour H] [--day-minutes M] [--outside]";
 const SKY: Color = Color::srgb(0.55, 0.72, 0.92);
+
+#[derive(Resource, Clone, Copy)]
+pub struct StartDungeonConfig {
+    pub start_in_dungeon: bool,
+}
 
 struct Args {
     dir: PathBuf,
@@ -51,6 +58,7 @@ struct Args {
     winter: bool,
     hour: f32,
     day_minutes: f32,
+    start_dungeon: bool,
 }
 
 #[derive(Resource)]
@@ -92,9 +100,11 @@ fn parse_args() -> Args {
         winter: false,
         hour: 10.5,
         day_minutes: 24.0,
+        start_dungeon: true, // Di default ci si risveglia dentro il dungeon iniziale
     };
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--outside" => args.start_dungeon = false,
             "--mods" => {
                 let m = it
                 .next()
@@ -152,7 +162,7 @@ fn load_data(args: &Args) -> GameData {
         }
     }
     println!(
-        "Caricate {} località (città e villaggi) dalla mappa.",
+        "Caricate {} località (città, villaggi, dungeon) dalla mappa.",
              locations.len()
     );
     GameData {
@@ -192,19 +202,32 @@ fn find_start(data: &GameData) -> (i32, i32) {
 fn main() {
     let args = parse_args();
     let data = load_data(&args);
-    // Capitale Daggerfall: map_x = 207, map_y = 499 - 286 = 213
+
+    // Cerca Privateer's Hold come punto di partenza predefinito
+    let privateer_loc = data
+    .locations
+    .values()
+    .find(|l| l.name.to_ascii_uppercase().contains("PRIVATEER"))
+    .cloned();
+
     let (mx, my) = args.pixel.unwrap_or_else(|| {
-        if data.locations.contains_key(&(207, 213)) {
+        if let Some(ref ph) = privateer_loc {
+            let ph_mx = (ph.world_x / 32768) as i32;
+            let ph_my = (MAP_HEIGHT_PIXELS - 1) - ((ph.world_y / 32768) as i32);
+            (ph_mx, ph_my)
+        } else if data.locations.contains_key(&(207, 213)) {
             (207, 213)
         } else {
             find_start(&data)
         }
     });
+
     if !in_map(mx, my) {
         fail(format!(
             "il map pixel ({mx}, {my}) è fuori dalla mappa (0..999, 0..499)"
         ));
     }
+
     println!("Partenza dal map pixel ({mx}, {my}), raggio {}.", args.radius);
     println!("Cartella mod: {}", args.mods_dir.display());
     println!("Comandi: clic = cattura il mouse, Esc = rilascia, WASD = cammina, Maiusc = corri,");
@@ -213,7 +236,7 @@ fn main() {
     println!("         M = apri/chiudi mappa dell'Iliac Bay.");
     println!("         L = mappa locale della città (taverne verdi, negozi rossi, gilde blu).");
     println!("         G = attiva/disattiva l'erba.");
-    println!("         E = entra nella taverna vicina / esci vicino alla porta (Backspace = esci sempre).");
+    println!("         E / U = entra nel locale o dungeon / esci vicino alla porta (Backspace = esci sempre).");
 
     App::new()
     .add_plugins(
@@ -232,6 +255,7 @@ fn main() {
     .add_plugins(compass::CompassPlugin)
     .add_plugins(vitals::VitalsPlugin)
     .add_plugins(equipment::EquipmentPlugin)
+    .add_plugins(dungeon::DungeonPlugin)
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(ModTexturesPlugin {
         dir: args.mods_dir.clone(),
@@ -245,6 +269,9 @@ fn main() {
     .insert_resource(data)
     .insert_resource(HeightField::default())
     .insert_resource(StartInfo { mx, my })
+    .insert_resource(StartDungeonConfig {
+        start_in_dungeon: args.start_dungeon,
+    })
     .insert_resource(RadiusSetting(args.radius))
     .insert_resource(NaturePool::default())
     .insert_resource(grass::GrassSettings::default())
@@ -254,7 +281,6 @@ fn main() {
         hour: args.hour,
         day_minutes: args.day_minutes,
     })
-    // --- Musica di Daggerfall ---
     .add_event::<music::MusicEvent>()
     .insert_resource(music::MusicController::default())
     .add_systems(
@@ -277,7 +303,7 @@ fn main() {
          interior::interior_enter_exit,
          interior::interior_move,
          interior::face_flats,
-         tiles::update_npcs,  // <-- AGGIUNGI
+         tiles::update_npcs,
          tiles::update_enemies,
          player::player_move,
          rebase_origin,
@@ -297,8 +323,8 @@ fn main() {
     .add_systems(
         Update,
         (grass::grass_toggle, grass::update_grass.run_if(interior::outside))
-            .chain()
-            .after(collect_tiles),
+        .chain()
+        .after(collect_tiles),
     )
     .run();
 }

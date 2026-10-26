@@ -229,13 +229,14 @@ pub fn player_move(
     field: Res<HeightField>,
     origin: Res<Origin>,
     interior: Res<crate::interior::InteriorState>,
+    dungeon: Res<crate::dungeon::DungeonState>,
     colliders: Query<(&TileCollision, &Transform), Without<Player>>,
                    mut player: Query<(&mut Player, &mut Transform)>,
 ) {
     if dialog.open {
         return;
     }
-    if interior.is_inside() {
+    if interior.is_inside() || dungeon.is_inside() {
         if let Ok((mut p, _)) = player.get_single_mut() {
             p.climbing = false;
         }

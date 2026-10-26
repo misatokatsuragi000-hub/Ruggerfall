@@ -10,6 +10,11 @@
 //! in FLATS.CFG. L'LLM decide il tono e la personalita' basandosi sulla descrizione.
 //! Queste voci sono salvate insieme alla quest in `quests.txt`.
 //!
+//! Per tutti gli altri PNG (quelli all'aperto e quelli interni senza voce flavor) la voce si
+//! genera SU RICHIESTA, quando il giocatore sceglie "Ascolta rumori": una sola chiamata breve al
+//! LLM con la descrizione di quel PNG (la caption di FLATS.CFG, oppure razza e sesso ricavati dal
+//! suo volto). Il testo si salva in `quest_npc_voices.txt` e non si rigenera piu'.
+//!
 //! File nella cartella da cui si lancia il gioco (la cartella del progetto):
 //!   - `quest_llm.conf`          configurazione (modello, llama-server, porta...). Se manca
 //!                               viene creata con i valori di default.
@@ -17,6 +22,8 @@
 //!                               all'avvio: una citta' gia' presente non viene rigenerata.
 //!   - `quest_seed_prompt.txt`, `quest_rumors_prompt.txt`, `quest_npc_flavor_prompt.txt`
 //!                               (facoltativi) sostituiscono i prompt incorporati.
+//!   - `quest_npc_voices.txt`    le voci generate su richiesta, una per riga in JSON.
+//!   - `quest_npc_voice_prompt.txt` (facoltativo) prompt delle voci su richiesta.
 //!
 //! Per non rallentare il rendering:
 //!   - tutto il lavoro con il LLM (avvio di llama-server, richieste HTTP, validazione, scrittura
@@ -62,6 +69,8 @@ pub const QUESTS_FILE: &str = "quests.txt";
 pub const SEED_PROMPT_FILE: &str = "quest_seed_prompt.txt";
 pub const RUMORS_PROMPT_FILE: &str = "quest_rumors_prompt.txt";
 pub const NPC_FLAVOR_PROMPT_FILE: &str = "quest_npc_flavor_prompt.txt";
+pub const NPC_VOICE_PROMPT_FILE: &str = "quest_npc_voice_prompt.txt";
+pub const VOICES_FILE: &str = "quest_npc_voices.txt";
 
 const DEFAULT_SERVER_BIN: &str = "/home/actarus/.lmstudio/extensions/backends/llama.cpp-linux-x86_64-nvidia-cuda12-avx2-2.55.0/llama-server";
 const DEFAULT_MODEL: &str = "/mnt/1CE16DBE48849731/Bionic-1.1.8-10-linux-x64.AppImage.home/models/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF/RVN-Q3_K_S.gguf";
@@ -746,6 +755,29 @@ Reply ONLY with a JSON object:
 where "index" matches the NPC number. Start with '{{' and end with '}}'.
 No prose, no markdown, no reasoning."####;
 
+/// Prompt delle voci su richiesta: UN solo PNG per chiamata.
+const DEFAULT_NPC_VOICE_PROMPT: &str = r####"You are writing what ONE specific person says in a Daggerfall town: a rumor about a quest.
+
+The quest seed (ground truth):
+{seed_json}
+
+The person who is speaking:
+{npc}
+
+Write the rumor AS SPOKEN BY THIS PERSON. Their description decides their voice, vocabulary,
+attitude, and what they know or care about. Make it sound like them and nobody else.
+
+RULES:
+- Use only facts from the seed (tomb_name, artifact_name, quest-giver, region, distance).
+- Do NOT use the generic dungeon name; say tomb_name, or a vague reference
+  ("that place", "the crypt", "those ruins").
+- The artifact is still HIDDEN. Nobody has recovered it.
+- 1-2 sentences, spoken language, IN ENGLISH. Gossip, not a briefing.
+- Only the words they say: no narration, no description of the person, no quotation marks.
+
+Reply ONLY with a JSON object like {"text": "..."}.
+Start your reply with '{' and end with '}'. No prose, no markdown, no reasoning."####;
+
 // =============================================================================
 // Schema
 // =============================================================================
@@ -780,6 +812,17 @@ impl Tone {
             Tone::Soldier => "Soldier",
             Tone::Commoner => "Commoner",
             Tone::Drunk => "Drunk",
+        }
+    }
+
+    /// Come si presenta questo tipo di PNG al modello (inglese, minuscolo).
+    pub fn role(self) -> &'static str {
+        match self {
+            Tone::Noble => "noble",
+            Tone::Merchant => "merchant",
+            Tone::Soldier => "soldier",
+            Tone::Commoner => "commoner",
+            Tone::Drunk => "drunkard",
         }
     }
 
@@ -1238,6 +1281,147 @@ fn generate_npc_flavors(
 }
 
 // =============================================================================
+// Voci dei PNG su richiesta
+// =============================================================================
+//
+// Le voci "flavor" in blocco coprono poche descrizioni. Qui ogni PNG con cui si parla riceve la
+// sua voce quando serve, con una chiamata breve (un PNG per volta: molto piu' affidabile con i
+// modelli piccoli), e il testo si conserva in `quest_npc_voices.txt`.
+
+/// Lunghezza massima (caratteri) di una voce.
+pub const VOICE_MAX_CHARS: usize = 400;
+
+/// I volti di `TFAC00I0.RCI` sono a blocchi di 24 per razza e sesso.
+const FACE_BLOCK: usize = 24;
+
+const TEMPERAMENTS: [&str; 12] = [
+    "nervous", "cheerful", "weary", "proud", "curious", "suspicious", "friendly", "gloomy", "talkative", "blunt",
+    "superstitious", "greedy",
+];
+
+/// Richiesta di una voce per un PNG, con il seed della quest della sua citta'.
+struct VoiceJob {
+    city: (i32, i32),
+    key: String,
+    description: String,
+    seed: Seed,
+}
+
+/// Chiave di un PNG interno riconosciuto da FLATS.CFG (tutti i flat uguali parlano allo stesso modo).
+pub fn flat_key(archive: u16, record: u8) -> String {
+    format!("flat:{archive}:{record}")
+}
+
+/// Chiave di un PNG interno senza caption: in base al suo volto.
+pub fn face_key(face_record: usize) -> String {
+    format!("face:{face_record}")
+}
+
+/// Chiave di un passante all'aperto: in base al suo volto (stesso volto = stessa persona).
+pub fn walker_key(face_record: usize) -> String {
+    format!("walker:{face_record}")
+}
+
+/// Razza e sesso di un passante, dal blocco di volti (`face_record / 24`). I blocchi sono quelli
+/// degli archivi persona di DFU; dove piu' razze condividono un blocco si dice solo il sesso.
+pub fn walker_look(face_record: usize) -> &'static str {
+    match face_record / FACE_BLOCK {
+        0 | 2 => "Nord woman",
+        1 => "Breton woman",
+        3 => "woman",
+        4..=6 => "Redguard woman",
+        8 => "Breton man",
+        9 | 10 => "man",
+        11 => "Nord man",
+        13 | 14 => "Redguard man",
+        _ => "townsperson",
+    }
+}
+
+pub fn place_label(place: Option<PoiKind>) -> &'static str {
+    match place {
+        Some(PoiKind::Tavern) => "inside a tavern",
+        Some(PoiKind::Shop) => "inside a shop",
+        Some(_) => "inside a building",
+        None => "out on the street",
+    }
+}
+
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+/// Carattere del PNG, stabile (stessa chiave e citta' = stesso carattere): da' varieta' alle voci
+/// di persone con lo stesso aspetto.
+pub fn temperament_for(key: &str, city: (i32, i32)) -> &'static str {
+    let h = splitmix(fnv1a(key) ^ ((city.0 as u64) << 20) ^ (city.1 as u64).wrapping_mul(0x1_0001));
+    TEMPERAMENTS[(h % TEMPERAMENTS.len() as u64) as usize]
+}
+
+/// Il blocco `{npc}` del prompt: chi e' e come appare.
+pub fn describe_npc(who: &str, role: Option<&str>, place: Option<PoiKind>, temperament: &str) -> String {
+    let mut s = format!("- Appearance: {who}\n");
+    if let Some(r) = role {
+        s.push_str(&format!("- Standing: {r}\n"));
+    }
+    s.push_str(&format!("- Location: {}\n", place_label(place)));
+    s.push_str(&format!("- Temperament (not visible, shapes how they talk): {temperament}"));
+    s
+}
+
+pub fn build_npc_voice_prompt(template: &str, seed: &Seed, npc: &str) -> String {
+    template.replace("{seed_json}", &seed.to_prompt_json().pretty()).replace("{npc}", npc)
+}
+
+/// Le stesse regole delle voci per tono: niente nome generico del dungeon, artefatto ancora nascosto.
+fn validate_voice(ev: &Json, seed: &Seed) -> Result<(), String> {
+    let text = ev.get("text").and_then(Json::as_str).ok_or("missing 'text' field")?.trim();
+    if text.is_empty() {
+        return Err("empty text".into());
+    }
+    let len = text.chars().count();
+    if len > VOICE_MAX_CHARS {
+        return Err(format!("text too long ({len} chars, max {VOICE_MAX_CHARS})"));
+    }
+    if normalized(text).contains(&normalized(&seed.dungeon_name)) {
+        return Err(format!(
+            "uses the generic name '{}' instead of '{}'. Say '{}' (or a vague 'that place').",
+            seed.dungeon_name, seed.tomb_name, seed.tomb_name
+        ));
+    }
+    let lower = text.to_lowercase();
+    let artifact = seed.artifact_name.to_lowercase();
+    for hint in RECOVERED_HINTS {
+        if lower.contains(hint) && lower.contains(&artifact) {
+            return Err(format!("implies the artifact was already recovered ('{hint}'): it is still hidden"));
+        }
+    }
+    Ok(())
+}
+
+/// Una voce per un PNG: fino a 3 tentativi con il motivo del rifiuto.
+fn generate_voice(cfg: &QuestConfig, tpl: &Templates, seed: &Seed, npc: &str) -> Result<String, String> {
+    let prompt = build_npc_voice_prompt(&tpl.voice, seed, npc);
+    let ev = try_json(cfg, &prompt, "NPC_VOICE", |ev| validate_voice(ev, seed))?;
+    let text = ev.get("text").and_then(Json::as_str).unwrap_or("").trim();
+    // il dialogo mette le virgolette: se il modello le ha messe lo stesso, si tolgono
+    Ok(text.trim_matches('"').trim().to_string())
+}
+
+fn append_voice(path: &Path, city: (i32, i32), key: &str, description: &str, text: &str) -> std::io::Result<()> {
+    let line = Json::Obj(vec![
+        ("city_x".into(), Json::Num(city.0 as f64)),
+        ("city_y".into(), Json::Num(city.1 as f64)),
+        ("key".into(), jstr(key)),
+        ("description".into(), jstr(description)),
+        ("text".into(), jstr(text)),
+    ])
+    .compact();
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{line}")
+}
+
+// =============================================================================
 // Estrazione del JSON dalla risposta del modello
 // =============================================================================
 
@@ -1657,6 +1841,7 @@ struct Templates {
     seed: String,
     rumors: String,
     npc_flavor: String,
+    voice: String,
 }
 
 struct Job {
@@ -1735,8 +1920,38 @@ fn append_quest(path: &Path, quest: &Quest) -> std::io::Result<()> {
 enum QuestMsg {
     Done(Quest),
     Failed { city: (i32, i32), reason: String },
+    /// Voce di un PNG generata su richiesta.
+    Voice { city: (i32, i32), key: String, text: String },
+    VoiceFailed { city: (i32, i32), key: String },
 }
 
+/// Ogni quanto il thread controlla le richieste di voce mentre aspetta una quest.
+const WORKER_POLL: Duration = Duration::from_millis(100);
+
+/// Una voce su richiesta: avvia il server se serve, genera, salva e risponde.
+fn run_voice(cfg: &QuestConfig, tpl: &Templates, server: &SharedServer, voices_path: &Path, v: &VoiceJob) -> QuestMsg {
+    let started = Instant::now();
+    let outcome = ensure_server(cfg, server)
+        .and_then(|_| generate_voice(cfg, tpl, &v.seed, &v.description))
+        .and_then(|text| {
+            append_voice(voices_path, v.city, &v.key, &v.description, &text)
+                .map_err(|e| format!("writing {}: {e}", voices_path.display()))?;
+            Ok(text)
+        });
+    match outcome {
+        Ok(text) => {
+            info!("Quest: voice '{}' ready in {:?}", v.key, started.elapsed());
+            QuestMsg::Voice { city: v.city, key: v.key.clone(), text }
+        }
+        Err(reason) => {
+            warn!("Quest: voice '{}': {reason}", v.key);
+            QuestMsg::VoiceFailed { city: v.city, key: v.key.clone() }
+        }
+    }
+}
+
+/// Solo per i test: un thread di lavoro senza richieste di voce.
+#[cfg(test)]
 fn worker_main(
     cfg: QuestConfig,
     tpl: Templates,
@@ -1745,10 +1960,27 @@ fn worker_main(
     results: Sender<QuestMsg>,
     server: SharedServer,
 ) {
+    let (_voice_tx, voice_rx) = mpsc::channel();
+    worker_loop(cfg, tpl, quests_path, PathBuf::from("quest_npc_voices.test.txt"), jobs, voice_rx, results, server);
+}
+
+/// Il thread di lavoro: genera le quest (prioritarie) e le voci su richiesta, una cosa per volta.
+#[allow(clippy::too_many_arguments)]
+fn worker_loop(
+    cfg: QuestConfig,
+    tpl: Templates,
+    quests_path: PathBuf,
+    voices_path: PathBuf,
+    jobs: Receiver<Job>,
+    voice_jobs: Receiver<VoiceJob>,
+    results: Sender<QuestMsg>,
+    server: SharedServer,
+) {
     let idle = Duration::from_secs(cfg.idle_stop_secs.max(1));
     let mut catalog_cache: Option<FlatCatalog> = None;
+    let mut last_work = Instant::now();
     loop {
-        match jobs.recv_timeout(idle) {
+        match jobs.recv_timeout(WORKER_POLL) {
             Ok(job) => {
                 let started = Instant::now();
                 let npc_flats = {
@@ -1779,9 +2011,23 @@ fn worker_main(
                 if results.send(msg).is_err() {
                     break;
                 }
+                last_work = Instant::now();
             }
-            Err(RecvTimeoutError::Timeout) => stop_server(&server),
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // una voce per giro: se nel frattempo arriva una quest, ha la precedenza
+        if let Ok(v) = voice_jobs.try_recv() {
+            let msg = run_voice(&cfg, &tpl, &server, &voices_path, &v);
+            if results.send(msg).is_err() {
+                break;
+            }
+            last_work = Instant::now();
+        }
+        // nessun lavoro da un po': si libera la VRAM
+        if last_work.elapsed() >= idle {
+            stop_server(&server);
+            last_work = Instant::now();
         }
     }
     stop_server(&server);
@@ -1796,6 +2042,22 @@ pub struct QuestBook {
     quests: HashMap<(i32, i32), Quest>,
     pending: HashSet<(i32, i32)>,
     failed: HashSet<(i32, i32)>,
+    /// Voci generate su richiesta: (citta', chiave del PNG) -> testo.
+    voices: HashMap<((i32, i32), String), String>,
+    voices_pending: HashSet<((i32, i32), String)>,
+    voices_failed: HashSet<((i32, i32), String)>,
+}
+
+/// Stato della voce su richiesta di un PNG.
+#[derive(Debug, PartialEq)]
+pub enum VoiceState<'a> {
+    Ready(&'a str),
+    /// Il thread la sta generando.
+    Pending,
+    /// La generazione e' fallita in questa sessione.
+    Failed,
+    /// Mai richiesta.
+    Unknown,
 }
 
 /// What the player can hear from an NPC.
@@ -1853,6 +2115,56 @@ impl QuestBook {
         } else {
             Hint::Nothing
         }
+    }
+
+    /// Legge `quest_npc_voices.txt`: una voce JSON per riga; le righe non valide si ignorano.
+    pub fn load_voices(&mut self, path: &Path) {
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let Ok(j) = Json::parse(line) else { continue };
+            let (Some(x), Some(y), Some(key), Some(text)) = (
+                j.get("city_x").and_then(Json::as_int),
+                j.get("city_y").and_then(Json::as_int),
+                j.get("key").and_then(Json::as_str),
+                j.get("text").and_then(Json::as_str),
+            ) else {
+                continue;
+            };
+            self.voices.insert(((x as i32, y as i32), key.to_string()), text.to_string());
+        }
+    }
+
+    pub fn voice_state(&self, city: (i32, i32), key: &str) -> VoiceState<'_> {
+        let k = (city, key.to_string());
+        if let Some(text) = self.voices.get(&k) {
+            VoiceState::Ready(text)
+        } else if self.voices_pending.contains(&k) {
+            VoiceState::Pending
+        } else if self.voices_failed.contains(&k) {
+            VoiceState::Failed
+        } else {
+            VoiceState::Unknown
+        }
+    }
+
+    /// Registra una voce arrivata dal thread (e toglie la richiesta in corso).
+    pub fn store_voice(&mut self, city: (i32, i32), key: String, text: String) {
+        self.voices_pending.remove(&(city, key.clone()));
+        self.voices.insert((city, key), text);
+    }
+
+    pub fn fail_voice(&mut self, city: (i32, i32), key: String) {
+        self.voices_pending.remove(&(city, key.clone()));
+        self.voices_failed.insert((city, key));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_voice_pending(&mut self, city: (i32, i32), key: &str) {
+        self.voices_pending.insert((city, key.to_string()));
+    }
+
+    pub fn voice_count(&self) -> usize {
+        self.voices.len()
     }
 
     /// NPC-specific flavor rumor, looked up by flat (archive, record).
@@ -1916,10 +2228,29 @@ fn theme_for(city: (i32, i32)) -> &'static str {
 // =============================================================================
 
 #[derive(Resource)]
-struct QuestWorker {
+pub struct QuestWorker {
     jobs: Sender<Job>,
+    voice_jobs: Sender<VoiceJob>,
     results: Mutex<Receiver<QuestMsg>>,
     server: SharedServer,
+}
+
+impl QuestWorker {
+    /// Chiede al thread la voce di un PNG. Serve la quest della citta' (il seed) e la voce non
+    /// deve essere gia' pronta, in corso o fallita. Restituisce true se la richiesta e' partita.
+    pub fn request_voice(&self, book: &mut QuestBook, city: (i32, i32), key: &str, description: &str) -> bool {
+        let Some(seed) = book.quests.get(&city).map(|q| q.seed.clone()) else { return false };
+        if !matches!(book.voice_state(city, key), VoiceState::Unknown) {
+            return false;
+        }
+        let job = VoiceJob { city, key: key.to_string(), description: description.to_string(), seed };
+        if self.voice_jobs.send(job).is_ok() {
+            book.voices_pending.insert((city, key.to_string()));
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for QuestWorker {
@@ -1943,10 +2274,12 @@ pub struct QuestPlugin;
 impl Plugin for QuestPlugin {
     fn build(&self, app: &mut App) {
         let cfg = QuestConfig::load_or_create(Path::new(CONFIG_FILE));
-        let book = QuestBook::load(Path::new(QUESTS_FILE));
+        let mut book = QuestBook::load(Path::new(QUESTS_FILE));
+        book.load_voices(Path::new(VOICES_FILE));
         info!(
-            "Quest: {} already saved in {QUESTS_FILE}, generator {}",
+            "Quest: {} already saved in {QUESTS_FILE} (+{} NPC voices), generator {}",
             book.len(),
+            book.voice_count(),
               if cfg.enabled { "active" } else { "disabled" }
         );
         app.insert_resource(book);
@@ -1957,19 +2290,32 @@ impl Plugin for QuestPlugin {
             seed: read_prompt(SEED_PROMPT_FILE, DEFAULT_SEED_PROMPT),
             rumors: read_prompt(RUMORS_PROMPT_FILE, DEFAULT_RUMORS_PROMPT),
             npc_flavor: read_prompt(NPC_FLAVOR_PROMPT_FILE, DEFAULT_NPC_FLAVOR_PROMPT),
+            voice: read_prompt(NPC_VOICE_PROMPT_FILE, DEFAULT_NPC_VOICE_PROMPT),
         };
         let (job_tx, job_rx) = mpsc::channel();
+        let (voice_tx, voice_rx) = mpsc::channel();
         let (res_tx, res_rx) = mpsc::channel();
         let server: SharedServer = Arc::new(Mutex::new(None));
         let thread_server = Arc::clone(&server);
         let spawned = std::thread::Builder::new()
         .name("quest-llm".into())
-        .spawn(move || worker_main(cfg, tpl, PathBuf::from(QUESTS_FILE), job_rx, res_tx, thread_server));
+        .spawn(move || {
+            worker_loop(
+                cfg,
+                tpl,
+                PathBuf::from(QUESTS_FILE),
+                PathBuf::from(VOICES_FILE),
+                job_rx,
+                voice_rx,
+                res_tx,
+                thread_server,
+            )
+        });
         if let Err(e) = spawned {
             warn!("Quest: cannot start generator thread: {e}");
             return;
         }
-        app.insert_resource(QuestWorker { jobs: job_tx, results: Mutex::new(res_rx), server })
+        app.insert_resource(QuestWorker { jobs: job_tx, voice_jobs: voice_tx, results: Mutex::new(res_rx), server })
         .add_systems(Update, (quest_trigger, quest_poll));
     }
 }
@@ -2020,6 +2366,8 @@ fn quest_poll(worker: Res<QuestWorker>, mut book: ResMut<QuestBook>) {
                 book.pending.remove(&city);
                 book.failed.insert(city);
             }
+            QuestMsg::Voice { city, key, text } => book.store_voice(city, key, text),
+            QuestMsg::VoiceFailed { city, key } => book.fail_voice(city, key),
         }
     }
 }
@@ -2321,6 +2669,7 @@ mod tests {
             seed: DEFAULT_SEED_PROMPT.to_string(),
             rumors: DEFAULT_RUMORS_PROMPT.to_string(),
             npc_flavor: DEFAULT_NPC_FLAVOR_PROMPT.to_string(),
+            voice: DEFAULT_NPC_VOICE_PROMPT.to_string(),
         }
     }
 
@@ -2660,5 +3009,172 @@ mod tests {
         }
         let distinct: HashSet<_> = (0..100).map(|x| theme_for((x, 3))).collect();
         assert!(distinct.len() >= 4);
+    }
+
+    // ------------------------------------------------- voci su richiesta
+
+    #[test]
+    fn walker_description_follows_the_face_blocks() {
+        assert_eq!(walker_look(0), "Nord woman");
+        assert_eq!(walker_look(24 + 5), "Breton woman");
+        assert_eq!(walker_look(72), "woman"); // blocco condiviso da Nord e Breton
+        assert_eq!(walker_look(96 + 23), "Redguard woman");
+        assert_eq!(walker_look(192), "Breton man");
+        assert_eq!(walker_look(240 + 3), "man");
+        assert_eq!(walker_look(264), "Nord man");
+        assert_eq!(walker_look(336 + 23), "Redguard man");
+        assert_eq!(walker_look(168), "townsperson"); // blocchi che nessun archivio usa
+        assert_eq!(walker_look(10_000), "townsperson");
+        assert_eq!(walker_key(37), "walker:37");
+        assert_eq!(flat_key(175, 0), "flat:175:0");
+        assert_eq!(face_key(9), "face:9");
+    }
+
+    #[test]
+    fn npc_description_is_stable_and_complete() {
+        let t1 = temperament_for("walker:37", (207, 213));
+        assert_eq!(t1, temperament_for("walker:37", (207, 213)));
+        assert!(TEMPERAMENTS.contains(&t1));
+        let all: HashSet<_> = (0..200).map(|i| temperament_for(&format!("walker:{i}"), (1, 1))).collect();
+        assert!(all.len() >= 8, "poca varieta': {all:?}");
+
+        let d = describe_npc("beautiful maiden", None, Some(PoiKind::Tavern), "cheerful");
+        assert_eq!(
+            d,
+            "- Appearance: beautiful maiden\n- Location: inside a tavern\n- Temperament (not visible, shapes how they talk): cheerful"
+        );
+        let d = describe_npc("Nord woman", Some("merchant"), None, "weary");
+        assert!(d.contains("- Standing: merchant\n") && d.contains("out on the street"));
+        assert_eq!(Tone::Drunk.role(), "drunkard");
+    }
+
+    #[test]
+    fn voice_prompt_has_the_seed_and_the_npc_but_not_the_generic_dungeon() {
+        let p = build_npc_voice_prompt(DEFAULT_NPC_VOICE_PROMPT, &seed(), "- Appearance: old beggar");
+        assert!(p.contains("Nekhar-Zul") && p.contains("- Appearance: old beggar"));
+        assert!(!p.contains("{seed_json}") && !p.contains("{npc}"));
+        assert!(!p.contains("Cripta di Cenere") && !p.contains("dgf_crypt_ash"));
+    }
+
+    #[test]
+    fn voice_validation_follows_the_rumor_rules() {
+        let s = seed();
+        let ok = |t: &str| validate_voice(&Json::Obj(vec![("text".into(), jstr(t))]), &s);
+        assert!(ok("They say the Mages Guild sniffs around Nekhar-Zul. Bad business.").is_ok());
+        assert!(ok("").unwrap_err().contains("empty"));
+        assert!(ok(&"a".repeat(VOICE_MAX_CHARS + 1)).unwrap_err().contains("too long"));
+        assert!(ok("Stay away from the  CRIPTA  di cenere!").unwrap_err().contains("generic name"));
+        assert!(ok("Someone has already found the Occhio di Vael.").unwrap_err().contains("already recovered"));
+        assert!(validate_voice(&Json::Obj(vec![]), &s).is_err());
+    }
+
+    #[test]
+    fn voices_are_saved_and_reloaded() {
+        let dir = std::env::temp_dir().join(format!("quest_voices_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("quest_npc_voices.txt");
+        let _ = std::fs::remove_file(&path);
+        append_voice(&path, (207, 213), "walker:37", "- Appearance: Nord woman", "Psst, listen \"here\".").unwrap();
+        append_voice(&path, (10, 20), "flat:175:0", "- Appearance: maiden", "Hush.").unwrap();
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"\n{rotto\n{\"a\":1}\n").unwrap();
+
+        let mut book = QuestBook::default();
+        book.load_voices(&path);
+        assert_eq!(book.voice_count(), 2);
+        assert_eq!(book.voice_state((207, 213), "walker:37"), VoiceState::Ready("Psst, listen \"here\"."));
+        assert_eq!(book.voice_state((10, 20), "flat:175:0"), VoiceState::Ready("Hush."));
+        assert_eq!(book.voice_state((10, 20), "walker:37"), VoiceState::Unknown); // la citta' conta
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn voice_requests_need_a_quest_and_are_not_repeated() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let (voice_tx, voice_rx) = mpsc::channel();
+        let (_res_tx, res_rx) = mpsc::channel();
+        let worker = QuestWorker {
+            jobs: job_tx,
+            voice_jobs: voice_tx,
+            results: Mutex::new(res_rx),
+            server: Arc::new(Mutex::new(None)),
+        };
+        let mut book = QuestBook::default();
+        // nessuna quest in citta': niente richiesta
+        assert!(!worker.request_voice(&mut book, (207, 213), "walker:1", "- Appearance: x"));
+        assert!(voice_rx.try_recv().is_err());
+        book.quests.insert((207, 213), sample_quest());
+        assert!(worker.request_voice(&mut book, (207, 213), "walker:1", "- Appearance: x"));
+        assert_eq!(book.voice_state((207, 213), "walker:1"), VoiceState::Pending);
+        let job = voice_rx.try_recv().unwrap();
+        assert_eq!((job.city, job.key.as_str(), job.seed.tomb_name.as_str()), ((207, 213), "walker:1", "Nekhar-Zul"));
+        // gia' in corso: non si ripete
+        assert!(!worker.request_voice(&mut book, (207, 213), "walker:1", "- Appearance: x"));
+        assert!(voice_rx.try_recv().is_err());
+        // arrivata: pronta; e un altro PNG puo' chiedere la sua
+        book.store_voice((207, 213), "walker:1".into(), "Hush.".into());
+        assert_eq!(book.voice_state((207, 213), "walker:1"), VoiceState::Ready("Hush."));
+        assert!(!worker.request_voice(&mut book, (207, 213), "walker:1", "- Appearance: x"));
+        assert!(worker.request_voice(&mut book, (207, 213), "walker:2", "- Appearance: y"));
+        // fallita: non si ritenta nella sessione
+        book.fail_voice((207, 213), "walker:2".into());
+        assert_eq!(book.voice_state((207, 213), "walker:2"), VoiceState::Failed);
+        assert!(!worker.request_voice(&mut book, (207, 213), "walker:2", "- Appearance: y"));
+        std::mem::forget(worker); // niente server da spegnere
+    }
+
+    #[test]
+    fn worker_generates_voices_on_demand_and_quests_keep_priority() {
+        let srv = fake_server(vec![
+            (200, "no json".into()),                                                // 1° tentativo: non e' JSON
+            (200, r#"{"text": "Folks whisper about Nekhar-Zul, mind you."}"#.into()), // ok
+            (200, "no".into()), (200, "no".into()), (200, "no".into()),            // seconda voce: 3 rifiuti
+        ]);
+        let dir = std::env::temp_dir().join(format!("quest_voice_worker_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (quests, voices) = (dir.join("quests.txt"), dir.join("quest_npc_voices.txt"));
+        let _ = std::fs::remove_file(&voices);
+
+        let (job_tx, job_rx) = mpsc::channel();
+        let (voice_tx, voice_rx) = mpsc::channel();
+        let (res_tx, res_rx) = mpsc::channel();
+        let server: SharedServer = Arc::new(Mutex::new(None));
+        let (cfg, t, q, v, s) = (test_cfg(srv.port), tpl(), quests.clone(), voices.clone(), Arc::clone(&server));
+        let handle = std::thread::spawn(move || worker_loop(cfg, t, q, v, job_rx, voice_rx, res_tx, s));
+
+        let job = |key: &str| VoiceJob {
+            city: (207, 213),
+            key: key.into(),
+            description: "- Appearance: Nord woman".into(),
+            seed: seed(),
+        };
+        voice_tx.send(job("walker:1")).unwrap();
+        match res_rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+            QuestMsg::Voice { city, key, text } => {
+                assert_eq!((city, key.as_str()), ((207, 213), "walker:1"));
+                assert_eq!(text, "Folks whisper about Nekhar-Zul, mind you.");
+            }
+            _ => panic!("doveva generare la voce"),
+        }
+        let mut book = QuestBook::default();
+        book.load_voices(&voices);
+        assert_eq!(book.voice_count(), 1); // salvata prima di avvisare il gioco
+        // il secondo tentativo del primo job ha ricevuto il motivo del rifiuto
+        let bodies = srv.bodies.lock().unwrap().clone();
+        assert!(bodies[0].contains("Nord woman") && !bodies[0].contains("WARNING"));
+        assert!(bodies[1].contains("WARNING") && bodies[1].contains("invalid JSON"), "{}", bodies[1]);
+
+        // una voce che non riesce (3 rifiuti) non ferma il thread e non viene salvata
+        voice_tx.send(job("walker:2")).unwrap();
+        match res_rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+            QuestMsg::VoiceFailed { key, .. } => assert_eq!(key, "walker:2"),
+            _ => panic!("doveva fallire"),
+        }
+        let mut book = QuestBook::default();
+        book.load_voices(&voices);
+        assert_eq!(book.voice_count(), 1);
+
+        drop(job_tx); // il gioco chiude: il thread termina da solo
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

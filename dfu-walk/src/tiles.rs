@@ -967,17 +967,14 @@ pub fn collect_tiles(
         let textured: Vec<_> = tile.city_textured.into_iter().map(|((archive, record), part)| {
             let mat = wall_textures.material(archive, record, climate_of(&data, key.0, key.1),
                                              &data, &mut mods, &mut images, &mut standard_materials);
-            let has_normal = wall_textures.has_normal_map(&mat);
-            (mat, has_normal, part)
+            // tangenti (normal map e parallax) e segno della B per i materiali capovolti
+            let mut mesh = to_bevy_part(part);
+            wall_textures.prepare_mesh(&mat, &mut mesh);
+            (mat, mesh)
         }).collect();
         if !textured.is_empty() {
             commands.entity(chunk_entity).with_children(|parent| {
-                for (mat, has_normal, part) in textured {
-                    let mut mesh = to_bevy_part(part);
-                    if has_normal {
-                        // senza tangenti Bevy ignora la normal map
-                        let _ = mesh.generate_tangents();
-                    }
+                for (mat, mesh) in textured {
                     parent.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), Transform::IDENTITY));
                 }
             });

@@ -7,7 +7,12 @@
 //!
 //! Il dialogo ha un piccolo menu: con `1` si ascolta una voce (rumor) sulla quest generata dal
 //! LLM per la citta' (vedi `quests.rs`). Se l'NPC ha una voce flavor dedicata (generata dalla
-//! sua descrizione esatta in FLATS.CFG), quella ha la precedenza. Altrimenti si usa il tono.
+//! sua descrizione esatta in FLATS.CFG), quella ha la precedenza.
+//!
+//! Per tutti gli altri PNG la voce si genera su richiesta: ogni PNG ha una descrizione (la
+//! caption di FLATS.CFG per quelli interni, razza e sesso ricavati dal volto per i passanti) che
+//! il LLM usa per far parlare proprio quella persona. Nell'attesa il dialogo mostra un messaggio e
+//! si aggiorna da solo quando la voce e' pronta; se non si puo' generare si ripiega sul tono.
 //! E o Esc chiudono.
 
 use crate::data::city_map::PoiKind;
@@ -16,7 +21,10 @@ use crate::data::{find_file_ci, Palette};
 use crate::interior::{InteriorNpc, InteriorState};
 use crate::mod_textures::ModTextures;
 use crate::player::Player;
-use crate::quests::{tone_for_npc, Hint, QuestBook, Tone};
+use crate::quests::{
+    describe_npc, face_key, flat_key, temperament_for, tone_for_npc, walker_key, walker_look, Hint, QuestBook,
+    QuestWorker, Tone, VoiceState,
+};
 use crate::tiles::NpcWalker;
 use crate::world::{map_pixel_of, GameData, Origin};
 use bevy::prelude::*;
@@ -168,9 +176,28 @@ pub struct DialogContext {
     npc_caption: Option<String>,
     /// Il dialogo e' appena stato aperto: va rimesso il saluto.
     dirty: bool,
+    /// Chi e' l'NPC per il LLM (chiave, etichetta, descrizione), per la voce su richiesta.
+    voice: Option<NpcVoiceInfo>,
+    /// Si sta aspettando la voce dal thread del LLM.
+    awaiting: bool,
+}
+
+#[derive(Clone, Default)]
+struct NpcVoiceInfo {
+    /// Chiave stabile del PNG (per la cache e il file delle voci).
+    key: String,
+    /// Come lo si chiama nel dialogo ("beautiful maiden", "Nord woman (merchant)").
+    label: String,
+    /// Il blocco di descrizione che si passa al LLM.
+    description: String,
 }
 
 impl DialogContext {
+    fn with_voice(mut self, key: String, label: String, description: String) -> Self {
+        self.voice = Some(NpcVoiceInfo { key, label, description });
+        self
+    }
+
     fn new(
         npc_key: u64,
         city: (i32, i32),
@@ -184,6 +211,8 @@ impl DialogContext {
             npc_flat,
             npc_caption,
             dirty: true,
+            voice: None,
+            awaiting: false,
         }
     }
 }
@@ -201,16 +230,71 @@ fn ascii_punctuation(text: &str) -> String {
     .collect()
 }
 
-/// Cosa dice il PNG quando si sceglie "Ascolta rumori".
+/// Voce flavor pre-generata in blocco per il flat dell'NPC (taverne e negozi), se c'e'.
+fn flavor_message(book: &QuestBook, ctx: &DialogContext) -> Option<String> {
+    let (city, (a, r)) = (ctx.city?, ctx.npc_flat?);
+    let text = book.npc_flavor(city, a, r)?;
+    let label = ctx.npc_caption.clone().unwrap_or_else(|| "NPC".to_string());
+    Some(format!("{}: \"{}\"", label, ascii_punctuation(text)))
+}
+
+/// Cosa mostrare scegliendo "Ascolta rumori".
+enum Reply {
+    /// La risposta definitiva.
+    Say(String),
+    /// La voce e' in generazione: si mostra questo messaggio e si aspetta.
+    Wait(String),
+}
+
+fn waiting_text(voice: &NpcVoiceInfo) -> String {
+    format!("{} is thinking about it...", voice.label)
+}
+
+/// La risposta del PNG. Ordine: voce flavor in blocco, voce su richiesta (generandola se manca e
+/// il LLM e' disponibile), e infine il ripiego di sempre (risposta neutra o voce per tono).
+fn npc_reply(book: &mut QuestBook, worker: Option<&QuestWorker>, ctx: &DialogContext) -> Reply {
+    if let Some(message) = flavor_message(book, ctx) {
+        return Reply::Say(message);
+    }
+    if let (Some(city), Some(voice)) = (ctx.city, ctx.voice.as_ref()) {
+        // lo stato si copia in un valore proprio: poi si puo' modificare l'archivio
+        enum Known {
+            Ready(String),
+            Pending,
+            Unknown,
+            Failed,
+        }
+        let known = match book.voice_state(city, &voice.key) {
+            VoiceState::Ready(t) => Known::Ready(t.to_string()),
+            VoiceState::Pending => Known::Pending,
+            VoiceState::Unknown => Known::Unknown,
+            VoiceState::Failed => Known::Failed,
+        };
+        match known {
+            Known::Ready(text) => {
+                return Reply::Say(format!("{}: \"{}\"", voice.label, ascii_punctuation(&text)));
+            }
+            Known::Pending => return Reply::Wait(waiting_text(voice)),
+            Known::Unknown => {
+                if let Some(worker) = worker {
+                    if worker.request_voice(book, city, &voice.key, &voice.description) {
+                        return Reply::Wait(waiting_text(voice));
+                    }
+                }
+            }
+            Known::Failed => {}
+        }
+    }
+    Reply::Say(rumor_message(book, ctx))
+}
+
+/// Cosa dice il PNG quando si sceglie "Ascolta rumori" (senza generare nulla di nuovo).
 /// Se l'NPC ha una voce flavor dedicata (da FLATS.CFG), quella ha la precedenza.
 /// Altrimenti si ripiega sulla voce per tono.
 fn rumor_message(book: &QuestBook, ctx: &DialogContext) -> String {
     // 1. Voce flavor dedicata: la caption esatta di FLATS.CFG è l'etichetta.
-    if let (Some(city), Some((a, r))) = (ctx.city, ctx.npc_flat) {
-        if let Some(text) = book.npc_flavor(city, a, r) {
-            let label = ctx.npc_caption.clone().unwrap_or_else(|| "NPC".to_string());
-            return format!("{}: \"{}\"", label, ascii_punctuation(text));
-        }
+    if let Some(message) = flavor_message(book, ctx) {
+        return message;
     }
     // 2. Nessun flavor per questo NPC interno: risposta neutra.
     if ctx.npc_flat.is_some() {
@@ -365,13 +449,17 @@ pub fn update_dialog(
                 .get(npc.flat_archive, npc.flat_record)
                 .map(|i| i.caption.clone());
 
-                *ctx = DialogContext::new(
-                    npc.face_record as u64,
-                    map_pixel_of(&origin, player_pos),
-                                          interior.kind(),
-                                          npc_flat,
-                                          npc_caption,
-                );
+                let city = map_pixel_of(&origin, player_pos);
+                let place = interior.kind();
+                let tone = tone_for_npc(npc.face_record as u64, city, place);
+                // con la caption di FLATS.CFG il PNG e' descritto da quella; altrimenti dal volto
+                let (key, who, role) = match &npc_caption {
+                    Some(caption) => (flat_key(npc.flat_archive, npc.flat_record), caption.clone(), None),
+                    None => (face_key(npc.face_record), "an ordinary townsperson".to_string(), Some(tone.role())),
+                };
+                let description = describe_npc(&who, role, place, temperament_for(&key, city));
+                *ctx = DialogContext::new(npc.face_record as u64, city, place, npc_flat, npc_caption)
+                    .with_voice(key, who, description);
                 if let Ok((mut image_node, mut node)) = portrait.get_single_mut() {
                     image_node.image = face;
                     image_node.rect = None;
@@ -403,13 +491,17 @@ pub fn update_dialog(
     }
     let Some((_, npc)) = nearest_ext else { return };
 
-    // Gli NPC esterni non hanno flat FLATS.CFG: nessun flavor dedicato
-    *ctx = DialogContext::new(
-        npc.face_record().unwrap_or(0) as u64,
-                              map_pixel_of(&origin, player_pos),
-                              None,
-                              None,
-                              None,
+    let city = map_pixel_of(&origin, player_pos);
+    let face = npc.face_record().unwrap_or(0);
+    let tone = tone_for_npc(face as u64, city, None);
+    // i passanti non hanno una riga in FLATS.CFG: razza e sesso si ricavano dal volto
+    let look = walker_look(face);
+    let key = walker_key(face);
+    let description = describe_npc(look, Some(tone.role()), None, temperament_for(&key, city));
+    *ctx = DialogContext::new(face as u64, city, None, None, None).with_voice(
+        key,
+        format!("{look} ({})", tone.role()),
+        description,
     );
     let (image, crop, width, height, is_hd) =
     match npc.face_record().and_then(|r| faces.get(r, &data, &mut mods, &mut images)) {
@@ -448,21 +540,25 @@ pub fn update_dialog(
     keys.clear_just_pressed(KeyCode::KeyE);
 }
 
-/// Menu del dialogo aperto: rimette il saluto all'apertura e con `1` mostra la voce.
+/// Menu del dialogo aperto: rimette il saluto all'apertura; con `1` mostra la voce del PNG e, se
+/// va generata, aspetta il thread del LLM senza bloccare il gioco.
+#[allow(clippy::too_many_arguments)]
 fn dialog_menu(
     keys: Res<ButtonInput<KeyCode>>,
     state: Res<DialogState>,
     mut ctx: ResMut<DialogContext>,
-    book: Res<QuestBook>,
+    mut book: ResMut<QuestBook>,
+    worker: Option<Res<QuestWorker>>,
     assets: Res<AssetServer>,
     mut line: Query<(&mut Text, &mut TextFont), (With<DialogLine>, Without<DialogOptions>)>,
-               mut options: Query<&mut Text, (With<DialogOptions>, Without<DialogLine>)>,
+    mut options: Query<&mut Text, (With<DialogOptions>, Without<DialogLine>)>,
 ) {
     if !state.open {
         return;
     }
     if ctx.dirty {
         ctx.dirty = false;
+        ctx.awaiting = false;
         for (mut text, mut font) in &mut line {
             text.0 = DIALOG_TEXT.to_string();
             font.font = assets.load(DIALOG_FONT);
@@ -472,8 +568,26 @@ fn dialog_menu(
             text.0 = MENU_TEXT.to_string();
         }
     }
+    let mut shown: Option<String> = None;
     if keys.just_pressed(KeyCode::Digit1) || keys.just_pressed(KeyCode::Numpad1) {
-        let message = rumor_message(&book, &ctx);
+        match npc_reply(&mut book, worker.as_deref(), &ctx) {
+            Reply::Say(message) => {
+                ctx.awaiting = false;
+                shown = Some(message);
+            }
+            Reply::Wait(message) => {
+                ctx.awaiting = true;
+                shown = Some(message);
+            }
+        }
+    } else if ctx.awaiting {
+        // la voce arriva dal thread: appena e' pronta (o fallita) si mostra
+        if let Reply::Say(message) = npc_reply(&mut book, worker.as_deref(), &ctx) {
+            ctx.awaiting = false;
+            shown = Some(message);
+        }
+    }
+    if let Some(message) = shown {
         for (mut text, mut font) in &mut line {
             text.0 = message.clone();
             font.font = assets.load(RUMOR_FONT);
@@ -531,6 +645,7 @@ mod tests {
             npc_flat: Some((183, 2)),
             npc_caption: Some("guard".into()),
             dirty: false,
+            ..Default::default()
         };
         // Nessun flavor salvato: risposta neutra per NPC interno
         let msg = rumor_message(&book, &ctx);
@@ -546,6 +661,7 @@ mod tests {
             npc_flat: None,
             npc_caption: None,
             dirty: false,
+            ..Default::default()
         };
         let msg = rumor_message(&book, &ctx);
         assert_eq!(msg, "You don't hear anything interesting.");
@@ -559,5 +675,80 @@ mod tests {
         assert!(face_rgba(&rci, usize::MAX, &palette()).is_none());
         let short = vec![0u8; FACE_BYTES + FACE_BYTES / 2];
         assert!(face_rgba(&short, 1, &palette()).is_none());
+    }
+
+    fn voice_ctx(city: Option<(i32, i32)>) -> DialogContext {
+        DialogContext {
+            tone: Tone::Merchant,
+            city,
+            ..Default::default()
+        }
+        .with_voice("walker:37".into(), "Nord woman (merchant)".into(), "- Appearance: Nord woman".into())
+    }
+
+    #[test]
+    fn reply_uses_a_stored_voice_with_the_npc_label() {
+        let mut book = QuestBook::default();
+        book.store_voice((1, 1), "walker:37".into(), "Hush \u{2019}now\u{2019}.".into());
+        match npc_reply(&mut book, None, &voice_ctx(Some((1, 1)))) {
+            Reply::Say(m) => assert_eq!(m, "Nord woman (merchant): \"Hush 'now'.\""),
+            Reply::Wait(_) => panic!("la voce e' pronta"),
+        }
+    }
+
+    #[test]
+    fn reply_waits_while_the_voice_is_being_generated() {
+        let mut book = QuestBook::default();
+        book.mark_voice_pending((1, 1), "walker:37");
+        let ctx = voice_ctx(Some((1, 1)));
+        match npc_reply(&mut book, None, &ctx) {
+            Reply::Wait(m) => assert_eq!(m, "Nord woman (merchant) is thinking about it..."),
+            Reply::Say(_) => panic!("deve aspettare"),
+        }
+        // arrivata la voce: la stessa domanda ora riceve la risposta
+        book.store_voice((1, 1), "walker:37".into(), "Psst.".into());
+        assert!(matches!(npc_reply(&mut book, None, &ctx), Reply::Say(m) if m.ends_with("\"Psst.\"")));
+    }
+
+    #[test]
+    fn reply_without_llm_and_without_voice_uses_the_tone_fallback() {
+        let mut book = QuestBook::default();
+        match npc_reply(&mut book, None, &voice_ctx(Some((2, 2)))) {
+            Reply::Say(m) => assert_eq!(m, "You don't hear anything interesting."),
+            Reply::Wait(_) => panic!("senza LLM non si aspetta"),
+        }
+    }
+
+    #[test]
+    fn reply_falls_back_when_generation_failed() {
+        let mut book = QuestBook::default();
+        book.fail_voice((1, 1), "walker:37".into());
+        match npc_reply(&mut book, None, &voice_ctx(Some((1, 1)))) {
+            Reply::Say(m) => assert_eq!(m, "You don't hear anything interesting."),
+            Reply::Wait(_) => panic!("fallita: niente attesa"),
+        }
+    }
+
+    #[test]
+    fn batch_flavor_still_has_priority_over_on_demand_voices() {
+        // un NPC interno senza flavor ne' voce ne' LLM: risposta neutra come prima
+        let mut book = QuestBook::default();
+        let ctx = DialogContext {
+            tone: Tone::Merchant,
+            city: Some((1, 1)),
+            npc_flat: Some((183, 2)),
+            npc_caption: Some("guard".into()),
+            ..Default::default()
+        };
+        match npc_reply(&mut book, None, &ctx) {
+            Reply::Say(m) => assert_eq!(m, "They shrug. They don't seem to know anything about it."),
+            Reply::Wait(_) => panic!("senza LLM non si aspetta"),
+        }
+    }
+
+    #[test]
+    fn waiting_text_names_the_npc() {
+        let v = NpcVoiceInfo { key: "k".into(), label: "old beggar".into(), description: String::new() };
+        assert_eq!(waiting_text(&v), "old beggar is thinking about it...");
     }
 }

@@ -24,6 +24,20 @@
 //! è già in fondo-up (allineata all'albedo BC7), quindi condivide lo stesso
 //! `uv_transform`.
 //!
+//! ## Parallax (bump)
+//!
+//! Ogni muro con una texture colore riceve una depth map per il parallax mapping, ricavata
+//! dalla **luminosita' della texture colore originale di Daggerfall** (quella a palette, che
+//! esiste per tutti i muri; non dall'albedo della mod, che manca quasi sempre): le zone scure
+//! sono incavi, quelle chiare sporgenze (`derive_depth_map`). Bevy vuole in `depth_map` un valore
+//! di profondita' (bianco = fondo), quindi la depth e' `1 - luminosita'`.
+//! Come per la normal map derivata, se l'albedo mostrata e' capovolta (`uv_transform`) l'input
+//! viene capovolto uguale, cosi' la depth map condivide lo stesso `uv_transform`.
+//! Il parallax richiede le tangenti sulla mesh (`prepare_mesh`); per i materiali capovolti
+//! con `uv_transform` la B delle tangenti e' invertita e il verde della normal map pure
+//! (`flip_normal_map_y`), cosi' le normali restano invariate e lo spostamento del parallax
+//! va nel verso giusto.
+//!
 //! I flat (decorazioni, NPC) **non** ricevono normal map: sono billboard, il
 //! normal mapping non aggiunge nulla.
 
@@ -31,6 +45,8 @@ use crate::mod_textures::ModTextures;
 use crate::world::GameData;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::math::Affine2;
+use bevy::pbr::ParallaxMappingMethod;
+use bevy::render::mesh::VertexAttributeValues;
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -46,8 +62,25 @@ pub struct WallTextures {
     flat_frames: HashMap<(u16, u8, u16), Option<(Handle<StandardMaterial>, f32, f32)>>,
     sizes: HashMap<(u16, u8), (f32, f32)>,
     normal_cache: HashMap<(u32, u8), Option<Handle<Image>>>,
+    /// Materiali che richiedono le tangenti sulla mesh (normal map o parallax).
     normal_materials: HashSet<AssetId<StandardMaterial>>,
+    /// Materiali con albedo capovolta via `uv_transform`: le tangenti vanno con la B invertita.
+    flipped_materials: HashSet<AssetId<StandardMaterial>>,
+    depth_cache: HashMap<(u32, u8), Option<Handle<Image>>>,
 }
+
+// --- Parallax mapping dalla luminosita' della texture colore ---
+/// Spegne il parallax (le normal map restano).
+const USE_PARALLAX: bool = true;
+/// Profondita' dell'effetto in spazio UV: 0.02 sottile, 0.05 marcato.
+const PARALLAX_DEPTH_SCALE: f32 = 0.03;
+/// Passi massimi lungo il raggio visivo (piu' alto = piu' preciso e piu' lento).
+const PARALLAX_MAX_LAYERS: f32 = 16.0;
+/// `true`: parallax "relief" (piu' preciso, piu' costoso); `false`: "occlusion".
+const PARALLAX_RELIEF: bool = true;
+/// `true` inverte la mappa (scuro = sporgenza). Il default segue Bevy: bianco = fondo, quindi
+/// le zone scure diventano incavi. Se l'effetto ti sembra al contrario, cambia questo.
+const PARALLAX_INVERT: bool = true;
 
 fn repeat_sampler() -> ImageSampler {
     ImageSampler::Descriptor(ImageSamplerDescriptor {
@@ -187,6 +220,65 @@ fn derive_normal_map(rgba: &[u8], w: usize, h: usize) -> Image {
     image
 }
 
+/// Depth map per il parallax dalla luminosita' della texture colore: scuro = incavo (profondo),
+/// chiaro = sporgenza. Output `Rgba8Unorm` lineare (Bevy vuole la depth map non sRGB), stesso
+/// ordine di righe dell'input.
+fn derive_depth_map(rgba: &[u8], w: usize, h: usize) -> Image {
+    debug_assert_eq!(rgba.len(), w * h * 4);
+    // luminosita' percettiva: i byte della texture sono gia' in sRGB
+    let lum: Vec<f32> = rgba
+        .chunks_exact(4)
+        .map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0)
+        .collect();
+
+    // blur 3x3 "a toro" (le texture dei muri si ripetono): toglie il rumore a pixel singolo
+    let mut blurred = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = 0.0;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let sx = (x as i32 + dx).rem_euclid(w as i32) as usize;
+                    let sy = (y as i32 + dy).rem_euclid(h as i32) as usize;
+                    sum += lum[sy * w + sx];
+                }
+            }
+            blurred[y * w + x] = sum / 9.0;
+        }
+    }
+
+    // sfrutta tutta la gamma: stira fra il 2% e il 98% delle luminosita'
+    let mut sorted = blurred.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let last = sorted.len().saturating_sub(1);
+    let lo = sorted[(last as f32 * 0.02) as usize];
+    let hi = sorted[(last as f32 * 0.98) as usize];
+    let range = (hi - lo).max(1e-3);
+
+    let mut out = vec![255u8; w * h * 4];
+    for (i, &v) in blurred.iter().enumerate() {
+        let bright = ((v - lo) / range).clamp(0.0, 1.0);
+        let deep = if PARALLAX_INVERT { bright } else { 1.0 - bright }; // scuro -> profondo
+        let depth = (deep * 255.0).round() as u8;
+        out[i * 4..i * 4 + 3].fill(depth);
+    }
+    let mut image = Image::new(
+        Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        out,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    image
+}
+
 fn flat_albedo_from_mod(
     archive: u16,
     record: u8,
@@ -267,6 +359,41 @@ impl WallTextures {
         Some(handle)
     }
 
+    /// Depth map del parallax per un muro, dalla luminosita' della texture colore originale
+    /// (palette di Daggerfall). `albedo_needs_flip`: l'albedo mostrata e' capovolta via
+    /// `uv_transform`, quindi l'input viene capovolto uguale.
+    fn depth_map(
+        &mut self,
+        archive: u32,
+        base_archive: u32,
+        record: u8,
+        albedo_needs_flip: bool,
+        data: &GameData,
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
+        if let Some(cached) = self.depth_cache.get(&(archive, record)) {
+            return cached.clone();
+        }
+        let handle = [archive, base_archive].into_iter().find_map(|a| {
+            let path = find_file_ci(&data.dir, &archive_file_name(a))?;
+            let file = TextureFile::open(&path).ok()?;
+            let frame = file.frame(record as usize, 0).ok()?;
+            if frame.width == 0 || frame.height == 0 {
+                return None;
+            }
+            let mut rgba = frame.to_rgba(&data.palette, None);
+            if albedo_needs_flip {
+                flip_v_rgba8(&mut rgba, frame.width, frame.height);
+            }
+            Some(images.add(derive_depth_map(&rgba, frame.width, frame.height)))
+        });
+        if handle.is_none() {
+            debug!("Parallax {archive}:{record}: texture colore non trovata, nessuna depth map");
+        }
+        self.depth_cache.insert((archive, record), handle.clone());
+        handle
+    }
+
     pub fn material(
         &mut self,
         archive: u16,
@@ -293,6 +420,12 @@ impl WallTextures {
         };
 
         let normal = self.normal_map(final_archive, record, needs_flip, data, mods, images);
+        // Bump per il parallax: dalla luminosita' della texture colore (vedi `derive_depth_map`).
+        let depth = if USE_PARALLAX && albedo.is_some() {
+            self.depth_map(final_archive, archive as u32, record, needs_flip, data, images)
+        } else {
+            None
+        };
 
         // Flip V per i muri BC7 (bottom-up, convenzione Unity/Daggerfall).
         // Stesso meccanismo dei flat (vedi `flat_material_frame`).
@@ -306,11 +439,22 @@ impl WallTextures {
             Affine2::IDENTITY
         };
 
-        let has_normal = normal.is_some();
+        let has_normal = normal.is_some() || depth.is_some();
         let material = match albedo {
             Some(texture) => StandardMaterial {
                 base_color_texture: Some(texture),
                 normal_map_texture: normal,
+                depth_map: depth,
+                parallax_depth_scale: PARALLAX_DEPTH_SCALE,
+                parallax_mapping_method: if PARALLAX_RELIEF {
+                    ParallaxMappingMethod::Relief { max_steps: 5 }
+                } else {
+                    ParallaxMappingMethod::Occlusion
+                },
+                max_parallax_layer_count: PARALLAX_MAX_LAYERS,
+                // con l'albedo capovolta via uv_transform `prepare_mesh` inverte la B delle tangenti:
+                // il verde della normal map si inverte con lei e le normali restano uguali
+                flip_normal_map_y: needs_flip,
                 uv_transform,
                 perceptual_roughness: 0.9,
                 reflectance: 0.1,
@@ -328,13 +472,32 @@ impl WallTextures {
         let handle = materials.add(material);
         if has_normal {
             self.normal_materials.insert(handle.id());
+            if needs_flip {
+                self.flipped_materials.insert(handle.id());
+            }
         }
         self.cache.insert(key, handle.clone());
         handle
     }
 
+    /// Il materiale usa normal map o parallax: la mesh ha bisogno delle tangenti.
     pub fn has_normal_map(&self, mat: &Handle<StandardMaterial>) -> bool {
         self.normal_materials.contains(&mat.id())
+    }
+
+    /// Prepara la mesh per il materiale: tangenti (senza, Bevy ignora normal map e parallax) e,
+    /// se l'albedo e' capovolta via `uv_transform`, B invertita (segno `w` delle tangenti).
+    pub fn prepare_mesh(&self, mat: &Handle<StandardMaterial>, mesh: &mut Mesh) {
+        if !self.normal_materials.contains(&mat.id()) || mesh.generate_tangents().is_err() {
+            return;
+        }
+        if self.flipped_materials.contains(&mat.id()) {
+            if let Some(VertexAttributeValues::Float32x4(tangents)) = mesh.attribute_mut(Mesh::ATTRIBUTE_TANGENT) {
+                for t in tangents.iter_mut() {
+                    t[3] = -t[3];
+                }
+            }
+        }
     }
 
     pub fn original_size(&mut self, archive: u16, record: u8, data: &GameData) -> (f32, f32) {

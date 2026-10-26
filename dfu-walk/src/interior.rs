@@ -379,9 +379,7 @@ pub fn interior_enter_exit(
             }
             // >>> Normal map: senza tangenti Bevy ignora la normal map (da File 1)
             let mut bevy_mesh = submesh_to_bevy(&scene.mesh, sm, size);
-            if wall_textures.has_normal_map(&handle) {
-                let _ = bevy_mesh.generate_tangents();
-            }
+            wall_textures.prepare_mesh(&handle, &mut bevy_mesh);
             parent.spawn((
                 Mesh3d(meshes.add(bevy_mesh)),
                           MeshMaterial3d(handle),
@@ -430,9 +428,7 @@ pub fn interior_enter_exit(
                     }
                     // >>> Normal map anche per le porte (da File 1)
                     let mut bevy_mesh = submesh_to_bevy(&d.mesh, sm, size);
-                    if wall_textures.has_normal_map(&handle) {
-                        let _ = bevy_mesh.generate_tangents();
-                    }
+                    wall_textures.prepare_mesh(&handle, &mut bevy_mesh);
                     door.spawn((
                         Mesh3d(meshes.add(bevy_mesh)),
                                 MeshMaterial3d(handle),

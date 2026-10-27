@@ -77,7 +77,7 @@ impl FlatsFaceMap {
                     let archive = tokens[0].parse::<u16>().unwrap();
                     let record = tokens[1].parse::<u8>().unwrap();
                     let face = tokens[3].parse::<usize>().unwrap();
-                    if archive <= 999 && record <= 255 {
+                    if archive <= 999 {
                         map.entries.entry((archive, record)).or_default().push(FlatInfo { face });
                         valid += 1;
                     } else {
@@ -94,7 +94,7 @@ impl FlatsFaceMap {
                         }
                         if let Some(face_line) = lines.next() {
                             if let Ok(face) = face_line.trim().parse::<usize>() {
-                                if archive <= 999 && record <= 255 {
+                                if archive <= 999 {
                                     map.entries.entry((archive, record)).or_default().push(FlatInfo { face });
                                     valid += 1;
                                 } else {

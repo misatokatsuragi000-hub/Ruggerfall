@@ -1,8 +1,84 @@
 //! Colonna sonora di Daggerfall: cambio traccia via eventi in base a situazione di gioco,
 //! meteo e ora del giorno. Replica la logica di SongManager.cs di Daggerfall Unity.
+//!
+//! ## Ducking
+//!
+//! Quando un PNG parla (componente `tts::SpeechVoice` presente in scena), la musica scende
+//! a `MUSIC_DUCKED_VOLUME`; quando la voce finisce o il dialogo viene chiuso, torna a
+//! `MUSIC_BASE_VOLUME`. La transizione è interpolata in `MUSIC_DUCK_FADE_SECS` secondi,
+//! così non ci sono stacchi bruschi.
+//!
+//! Richiede in `main.rs`:
+//!   `.init_resource::<music::MusicDucking>()`
+//!   e `music::duck_music` nella catena di Update, dopo `music::play_music`.
+
 use bevy::prelude::*;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+
+use crate::tts::SpeechVoice;
+
+// =============================================================================
+// Ducking: costanti, marker, risorsa, sistema
+// =============================================================================
+
+/// Volume normale della musica di sottofondo.
+pub const MUSIC_BASE_VOLUME: f32 = 0.4;
+/// Volume della musica mentre un PNG sta parlando (15% del normale).
+pub const MUSIC_DUCKED_VOLUME: f32 = 0.06;
+/// Durata della transizione base ↔ ducked (secondi).
+pub const MUSIC_DUCK_FADE_SECS: f32 = 0.3;
+
+/// Marca le entità della musica di sottofondo spawnate da `play_music`, così il
+/// sistema di ducking sa quali `AudioSink` modulare (le voci TTS hanno il loro
+/// `SpeechSource` e non vengono toccate).
+#[derive(Component)]
+pub struct MusicPlaying;
+
+/// Stato del ducking, aggiornato ogni frame da `duck_music`.
+#[derive(Resource)]
+pub struct MusicDucking {
+    /// Volume attuale applicato alle sink della musica.
+    pub current: f32,
+    /// Volume verso cui `current` sta interpolando.
+    pub target: f32,
+}
+
+impl Default for MusicDucking {
+    fn default() -> Self {
+        Self { current: MUSIC_BASE_VOLUME, target: MUSIC_BASE_VOLUME }
+    }
+}
+
+/// Sistema: se c'è almeno una `SpeechVoice` in scena, abbassa la musica; altrimenti
+/// la riporta al volume normale. Interpola `MusicDucking.current` verso il target
+/// con passo costante, poi applica il valore a ogni `AudioSink` della musica.
+pub fn duck_music(
+    time: Res<Time>,
+    voices: Query<Entity, With<SpeechVoice>>,
+    mut ducking: ResMut<MusicDucking>,
+    sinks: Query<&AudioSink, With<MusicPlaying>>,
+) {
+    let speaking = !voices.is_empty();
+    ducking.target = if speaking { MUSIC_DUCKED_VOLUME } else { MUSIC_BASE_VOLUME };
+
+    let step = (MUSIC_BASE_VOLUME / MUSIC_DUCK_FADE_SECS) * time.delta_secs();
+    if (ducking.current - ducking.target).abs() <= step {
+        ducking.current = ducking.target;
+    } else if ducking.current < ducking.target {
+        ducking.current += step;
+    } else {
+        ducking.current -= step;
+    }
+
+    for sink in &sinks {
+        sink.set_volume(ducking.current);
+    }
+}
+
+// =============================================================================
+// Playlist e contesto (invariati)
+// =============================================================================
 
 /// Situazione musicale (PlayerMusicEnvironment di DFU)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -163,6 +239,7 @@ pub fn play_music(
     mut events: EventReader<MusicEvent>,
     asset_server: Res<AssetServer>,
     mut controller: ResMut<MusicController>,
+    ducking: Res<MusicDucking>,
     audio_players: Query<Entity, With<AudioPlayer>>,
 ) {
     for ev in events.read() {
@@ -172,7 +249,8 @@ pub fn play_music(
                     continue;
                 }
 
-                // Ferma la traccia precedente
+                // Ferma la traccia precedente. Filtra solo `AudioPlayer<AudioSource>`:
+                // le voci TTS usano `AudioPlayer<SpeechSource>` e non vengono toccate.
                 for e in &audio_players {
                     commands.entity(e).despawn();
                 }
@@ -186,10 +264,13 @@ pub fn play_music(
 
                 let path = playlist.pick_track(context);
                 let handle = asset_server.load(path);
+                // Se stiamo già abbassando la musica per una voce, la nuova traccia
+                // parte già al volume ducked, così non c'è uno stacco.
                 commands.spawn((
                     AudioPlayer::new(handle),
                                 PlaybackSettings::LOOP
-                                .with_volume(bevy::audio::Volume::new(0.4)),
+                                .with_volume(bevy::audio::Volume::new(ducking.current)),
+                                MusicPlaying,
                 ));
 
                 controller.current_context = Some(*context);

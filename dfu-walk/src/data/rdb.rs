@@ -1,4 +1,14 @@
-//! Parser per i blocchi dungeon RDB (BLOCKS.BSA), porting fedele da BlocksFile.cs di Daggerfall Unity.
+//! Parser per i blocchi dungeon RDB (BLOCKS.BSA), porting fedele da
+//! `BlocksFile.cs` di Daggerfall Unity.
+//!
+//! ## Convenzione di rotazione
+//!
+//! DFU legge le rotazioni come **negative**: `-XRotation / Div`,
+//! `-YRotation / Div`, `-ZRotation / Div`. La convenzione originale di
+//! Daggerfall è oraria vista dall'alto, mentre `Quat::from_rotation_*(+ang)`
+//! di Bevy è antioraria (regola della mano destra). Senza il segno meno, ogni
+//! oggetto RDB risulta ruotato nel verso opposto: l'effetto visibile è che
+//! l'ingresso del dungeon sembra ruotato di 180° e i blocchi non si allineano.
 
 use std::str::FromStr;
 
@@ -33,8 +43,11 @@ pub struct RdbModelRef {
 
 #[derive(Debug, Clone)]
 pub struct RdbModelResource {
+    /// Rotazione X in gradi, già negata (convenzione DFU).
     pub x_rot_deg: f32,
+    /// Rotazione Y in gradi, già negata (convenzione DFU).
     pub y_rot_deg: f32,
+    /// Rotazione Z in gradi, già negata (convenzione DFU).
     pub z_rot_deg: f32,
     pub model_index: u16,
     pub model_id: u32,
@@ -93,7 +106,7 @@ impl RdbBlock {
         let height = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
         let root_offset = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
 
-        // 1. ModelReferenceList: 750 record da 8 byte (offset 20 .. 6020)
+        // 1. ModelReferenceList: 750 record da 8 byte (offset 20..6020)
         let mut p = 20;
         let mut model_refs = Vec::with_capacity(750);
         for _ in 0..750 {
@@ -110,7 +123,7 @@ impl RdbBlock {
             p += 8;
         }
 
-        // 2. Lettura ObjectRootList (Width * Height offset i32)
+        // 2. ObjectRootList (Width * Height offset i32)
         if root_offset >= data.len() {
             return Err("ObjectRootOffset oltre la fine del file RDB");
         }
@@ -123,7 +136,11 @@ impl RdbBlock {
 
         let mut root_offsets = Vec::with_capacity(total_roots);
         for i in 0..total_roots {
-            let off = i32::from_le_bytes(data[root_offset + i * 4..root_offset + i * 4 + 4].try_into().unwrap());
+            let off = i32::from_le_bytes(
+                data[root_offset + i * 4..root_offset + i * 4 + 4]
+                .try_into()
+                .unwrap(),
+            );
             if off >= 0 {
                 root_offsets.push(off as usize);
             }
@@ -133,14 +150,6 @@ impl RdbBlock {
         let mut objects = Vec::new();
         for mut obj_pos in root_offsets {
             let mut visited = 0;
-            // Un nodo oggetto occupa 25 byte:
-            // +0: Next (4)
-            // +4: Previous (4)
-            // +8: XPos (4)
-            // +12: YPos (4)
-            // +16: ZPos (4)
-            // +20: Type (1)
-            // +21: ResourceOffset (4)
             while obj_pos + 25 <= data.len() && visited < 5000 {
                 visited += 1;
                 let next = i32::from_le_bytes(data[obj_pos..obj_pos + 4].try_into().unwrap());
@@ -148,32 +157,43 @@ impl RdbBlock {
                 let y = i32::from_le_bytes(data[obj_pos + 12..obj_pos + 16].try_into().unwrap());
                 let z = i32::from_le_bytes(data[obj_pos + 16..obj_pos + 20].try_into().unwrap());
                 let r_type = RdbResourceType::from(data[obj_pos + 20]);
-                let res_offset = u32::from_le_bytes(data[obj_pos + 21..obj_pos + 25].try_into().unwrap()) as usize;
+                let res_offset =
+                u32::from_le_bytes(data[obj_pos + 21..obj_pos + 25].try_into().unwrap()) as usize;
 
                 let resource = if res_offset < data.len() {
                     match r_type {
                         RdbResourceType::Model => {
-                            // ModelResource (23 byte):
-                            // +0: XRot (4)
-                            // +4: YRot (4)
-                            // +8: ZRot (4)
-                            // +12: ModelIndex (2)
-                            // +14: TriggerFlag (4)
-                            // +18: SoundIndex (1)
-                            // +19: ActionOffset (4)
                             if res_offset + 23 <= data.len() {
-                                let xr = i32::from_le_bytes(data[res_offset..res_offset + 4].try_into().unwrap());
-                                let yr = i32::from_le_bytes(data[res_offset + 4..res_offset + 8].try_into().unwrap());
-                                let zr = i32::from_le_bytes(data[res_offset + 8..res_offset + 12].try_into().unwrap());
-                                let m_idx = u16::from_le_bytes(data[res_offset + 12..res_offset + 14].try_into().unwrap());
-                                let act_off = i32::from_le_bytes(data[res_offset + 19..res_offset + 23].try_into().unwrap());
+                                let xr = i32::from_le_bytes(
+                                    data[res_offset..res_offset + 4].try_into().unwrap(),
+                                );
+                                let yr = i32::from_le_bytes(
+                                    data[res_offset + 4..res_offset + 8].try_into().unwrap(),
+                                );
+                                let zr = i32::from_le_bytes(
+                                    data[res_offset + 8..res_offset + 12].try_into().unwrap(),
+                                );
+                                let m_idx = u16::from_le_bytes(
+                                    data[res_offset + 12..res_offset + 14].try_into().unwrap(),
+                                );
+                                let act_off = i32::from_le_bytes(
+                                    data[res_offset + 19..res_offset + 23].try_into().unwrap(),
+                                );
 
-                                let model_id = model_refs.get(m_idx as usize).map(|m| m.model_id).unwrap_or(0);
+                                let model_id = model_refs
+                                .get(m_idx as usize)
+                                .map(|m| m.model_id)
+                                .unwrap_or(0);
 
+                                // FIX: le rotazioni sono NEGATIVE, come in DFU
+                                // (`-XRotation / Div`, `-YRotation / Div`,
+                                // `-ZRotation / Div`). Senza il segno meno, il
+                                // dungeon risulta ruotato di 180° e i blocchi
+                                // non si allineano tra loro.
                                 RdbResource::Model(RdbModelResource {
-                                    x_rot_deg: (xr as f32) * RDB_DA_TO_DEG,
-                                                   y_rot_deg: (yr as f32) * RDB_DA_TO_DEG,
-                                                   z_rot_deg: (zr as f32) * RDB_DA_TO_DEG,
+                                    x_rot_deg: -((xr as f32) * RDB_DA_TO_DEG),
+                                                   y_rot_deg: -((yr as f32) * RDB_DA_TO_DEG),
+                                                   z_rot_deg: -((zr as f32) * RDB_DA_TO_DEG),
                                                    model_index: m_idx,
                                                    model_id,
                                                    action_offset: act_off,
@@ -183,16 +203,13 @@ impl RdbBlock {
                             }
                         }
                         RdbResourceType::Flat => {
-                            // FlatResource (11 byte):
-                            // +0: Bitfield (2)
-                            // +2: Flags (2)
-                            // +4: Magnitude (1)
-                            // +5: SoundIndex (1)
-                            // +6: NextObjectOffset (4)
-                            // +10: Action (1)
                             if res_offset + 6 <= data.len() {
-                                let bitfield = u16::from_le_bytes(data[res_offset..res_offset + 2].try_into().unwrap());
-                                let flags = u16::from_le_bytes(data[res_offset + 2..res_offset + 4].try_into().unwrap());
+                                let bitfield = u16::from_le_bytes(
+                                    data[res_offset..res_offset + 2].try_into().unwrap(),
+                                );
+                                let flags = u16::from_le_bytes(
+                                    data[res_offset + 2..res_offset + 4].try_into().unwrap(),
+                                );
                                 let mag = data[res_offset + 4];
                                 let snd = data[res_offset + 5];
                                 let fact = u16::from_le_bytes([mag, snd]);
@@ -208,12 +225,10 @@ impl RdbBlock {
                             }
                         }
                         RdbResourceType::Light => {
-                            // LightResource (10 byte):
-                            // +0: Unk1 (4)
-                            // +4: Unk2 (4)
-                            // +8: Radius (2)
                             if res_offset + 10 <= data.len() {
-                                let radius = u16::from_le_bytes(data[res_offset + 8..res_offset + 10].try_into().unwrap());
+                                let radius = u16::from_le_bytes(
+                                    data[res_offset + 8..res_offset + 10].try_into().unwrap(),
+                                );
                                 RdbResource::Light(RdbLightResource { radius })
                             } else {
                                 RdbResource::None

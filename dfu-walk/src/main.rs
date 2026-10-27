@@ -1,7 +1,7 @@
 //! Terreno e città di Daggerfall in Bevy con shader WGSL,
 //! mod HD di D.R.E.A.M., dungeon procedurali (RDB), mappa interattiva (tasto M),
 //! mappa locale (tasto L), vegetazione 3D e colonna sonora originale.
-
+mod torch;
 mod data;
 mod equipment;
 mod grass;
@@ -24,6 +24,7 @@ mod world;
 mod compass;
 mod vitals;
 mod dungeon;
+mod tts;
 
 use crate::data::bsa::BsaArchive;
 use crate::data::maps::MapsReader;
@@ -42,7 +43,7 @@ use tiles::*;
 use trees::NaturePool;
 use world::*;
 
-const USAGE: &str = "uso: dfu-walk <cartella ARENA2> [--mods <cartella>] [--pixel X Y] [--radius N] [--winter] [--hour H] [--day-minutes M] [--outside]";
+const USAGE: &str = "uso: dfu-walk <cartella ARENA2> [--mods <cartella>] [--textures <cartella>] [--pixel X Y] [--radius N] [--winter] [--hour H] [--day-minutes M] [--outside]";
 const SKY: Color = Color::srgb(0.55, 0.72, 0.92);
 
 #[derive(Resource, Clone, Copy)]
@@ -53,6 +54,7 @@ pub struct StartDungeonConfig {
 struct Args {
     dir: PathBuf,
     mods_dir: PathBuf,
+    textures_dir: PathBuf,
     pixel: Option<(i32, i32)>,
     radius: i32,
     winter: bool,
@@ -84,6 +86,7 @@ fn next_value<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>, what:
 fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     let dir = it.next().unwrap_or_else(|| fail(USAGE));
+
     let default_dream_mods = PathBuf::from(
         "/mnt/1CE16DBE48849731/Daggerfall/DaggerfallUnity_Data/StreamingAssets/Mods",
     );
@@ -92,16 +95,28 @@ fn parse_args() -> Args {
     } else {
         PathBuf::from("mods")
     };
+
+    let default_dream_textures = PathBuf::from(
+        "/mnt/1CE16DBE48849731/Daggerfall/DaggerfallUnity_Data/StreamingAssets/Textures",
+    );
+    let default_textures = if default_dream_textures.exists() {
+        default_dream_textures
+    } else {
+        PathBuf::from("textures")
+    };
+
     let mut args = Args {
         dir: PathBuf::from(dir),
         mods_dir: default_mods,
+        textures_dir: default_textures,
         pixel: None,
         radius: 2,
         winter: false,
         hour: 10.5,
         day_minutes: 24.0,
-        start_dungeon: true, // Di default ci si risveglia dentro il dungeon iniziale
+        start_dungeon: true,
     };
+
     while let Some(a) = it.next() {
         match a.as_str() {
             "--outside" => args.start_dungeon = false,
@@ -110,6 +125,12 @@ fn parse_args() -> Args {
                 .next()
                 .unwrap_or_else(|| fail(format!("--mods vuole un percorso\n{USAGE}")));
                 args.mods_dir = PathBuf::from(m);
+            }
+            "--textures" => {
+                let m = it
+                .next()
+                .unwrap_or_else(|| fail(format!("--textures vuole un percorso\n{USAGE}")));
+                args.textures_dir = PathBuf::from(m);
             }
             "--pixel" => {
                 let x: i32 = next_value(&mut it, "--pixel");
@@ -203,7 +224,6 @@ fn main() {
     let args = parse_args();
     let data = load_data(&args);
 
-    // Cerca Privateer's Hold come punto di partenza predefinito
     let privateer_loc = data
     .locations
     .values()
@@ -230,6 +250,7 @@ fn main() {
 
     println!("Partenza dal map pixel ({mx}, {my}), raggio {}.", args.radius);
     println!("Cartella mod: {}", args.mods_dir.display());
+    println!("Cartella texture sciolte: {}", args.textures_dir.display());
     println!("Comandi: clic = cattura il mouse, Esc = rilascia, WASD = cammina, Maiusc = corri,");
     println!("         Spazio = salta, F = volo (Spazio/Ctrl su e giù), Maiusc in volo = velocissimo.");
     println!("         T = ferma/riprendi il tempo, , e . = un'ora indietro/avanti.");
@@ -254,13 +275,17 @@ fn main() {
     .add_plugins(fps_weapon::FpsWeaponPlugin)
     .add_plugins(compass::CompassPlugin)
     .add_plugins(vitals::VitalsPlugin)
+    .add_plugins(torch::TorchPlugin)
+    .add_plugins(tts::TtsPlugin)
     .add_plugins(equipment::EquipmentPlugin)
     .add_plugins(dungeon::DungeonPlugin)
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(ModTexturesPlugin {
         dir: args.mods_dir.clone(),
+                 textures_dir: Some(args.textures_dir.clone()),
                  nearest_filter: false,
     })
+    // .add_plugins(fake_relief::FakeReliefPlugin) // <-- disattivato finché lo shader WGSL non compila
     .insert_resource(ClearColor(SKY))
     .insert_resource(AmbientLight {
         color: Color::srgb(0.85, 0.9, 1.0),
@@ -283,6 +308,7 @@ fn main() {
     })
     .add_event::<music::MusicEvent>()
     .insert_resource(music::MusicController::default())
+    .init_resource::<music::MusicDucking>()
     .add_systems(
         Startup,
         (
@@ -316,6 +342,7 @@ fn main() {
          local_map::update_local_map,
          music_zones::update_music_zone,
          music::play_music,
+         music::duck_music,
          update_title,
         )
         .chain(),
@@ -350,7 +377,7 @@ fn setup(
         Camera3d::default(),
                     Projection::Perspective(PerspectiveProjection {
                         fov: 70.0_f32.to_radians(),
-                                            near: 0.3,
+                                            near: 0.1,
                                             far: 60_000.0,
                                             ..default()
                     }),
@@ -362,7 +389,11 @@ fn setup(
                         },
                         ..default()
                     },
-                    Transform::from_xyz(MAP_PIXEL_SIZE / 2.0, ground + EYE_HEIGHT, -MAP_PIXEL_SIZE / 2.0),
+                    Transform::from_xyz(
+                        MAP_PIXEL_SIZE / 2.0,
+                        ground + EYE_HEIGHT,
+                        -MAP_PIXEL_SIZE / 2.0,
+                    ),
                     Player::new(ground),
     ));
     let _ = CELL_SIZE;

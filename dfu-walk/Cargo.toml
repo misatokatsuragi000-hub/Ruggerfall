@@ -29,10 +29,12 @@ bevy = { version = "0.15", default-features = false, features = [
     "x11",
     "tonemapping_luts",
     "bevy_audio",   # <-- aggiungi
-    "vorbis",       # <-- aggiungi (decodifica .ogg)
+    "vorbis",
+    "wav",
 ] }
 dfmod = { version = "0.1.0", path = "../dfmod" }
-
+image = { version = "0.25", default-features = false, features = ["png"] }
+texture2ddecoder = "0.1"
 [profile.dev]
 opt-level = 1
 

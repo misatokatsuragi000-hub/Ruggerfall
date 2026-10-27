@@ -559,7 +559,7 @@ fn enemy_table(climate: ClimateBase) -> &'static [usize] {
     }
 }
 
-type RecordSet = ([Vec<Handle<StandardMaterial>>; 5], [Vec2; 5]);
+pub type RecordSet = ([Vec<Handle<StandardMaterial>>; 5], [Vec2; 5]);
 
 fn load_record_set(
     archive: u16,
@@ -581,12 +581,12 @@ fn load_record_set(
 }
 
 pub struct EnemySpriteSet {
-    walk: RecordSet,
-    attack: RecordSet,
-    idle: Option<RecordSet>,
+    pub walk: RecordSet,
+    pub attack: RecordSet,
+    pub idle: Option<RecordSet>,
 }
 
-fn build_enemy_sprites(
+pub fn build_enemy_sprites(
     archive: u16,
     has_idle: bool,
     data: &GameData,

@@ -1,3 +1,19 @@
+//! Texture delle mod: file `.dfmod` (DREAM, ecc.) **e** file sciolti in
+//! `StreamingAssets/Textures` (`*.png`).
+//!
+//! - I `.dfmod` sono indicizzati all'avvio (solo il container, veloce). Le texture
+//!   vengono decodificate alla prima richiesta e messe in cache.
+//! - I file sciolti vengono solo *indicizzati* all'avvio (path per nome file);
+//!   il contenuto viene letto e decodificato alla prima richiesta.
+//! - Priorità per l'albedo:
+//!     1. file sciolto in `StreamingAssets/Textures` (override esplicito dell'utente);
+//!     2. `.dfmod` con nome esatto (DREAM, ecc.);
+//!     3. materiale Unity dentro `.dfmod`;
+//!     4. fallback vanilla gestito dal chiamante (`TEXTURE.nnn` originale).
+//!
+//!   In questo modo basta copiare un PNG modificato nella cartella perché venga
+//!   usato al posto della texture DREAM, senza toccare il `.dfmod`.
+
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -48,6 +64,13 @@ pub struct ModTextures {
     materials_by_key: HashMap<(u32, u32, u32), Entry>,
     /// Normal, emissione e metallico gia' convertiti: ((mod, nome#proprieta'), ordine grezzo) -> immagine.
     map_handles: HashMap<(Entry, bool), Option<Handle<Image>>>,
+
+    /// Texture sciolte (`StreamingAssets/Textures`): nome file minuscolo senza
+    /// estensione → path sul disco.
+    loose_paths: HashMap<String, PathBuf>,
+    /// Cache degli handle delle texture sciolte già decodificate (una sola volta).
+    loose_handles: HashMap<String, Option<Handle<Image>>>,
+
     pub nearest_filter: bool,
 }
 
@@ -133,7 +156,6 @@ impl ModTextures {
                     unparsed.push(name.to_owned());
                 }
             }
-            // Indicizza con chiave minuscola per lookup case-insensitive
             self.by_name.insert(name.to_ascii_lowercase(), entry);
             tex_count += 1;
         }
@@ -166,7 +188,8 @@ impl ModTextures {
                 Some(k) if k.kind == MapKind::Albedo => {
                     *mod_coverage.entry(k.archive).or_default() += 1;
                     *self.coverage.entry(k.archive).or_default() += 1;
-                    self.materials_by_key.insert((k.archive, k.record, k.frame), (idx, name.to_owned()));
+                    self.materials_by_key
+                    .insert((k.archive, k.record, k.frame), (idx, name.to_owned()));
                     material_count += 1;
                 }
                 _ => {
@@ -196,6 +219,88 @@ impl ModTextures {
 
         self.archives.push(m);
         Ok(())
+    }
+
+    /// Indicizza tutti i file `*.png` di una cartella. Il caricamento vero avviene
+    /// al primo `image_by_name` / `image_by_key` che lo richiede.
+    pub fn load_loose_dir(&mut self, dir: &Path) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            warn!("Cartella texture sciolte `{}` non trovata, salto", dir.display());
+            return;
+        };
+        let mut count = 0usize;
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+            if ext != "png" {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            self.loose_paths.insert(stem.to_ascii_lowercase(), path);
+            count += 1;
+        }
+        info!("Indicizzate {} texture sciolte da {}", count, dir.display());
+        if count > 0 {
+            let mut sample: Vec<&String> = self.loose_paths.keys().take(20).collect();
+            sample.sort();
+            info!("  esempi: {:?}", sample);
+        }
+    }
+
+    /// Decodifica (una sola volta) una texture sciolta e ne restituisce l'handle.
+    fn load_loose(&mut self, name: &str, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+        let key = name.to_ascii_lowercase();
+        if let Some(cached) = self.loose_handles.get(&key) {
+            return cached.clone();
+        }
+        let path = self.loose_paths.get(&key)?.clone();
+
+        let handle = (|| -> Option<Handle<Image>> {
+            let reader = image::ImageReader::open(&path).ok()?;
+            let dyn_img = reader.decode().ok()?;
+            let rgba = dyn_img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let mut image = Image::new(
+                Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                rgba.into_raw(),
+                                       BevyFormat::Rgba8UnormSrgb,
+                                       RenderAssetUsages::RENDER_WORLD,
+            );
+            image.sampler = if self.nearest_filter {
+                ImageSampler::nearest()
+            } else {
+                ImageSampler::linear()
+            };
+            let size = UVec2::new(w, h);
+            let handle = images.add(image);
+            self.sizes.insert(handle.id(), size);
+            Some(handle)
+        })();
+
+        if handle.is_some() {
+            debug!("texture sciolta caricata: {}", path.display());
+        } else {
+            warn!("texture sciolta non decodificabile: {}", path.display());
+        }
+        self.loose_handles.insert(key, handle.clone());
+        handle
     }
 
     /// Quante texture 2D delle mod riguardano questo archivio di Daggerfall.
@@ -273,19 +378,48 @@ impl ModTextures {
         Some(images.add(image))
     }
 
-    pub fn image_by_key(&mut self, key: &TextureKey, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+    /// Restituisce l'albedo di (archivio, record, frame).
+    ///
+    /// **Priorità**:
+    /// 1. file sciolto in `StreamingAssets/Textures` (override esplicito dell'utente);
+    /// 2. `.dfmod` con nome esatto;
+    /// 3. materiale Unity dentro `.dfmod`.
+    pub fn image_by_key(
+        &mut self,
+        key: &TextureKey,
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
+        if matches!(key.kind, MapKind::Albedo) {
+            for name in albedo_loose_names(key) {
+                if self.loose_paths.contains_key(&name) {
+                    if let Some(h) = self.load_loose(&name, images) {
+                        info!(
+                            "override albedo: `{}` (archivio {} record {} frame {})",
+                              name, key.archive, key.record, key.frame
+                        );
+                        return Some(h);
+                    }
+                }
+            }
+        }
         if let Some(entry) = self.by_key.get(key).cloned() {
             let srgb = !matches!(key.kind, MapKind::Normal | MapKind::MetallicGloss);
             return self.load_2d(entry, srgb, images);
         }
-        // Nessuna texture 2D con questo nome: la mod puo' fornirla come materiale Unity.
         self.material_image(key, images)
     }
 
     /// Texture assegnata dalla mod al materiale (archivio, record, frame): `_MainTex` per l'albedo,
     /// `_BumpMap`, `_EmissionMap`, `_MetallicGlossMap` per le altre mappe.
-    fn material_image(&mut self, key: &TextureKey, images: &mut Assets<Image>) -> Option<Handle<Image>> {
-        let (idx, mat_name) = self.materials_by_key.get(&(key.archive, key.record, key.frame))?.clone();
+    fn material_image(
+        &mut self,
+        key: &TextureKey,
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
+        let (idx, mat_name) = self
+        .materials_by_key
+        .get(&(key.archive, key.record, key.frame))?
+        .clone();
         let property = match key.kind {
             MapKind::Albedo => "_MainTex",
             MapKind::Normal => "_BumpMap",
@@ -323,8 +457,6 @@ impl ModTextures {
     }
 
     /// Normal, emissione e metallico HD di (archivio, record, frame), convertiti per Bevy.
-    /// `raw_order`: l'albedo e' un BC7 nell'ordine di Unity (riga 0 in basso, vedi `needs_v_flip`):
-    /// le mappe devono avere lo stesso ordine per condividere la stessa trasformazione UV.
     pub fn material_maps(
         &mut self,
         archive: u32,
@@ -335,8 +467,22 @@ impl ModTextures {
     ) -> HdMaps {
         HdMaps {
             normal: self.material_map(archive, record, frame, MapKind::Normal, raw_order, images),
-            metallic_roughness: self.material_map(archive, record, frame, MapKind::MetallicGloss, raw_order, images),
-            emission: self.material_map(archive, record, frame, MapKind::Emission, raw_order, images),
+            metallic_roughness: self.material_map(
+                archive,
+                record,
+                frame,
+                MapKind::MetallicGloss,
+                raw_order,
+                images,
+            ),
+            emission: self.material_map(
+                archive,
+                record,
+                frame,
+                MapKind::Emission,
+                raw_order,
+                images,
+            ),
         }
     }
 
@@ -351,7 +497,12 @@ impl ModTextures {
         raw_order: bool,
         images: &mut Assets<Image>,
     ) -> Option<Handle<Image>> {
-        let key = TextureKey { archive, record, frame, kind };
+        let key = TextureKey {
+            archive,
+            record,
+            frame,
+            kind,
+        };
         let property = match kind {
             MapKind::Albedo => "_MainTex",
             MapKind::Normal => "_BumpMap",
@@ -383,9 +534,14 @@ impl ModTextures {
         handle
     }
 
-    /// Converte una mappa nel formato di Bevy. I BC7 non si decodificano su CPU: restano utilizzabili
-    /// solo come emissione (e come normale se `ASSUME_BC7_NORMALS_ARE_RGB`), e solo nell'ordine grezzo.
-    fn decode_map(&self, name: &str, tex: Texture2D, kind: MapKind, raw_order: bool) -> Option<Image> {
+    /// Converte una mappa nel formato di Bevy.
+    fn decode_map(
+        &self,
+        name: &str,
+        tex: Texture2D,
+        kind: MapKind,
+        raw_order: bool,
+    ) -> Option<Image> {
         let srgb = matches!(kind, MapKind::Albedo | MapKind::Emission);
         if tex.format == DfFormat::BC7 {
             let usable = raw_order
@@ -395,17 +551,26 @@ impl ModTextures {
                 MapKind::MetallicGloss => false,
             };
             if !usable {
-                debug!("mappa {kind:?} di `{name}` in BC7 non usabile (ordine grezzo: {raw_order})");
+                debug!(
+                    "mappa {kind:?} di `{name}` in BC7 non usabile (ordine grezzo: {raw_order})"
+                );
                 return None;
             }
             return self.image_from_texture(name, tex, srgb);
         }
         let (width, height) = (tex.width, tex.height);
-        let decoded = if raw_order { tex.to_rgba8() } else { tex.to_rgba8_top_down() };
+        let decoded = if raw_order {
+            tex.to_rgba8()
+        } else {
+            tex.to_rgba8_top_down()
+        };
         let mut px = match decoded {
             Ok(px) => px,
             Err(e) => {
-                warn!("Impossibile decodificare la mappa {kind:?} di `{name}` ({}): {e}", tex.format.name());
+                warn!(
+                    "Impossibile decodificare la mappa {kind:?} di `{name}` ({}): {e}",
+                      tex.format.name()
+                );
                 return None;
             }
         };
@@ -417,13 +582,25 @@ impl ModTextures {
             _ => {}
         }
         let mut image = Image::new(
-            Extent3d { width, height, depth_or_array_layers: 1 },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             TextureDimension::D2,
             px,
-            if srgb { BevyFormat::Rgba8UnormSrgb } else { BevyFormat::Rgba8Unorm },
-                RenderAssetUsages::RENDER_WORLD,
+            if srgb {
+                BevyFormat::Rgba8UnormSrgb
+            } else {
+                BevyFormat::Rgba8Unorm
+            },
+            RenderAssetUsages::RENDER_WORLD,
         );
-        image.sampler = if self.nearest_filter { ImageSampler::nearest() } else { ImageSampler::linear() };
+        image.sampler = if self.nearest_filter {
+            ImageSampler::nearest()
+        } else {
+            ImageSampler::linear()
+        };
         Some(image)
     }
 
@@ -435,27 +612,80 @@ impl ModTextures {
         Some(MaterialParams {
             color: material.colors.get("_Color").copied().unwrap_or([1.0; 4]),
              metallic: float("_Metallic").unwrap_or(0.0),
-             glossiness: float("_Glossiness").or_else(|| float("_Smoothness")).unwrap_or(0.1),
-             emission: material.colors.get("_EmissionColor").map(|c| [c[0], c[1], c[2]]),
+             glossiness: float("_Glossiness")
+             .or_else(|| float("_Smoothness"))
+             .unwrap_or(0.1),
+             emission: material
+             .colors
+             .get("_EmissionColor")
+             .map(|c| [c[0], c[1], c[2]]),
         })
     }
 
+    /// Restituisce l'immagine con un nome libero (usato per icone, sprite, ritratti,
+    /// bussola, armi in prima persona).
+    ///
+    /// **Priorità**:
+    /// 1. file sciolto in `StreamingAssets/Textures`;
+    /// 2. `.dfmod` con nome esatto.
     pub fn image_by_name(&mut self, name: &str, images: &mut Assets<Image>) -> Option<Handle<Image>> {
-        let entry = self.by_name.get(&name.to_ascii_lowercase())?.clone();
-        self.load_2d(entry, true, images)
+        let lower = name.to_ascii_lowercase();
+        if self.loose_paths.contains_key(&lower) {
+            if let Some(h) = self.load_loose(&lower, images) {
+                info!("override per nome: `{}`", name);
+                return Some(h);
+            }
+        }
+        if let Some(entry) = self.by_name.get(&lower).cloned() {
+            return self.load_2d(entry, true, images);
+        }
+        None
     }
 
     /// Dimensioni in pixel (larghezza, altezza) di una texture 2D della mod, senza caricarla
-    /// in `Assets<Image>`. Utile perche' le immagini create con `RENDER_WORLD` spariscono da
-    /// `Assets<Image>` dopo il primo upload sulla GPU e `images.get()` non le trova piu'.
+    /// in `Assets<Image>`. Per i PNG sciolti legge solo l'header del file.
     pub fn size_by_name(&self, name: &str) -> Option<(u32, u32)> {
-        let (idx, entry_name) = self.by_name.get(&name.to_ascii_lowercase())?;
-        let tex = self.archives[*idx].texture(entry_name).ok()??;
-        Some((tex.width, tex.height))
+        let lower = name.to_ascii_lowercase();
+        if let Some((idx, entry_name)) = self.by_name.get(&lower) {
+            let tex = self.archives[*idx].texture(entry_name).ok()??;
+            return Some((tex.width, tex.height));
+        }
+        if let Some(Some(handle)) = self.loose_handles.get(&lower) {
+            return self.sizes.get(&handle.id()).map(|s| (s.x, s.y));
+        }
+        self.loose_size(&lower)
     }
 
-    /// Questa immagine va mostrata con la V capovolta (BC7)? Gli sprite e le icone HD delle mod
-    /// DREAM sono BC7; quelli decodificati su CPU (PNG, DXT) sono gia' nel verso giusto.
+    /// Dimensioni di un PNG sciolto lette direttamente dal file (solo header, molto veloce).
+    pub fn loose_size(&self, name: &str) -> Option<(u32, u32)> {
+        let path = self.loose_paths.get(&name.to_ascii_lowercase())?;
+        image::image_dimensions(path).ok()
+    }
+
+    /// Cerca un nome che inizia per `prefix` senza caricarlo. Stessa logica di
+    /// preferenza di `image_by_prefix`, ma restituisce solo il nome trovato.
+    pub fn find_by_prefix(&self, prefix: &str, prefer: &[String]) -> Option<String> {
+        let prefix = prefix.to_ascii_lowercase();
+        let mut matches: Vec<String> = self
+        .by_name
+        .keys()
+        .chain(self.loose_paths.keys())
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        matches.sort();
+        prefer
+        .iter()
+        .find_map(|p| matches.iter().find(|k| k.ends_with(p.as_str())))
+        .or_else(|| matches.iter().find(|k| **k == prefix))
+        .or_else(|| matches.first())
+        .cloned()
+    }
+
+    /// Questa immagine va mostrata con la V capovolta (BC7)?
     pub fn needs_v_flip(&self, handle: &Handle<Image>) -> bool {
         self.flipped.contains(&handle.id())
     }
@@ -465,8 +695,7 @@ impl ModTextures {
         self.sizes.get(&handle.id()).map(|s| s.as_vec2())
     }
 
-    /// Immagine HD di un'icona o di uno sprite di Daggerfall: prima la variante per materiale
-    /// (`{archivio}_{record}-{frame}_{materiale}`, come nelle mod delle armi), poi quella generica.
+    /// Immagine HD di un'icona o di uno sprite di Daggerfall.
     pub fn item_image(
         &mut self,
         archive: u32,
@@ -476,7 +705,6 @@ impl ModTextures {
         images: &mut Assets<Image>,
     ) -> Option<Handle<Image>> {
         if let Some(material) = material {
-            // Daggerfall Unity numera gli archivi con tre cifre ("083_5-0"): si provano entrambe.
             for name in [
                 format!("{archive:03}_{record}-{frame}_{material}"),
                     format!("{archive}_{record}-{frame}_{material}"),
@@ -489,8 +717,7 @@ impl ModTextures {
         self.albedo(archive, record, frame, images)
     }
 
-    /// Mappa albedo HD di (archivio, record, frame): prima la chiave interpretata, poi i nomi
-    /// con e senza zeri iniziali nell'archivio.
+    /// Mappa albedo HD di (archivio, record, frame).
     pub fn albedo(
         &mut self,
         archive: u32,
@@ -498,43 +725,40 @@ impl ModTextures {
         frame: u32,
         images: &mut Assets<Image>,
     ) -> Option<Handle<Image>> {
-        let key = TextureKey { archive, record, frame, kind: MapKind::Albedo };
+        let key = TextureKey {
+            archive,
+            record,
+            frame,
+            kind: MapKind::Albedo,
+        };
         self.image_by_key(&key, images)
-        .or_else(|| self.image_by_name(&format!("{archive:03}_{record}-{frame}"), images))
+        .or_else(|| {
+            self.image_by_name(&format!("{archive:03}_{record}-{frame}"), images)
+        })
         .or_else(|| self.image_by_name(&format!("{archive}_{record}-{frame}"), images))
     }
 
-    /// Prima immagine il cui nome (minuscolo) inizia per `prefix`. Fra piu' candidati si
-    /// preferisce quello che finisce con uno dei suffissi di `prefer` (nell'ordine dato).
-    /// Serve per i file che le mod nominano con estensione o suffissi di materiale diversi.
+    /// Prima immagine il cui nome inizia per `prefix`, con preferenza per i suffissi indicati.
     pub fn image_by_prefix(
         &mut self,
         prefix: &str,
         prefer: &[String],
         images: &mut Assets<Image>,
     ) -> Option<Handle<Image>> {
-        let prefix = prefix.to_ascii_lowercase();
-        let chosen = {
-            let mut matches: Vec<&String> = self.by_name.keys().filter(|k| k.starts_with(&prefix)).collect();
-            if matches.is_empty() {
-                return None;
-            }
-            matches.sort();
-            prefer
-            .iter()
-            .find_map(|p| matches.iter().find(|k| k.ends_with(p.as_str())))
-            // senza materiale preferito: la versione generica (nome == prefisso), poi la prima
-            .or_else(|| matches.iter().find(|k| ***k == prefix))
-            .or_else(|| matches.first())
-            .map(|k| k.to_string())?
-        };
+        let chosen = self.find_by_prefix(prefix, prefer)?;
         self.image_by_name(&chosen, images)
     }
 
     /// Nomi (minuscoli) che contengono `needle`: per i messaggi diagnostici.
     pub fn names_containing(&self, needle: &str, limit: usize) -> Vec<String> {
         let needle = needle.to_ascii_lowercase();
-        let mut found: Vec<String> = self.by_name.keys().filter(|k| k.contains(&needle)).cloned().collect();
+        let mut found: Vec<String> = self
+        .by_name
+        .keys()
+        .chain(self.loose_paths.keys())
+        .filter(|k| k.contains(&needle))
+        .cloned()
+        .collect();
         found.sort();
         found.truncate(limit);
         found
@@ -544,7 +768,12 @@ impl ModTextures {
         self.by_name.keys().map(String::as_str)
     }
 
-    fn load_2d(&mut self, entry: Entry, srgb: bool, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+    fn load_2d(
+        &mut self,
+        entry: Entry,
+        srgb: bool,
+        images: &mut Assets<Image>,
+    ) -> Option<Handle<Image>> {
         let id = (entry, srgb);
         if let Some(cached) = self.handles.get(&id) {
             return cached.clone();
@@ -581,21 +810,14 @@ impl ModTextures {
         self.image_from_texture(name, tex, srgb)
     }
 
-    /// Normal map caricata come `Rgba8Unorm` (lineare, non sRGB), con il canale
-    /// verde girato da DirectX a OpenGL e i pixel riportati alla convenzione
-    /// "bottom-up" per coerenza con l'albedo BC7.
-    ///
-    /// Questo metodo decodifica sempre su CPU, anche se la texture è BC7 nativa.
-    /// Il costo è 4 byte per pixel in più di VRAM per ogni normal map, ma permette
-    /// di correggere la convenzione del canale verde di DREAM.
+    /// Normal map caricata come `Rgba8Unorm` (lineare), con il canale verde girato
+    /// da DirectX a OpenGL e i pixel riportati alla convenzione "bottom-up".
     pub fn image_normal_by_key(
         &mut self,
         key: &TextureKey,
         images: &mut Assets<Image>,
     ) -> Option<Handle<Image>> {
         let entry = self.by_key.get(key)?.clone();
-        // Chiave separata dalla cache normale (`image_by_key` usa sRGB=true per
-        // l'albedo; qui sRGB=false), così non c'è collisione.
         let id = (entry.clone(), false);
         if let Some(cached) = self.handles.get(&id) {
             return cached.clone();
@@ -604,13 +826,7 @@ impl ModTextures {
         let result = (|| {
             let tex = self.archives[entry.0].texture(&entry.1).ok()??;
             let mut rgba = tex.to_rgba8_top_down().ok()?;
-
-            // `to_rgba8_top_down` produce pixel con row 0 = top; l'albedo BC7 di DREAM
-            // ha row 0 = bottom. Riportiamo la normal map alla stessa convenzione per
-            // poter usare lo stesso uv_transform dell'albedo.
             flip_v_in_place(&mut rgba, tex.width as usize, tex.height as usize);
-
-            // DirectX (Y giù) → OpenGL (Y su): inverte il canale verde.
             for chunk in rgba.chunks_exact_mut(4) {
                 chunk[1] = 255 - chunk[1];
             }
@@ -623,7 +839,7 @@ impl ModTextures {
                 },
                 TextureDimension::D2,
                 rgba,
-                BevyFormat::Rgba8Unorm, // lineare, le normal map non sono sRGB
+                BevyFormat::Rgba8Unorm,
                 BevyRenderAssetUsages::RENDER_WORLD,
             );
             image.sampler = if self.nearest_filter {
@@ -638,10 +854,8 @@ impl ModTextures {
         result
     }
 
-    /// Converte una `Texture2D` della mod in `Image` di Bevy (BC7 diretto, il resto decodificato su CPU).
+    /// Converte una `Texture2D` della mod in `Image` di Bevy.
     fn image_from_texture(&self, name: &str, tex: Texture2D, srgb: bool) -> Option<Image> {
-
-        // Supporto nativo hardware per BC7 (usato da DREAM - Sprites)
         if tex.format == DfFormat::BC7 {
             let mut image = Image::new(
                 Extent3d {
@@ -651,37 +865,78 @@ impl ModTextures {
                 },
                 TextureDimension::D2,
                 tex.data.clone(),
-                                       if srgb { BevyFormat::Bc7RgbaUnormSrgb } else { BevyFormat::Bc7RgbaUnorm },
-                                           RenderAssetUsages::RENDER_WORLD,
+                                       if srgb {
+                                           BevyFormat::Bc7RgbaUnormSrgb
+                                       } else {
+                                           BevyFormat::Bc7RgbaUnorm
+                                       },
+                                       RenderAssetUsages::RENDER_WORLD,
             );
             image.texture_descriptor.mip_level_count = tex.mip_count;
-            image.sampler = if self.nearest_filter { ImageSampler::nearest() } else { ImageSampler::linear() };
+            image.sampler = if self.nearest_filter {
+                ImageSampler::nearest()
+            } else {
+                ImageSampler::linear()
+            };
             return Some(image);
         }
 
-        // Formati non compressi o DXT decodificabili su CPU
         let rgba = match tex.to_rgba8_top_down() {
             Ok(px) => px,
             Err(e) => {
-                warn!("Impossibile decodificare `{name}` ({}): {e}", tex.format.name());
+                warn!(
+                    "Impossibile decodificare `{name}` ({}): {e}",
+                      tex.format.name()
+                );
                 return None;
             }
         };
 
         let mut image = Image::new(
-            Extent3d { width: tex.width, height: tex.height, depth_or_array_layers: 1 },
+            Extent3d {
+                width: tex.width,
+                height: tex.height,
+                depth_or_array_layers: 1,
+            },
             TextureDimension::D2,
             rgba,
-            if srgb { BevyFormat::Rgba8UnormSrgb } else { BevyFormat::Rgba8Unorm },
-                RenderAssetUsages::RENDER_WORLD,
+            if srgb {
+                BevyFormat::Rgba8UnormSrgb
+            } else {
+                BevyFormat::Rgba8Unorm
+            },
+            RenderAssetUsages::RENDER_WORLD,
         );
-        image.sampler = if self.nearest_filter { ImageSampler::nearest() } else { ImageSampler::linear() };
+        image.sampler = if self.nearest_filter {
+            ImageSampler::nearest()
+        } else {
+            ImageSampler::linear()
+        };
         Some(image)
     }
 }
 
+/// Nomi possibili per una texture albedo sciolta (`StreamingAssets/Textures`).
+/// DFU usa `{archive}_{record}-{frame}.png`, con o senza padding a 3 cifre,
+/// e per gli oggetti a frame singolo anche `{archive}_{record}.png`.
+fn albedo_loose_names(key: &TextureKey) -> Vec<String> {
+    let mut names = Vec::new();
+    let (a, r, f) = (key.archive, key.record, key.frame);
+    if f > 0 {
+        names.push(format!("{:03}_{}-{}", a, r, f));
+        names.push(format!("{}_{}-{}", a, r, f));
+    }
+    names.push(format!("{:03}_{}-0", a, r));
+    names.push(format!("{}_{}-0", a, r));
+    names.push(format!("{:03}_{}", a, r));
+    names.push(format!("{}_{}", a, r));
+    names
+}
+
 pub struct ModTexturesPlugin {
     pub dir: PathBuf,
+    /// Cartella opzionale di texture sciolte (`*.png`).
+    pub textures_dir: Option<PathBuf>,
     pub nearest_filter: bool,
 }
 
@@ -689,6 +944,7 @@ impl Default for ModTexturesPlugin {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("mods"),
+            textures_dir: None,
             nearest_filter: false,
         }
     }
@@ -701,6 +957,9 @@ impl Plugin for ModTexturesPlugin {
             ..Default::default()
         };
         mods.load_dir(&self.dir);
+        if let Some(td) = &self.textures_dir {
+            mods.load_loose_dir(td);
+        }
         app.insert_resource(mods);
     }
 }
@@ -711,7 +970,6 @@ mod tests {
 
     #[test]
     fn dxt5nm_normal_gets_its_z_back() {
-        // pixel DXT5nm piatto: x = y = 0 -> R=255, G=128, A=128; Z deve diventare ~255
         let mut px = vec![255, 128, 0, 128, 255, 128, 0, 128];
         assert!(convert_unity_normal(&mut px));
         assert_eq!(&px[0..4], &[128, 128, 255, 255]);
@@ -726,9 +984,31 @@ mod tests {
 
     #[test]
     fn unity_metallic_map_is_converted_to_gltf_layout() {
-        // R = metallico 200, A = liscio 100  ->  B = 200, G = 155
         let mut px = vec![200, 9, 9, 100];
         convert_unity_metallic(&mut px);
         assert_eq!(px, [255, 155, 200, 255]);
+    }
+
+    #[test]
+    fn albedo_loose_names_cover_common_patterns() {
+        let key = TextureKey {
+            archive: 381,
+            record: 0,
+            frame: 0,
+            kind: MapKind::Albedo,
+        };
+        let names = albedo_loose_names(&key);
+        assert!(names.contains(&"381_0-0".to_string()));
+        assert!(names.contains(&"381_0".to_string()));
+
+        let key = TextureKey {
+            archive: 381,
+            record: 0,
+            frame: 3,
+            kind: MapKind::Albedo,
+        };
+        let names = albedo_loose_names(&key);
+        assert!(names[0] == "381_0-3");
+        assert!(names[1] == "381_0-3");
     }
 }

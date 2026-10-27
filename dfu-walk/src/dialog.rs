@@ -13,6 +13,13 @@
 //! caption di FLATS.CFG per quelli interni, razza e sesso ricavati dal volto per i passanti) che
 //! il LLM usa per far parlare proprio quella persona. Nell'attesa il dialogo mostra un messaggio e
 //! si aggiorna da solo quando la voce e' pronta; se non si puo' generare si ripiega sul tono.
+//!
+//! Con `2` si scrive una domanda libera: il LLM risponde come il PNG, che conosce solo il nome della
+//! citta'. Mentre si scrive la tastiera e' del campo di testo (Invio invia, Esc annulla) e i comandi
+//! del gioco sono bloccati: le lettere non aprono mappe ne' fanno uscire dagli edifici.
+//!
+//! Quello che il PNG dice viene anche pronunciato (vedi `tts.rs`): il dialogo manda un
+//! `SpeakEvent` con il testo e i descrittori del PNG (genere, ruolo, carattere).
 //! E o Esc chiudono.
 
 use crate::data::city_map::PoiKind;
@@ -22,10 +29,13 @@ use crate::interior::{InteriorNpc, InteriorState};
 use crate::mod_textures::ModTextures;
 use crate::player::Player;
 use crate::quests::{
-    describe_npc, face_key, flat_key, temperament_for, tone_for_npc, walker_key, walker_look, Hint, QuestBook,
-    QuestWorker, Tone, VoiceState,
+    clean_question, describe_npc, face_key, flat_key, temperament_for, tone_for_npc, walker_key, walker_look, Hint,
+    QuestBook, QuestWorker, Tone, VoiceState, QUESTION_MAX_CHARS,
 };
 use crate::tiles::NpcWalker;
+use crate::tts::{gender_from_caption, gender_from_look, Gender, SpeakEvent, Speaker};
+use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::ButtonState;
 use crate::world::{map_pixel_of, GameData, Origin};
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssetUsages;
@@ -48,7 +58,11 @@ const PORTRAIT_CROP: f32 = 0.45;
 
 // Menu e voci
 const DIALOG_TEXT_MAX_WIDTH: f32 = 760.0;
-const MENU_TEXT: &str = "[1] Ascolta rumori        [E] Congeda";
+const MENU_TEXT: &str = "[1] Ascolta rumori      [2] Fai una domanda      [E] Congeda";
+/// Mentre si scrive una domanda.
+const ASK_HINT: &str = "Scrivi la tua domanda     [Invio] invia     [Esc] annulla";
+const INPUT_FONT_SIZE: f32 = 28.0;
+const INPUT_COLOR: Color = Color::srgb(0.95, 0.95, 0.85);
 const MENU_FONT_SIZE: f32 = 28.0;
 const MENU_COLOR: Color = Color::srgb(0.85, 0.8, 0.55);
 const RUMOR_FONT_SIZE: f32 = 30.0;
@@ -163,6 +177,10 @@ struct DialogLine;
 #[derive(Component)]
 struct DialogOptions;
 
+/// La riga in cui si scrive la domanda (poi ne resta l'eco).
+#[derive(Component)]
+struct DialogInput;
+
 /// Con chi si sta parlando: decide quale voce racconta.
 #[derive(Resource, Default)]
 pub struct DialogContext {
@@ -180,6 +198,13 @@ pub struct DialogContext {
     voice: Option<NpcVoiceInfo>,
     /// Si sta aspettando la voce dal thread del LLM.
     awaiting: bool,
+    /// Nome della citta' in cui ci si trova: l'unica cosa che il PNG sa del posto.
+    city_name: String,
+    /// Si sta scrivendo una domanda: la tastiera e' del campo di testo.
+    typing: bool,
+    buffer: String,
+    /// Domanda inviata al LLM, in attesa della risposta.
+    asking: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -190,11 +215,30 @@ struct NpcVoiceInfo {
     label: String,
     /// Il blocco di descrizione che si passa al LLM.
     description: String,
+    /// Descrittori per la voce parlata (vedi `tts.rs`).
+    gender: Option<Gender>,
+    role: Option<Tone>,
+    temperament: &'static str,
 }
 
 impl DialogContext {
     fn with_voice(mut self, key: String, label: String, description: String) -> Self {
-        self.voice = Some(NpcVoiceInfo { key, label, description });
+        self.voice = Some(NpcVoiceInfo { key, label, description, ..Default::default() });
+        self
+    }
+
+    fn with_city_name(mut self, name: String) -> Self {
+        self.city_name = name;
+        self
+    }
+
+    /// Genere, ruolo e carattere del PNG, per scegliere la sua voce parlata.
+    fn with_speaker(mut self, gender: Option<Gender>, role: Option<Tone>, temperament: &'static str) -> Self {
+        if let Some(voice) = self.voice.as_mut() {
+            voice.gender = gender;
+            voice.role = role;
+            voice.temperament = temperament;
+        }
         self
     }
 
@@ -213,6 +257,10 @@ impl DialogContext {
             dirty: true,
             voice: None,
             awaiting: false,
+            city_name: String::new(),
+            typing: false,
+            buffer: String::new(),
+            asking: None,
         }
     }
 }
@@ -236,6 +284,14 @@ fn flavor_message(book: &QuestBook, ctx: &DialogContext) -> Option<String> {
     let text = book.npc_flavor(city, a, r)?;
     let label = ctx.npc_caption.clone().unwrap_or_else(|| "NPC".to_string());
     Some(format!("{}: \"{}\"", label, ascii_punctuation(text)))
+}
+
+/// La parte pronunciata di un messaggio `Etichetta: "testo"`: il testo tra virgolette. I messaggi
+/// senza virgolette (risposta neutra, attesa) non si pronunciano.
+fn spoken_part(message: &str) -> Option<String> {
+    let start = message.find(": \"")? + 3;
+    let end = message.rfind('"')?;
+    (end > start).then(|| message[start..end].to_string())
 }
 
 /// Cosa mostrare scegliendo "Ascolta rumori".
@@ -324,6 +380,8 @@ impl Plugin for DialogPlugin {
         .init_resource::<FacePortraits>()
         .init_resource::<DialogContext>()
         .add_systems(Startup, setup_dialog_ui)
+        // mentre si scrive, i tasti vengono azzerati PRIMA di tutti i sistemi di gioco
+        .add_systems(PreUpdate, reset_keys_while_typing.after(bevy::input::InputSystem))
         .add_systems(Update, dialog_menu.after(update_dialog))
         .add_systems(
             Update,
@@ -378,9 +436,16 @@ fn setup_dialog_ui(mut commands: Commands, assets: Res<AssetServer>) {
             ));
             column.spawn((
                 Text::new(MENU_TEXT),
-                          TextFont { font, font_size: MENU_FONT_SIZE, ..default() },
+                          TextFont { font: font.clone(), font_size: MENU_FONT_SIZE, ..default() },
                           TextColor(MENU_COLOR),
                           DialogOptions,
+            ));
+            column.spawn((
+                Text::new(""),
+                TextFont { font, font_size: INPUT_FONT_SIZE, ..default() },
+                TextColor(INPUT_COLOR),
+                Visibility::Hidden,
+                DialogInput,
             ));
         });
     });
@@ -413,6 +478,10 @@ pub fn update_dialog(
 ) {
     let pressed_e = keys.just_pressed(KeyCode::KeyE);
     if state.open {
+        // la tastiera e' del campo di testo: E ed Esc non chiudono il dialogo
+        if ctx.typing {
+            return;
+        }
         if pressed_e || keys.just_pressed(KeyCode::Escape) {
             close_dialog(&mut state, &mut root);
             if pressed_e {
@@ -445,11 +514,11 @@ pub fn update_dialog(
                 // Cattura il flat dell'NPC per cercare la voce flavor dedicata
                 let npc_flat = Some((npc.flat_archive, npc.flat_record));
                 let catalog = flats_catalog.get_or_insert_with(|| FlatCatalog::load(&data.dir));
-                let npc_caption = catalog
-                .get(npc.flat_archive, npc.flat_record)
-                .map(|i| i.caption.clone());
+                let flat_info = catalog.get(npc.flat_archive, npc.flat_record);
+                let npc_caption = flat_info.map(|i| i.caption.clone());
 
                 let city = map_pixel_of(&origin, player_pos);
+                let city_name = data.locations.get(&city).map(|l| l.name.clone()).unwrap_or_default();
                 let place = interior.kind();
                 let tone = tone_for_npc(npc.face_record as u64, city, place);
                 // con la caption di FLATS.CFG il PNG e' descritto da quella; altrimenti dal volto
@@ -457,9 +526,20 @@ pub fn update_dialog(
                     Some(caption) => (flat_key(npc.flat_archive, npc.flat_record), caption.clone(), None),
                     None => (face_key(npc.face_record), "an ordinary townsperson".to_string(), Some(tone.role())),
                 };
-                let description = describe_npc(&who, role, place, temperament_for(&key, city));
+                let temperament = temperament_for(&key, city);
+                let description = describe_npc(&who, role, place, temperament);
+                // genere: dalla caption se lo dice, altrimenti dal blocco del volto
+                let gender = flat_info
+                .and_then(|i| match i.gender {
+                    1 => Some(Gender::Male),
+                          2 => Some(Gender::Female),
+                          _ => None,
+                })
+                .or_else(|| npc_caption.as_deref().and_then(gender_from_caption));
                 *ctx = DialogContext::new(npc.face_record as u64, city, place, npc_flat, npc_caption)
-                    .with_voice(key, who, description);
+                    .with_voice(key, who, description)
+                    .with_speaker(gender, role.map(|_| tone), temperament)
+                    .with_city_name(city_name);
                 if let Ok((mut image_node, mut node)) = portrait.get_single_mut() {
                     image_node.image = face;
                     image_node.rect = None;
@@ -492,17 +572,18 @@ pub fn update_dialog(
     let Some((_, npc)) = nearest_ext else { return };
 
     let city = map_pixel_of(&origin, player_pos);
+    let city_name = data.locations.get(&city).map(|l| l.name.clone()).unwrap_or_default();
     let face = npc.face_record().unwrap_or(0);
     let tone = tone_for_npc(face as u64, city, None);
     // i passanti non hanno una riga in FLATS.CFG: razza e sesso si ricavano dal volto
     let look = walker_look(face);
     let key = walker_key(face);
-    let description = describe_npc(look, Some(tone.role()), None, temperament_for(&key, city));
-    *ctx = DialogContext::new(face as u64, city, None, None, None).with_voice(
-        key,
-        format!("{look} ({})", tone.role()),
-        description,
-    );
+    let temperament = temperament_for(&key, city);
+    let description = describe_npc(look, Some(tone.role()), None, temperament);
+    *ctx = DialogContext::new(face as u64, city, None, None, None)
+        .with_voice(key, format!("{look} ({})", tone.role()), description)
+        .with_speaker(gender_from_look(look), Some(tone), temperament)
+        .with_city_name(city_name);
     let (image, crop, width, height, is_hd) =
     match npc.face_record().and_then(|r| faces.get(r, &data, &mut mods, &mut images)) {
         Some((face, is_hd)) => (face, None, FACE_DISPLAY_SIZE, FACE_DISPLAY_SIZE, is_hd),
@@ -540,25 +621,59 @@ pub fn update_dialog(
     keys.clear_just_pressed(KeyCode::KeyE);
 }
 
+/// Mentre si scrive una domanda i tasti del gioco sono azzerati prima di tutti i sistemi: le
+/// lettere non aprono mappe, non fanno uscire dagli edifici, non estraggono l'arma. Il testo
+/// arriva dagli eventi della tastiera, che questo non tocca.
+fn reset_keys_while_typing(ctx: Res<DialogContext>, mut keys: ResMut<ButtonInput<KeyCode>>) {
+    if ctx.typing {
+        keys.reset_all();
+    }
+}
+
+/// Aggiunge un carattere alla domanda, se e' stampabile e c'e' spazio.
+fn push_typed(buffer: &mut String, c: char) {
+    if !c.is_control() && buffer.chars().count() < QUESTION_MAX_CHARS {
+        buffer.push(c);
+    }
+}
+
+/// Quello che il PNG risponde a una domanda.
+fn answer_message(label: &str, result: &Result<String, ()>) -> String {
+    match result {
+        Ok(text) => format!("{label}: \"{}\"", ascii_punctuation(text)),
+        Err(()) => format!("{label} says nothing."),
+    }
+}
+
 /// Menu del dialogo aperto: rimette il saluto all'apertura; con `1` mostra la voce del PNG e, se
-/// va generata, aspetta il thread del LLM senza bloccare il gioco.
+/// va generata, aspetta il thread del LLM senza bloccare il gioco; con `2` si scrive una domanda
+/// libera a cui il PNG risponde in carattere.
 #[allow(clippy::too_many_arguments)]
 fn dialog_menu(
     keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
     state: Res<DialogState>,
     mut ctx: ResMut<DialogContext>,
     mut book: ResMut<QuestBook>,
     worker: Option<Res<QuestWorker>>,
+    mut speak: EventWriter<SpeakEvent>,
+    mut typed: EventReader<KeyboardInput>,
     assets: Res<AssetServer>,
-    mut line: Query<(&mut Text, &mut TextFont), (With<DialogLine>, Without<DialogOptions>)>,
-    mut options: Query<&mut Text, (With<DialogOptions>, Without<DialogLine>)>,
+    mut line: Query<(&mut Text, &mut TextFont), (With<DialogLine>, Without<DialogOptions>, Without<DialogInput>)>,
+    mut options: Query<&mut Text, (With<DialogOptions>, Without<DialogLine>, Without<DialogInput>)>,
+    mut input: Query<(&mut Text, &mut Visibility), (With<DialogInput>, Without<DialogLine>, Without<DialogOptions>)>,
 ) {
     if !state.open {
+        typed.clear();
         return;
     }
     if ctx.dirty {
         ctx.dirty = false;
         ctx.awaiting = false;
+        ctx.typing = false;
+        ctx.buffer.clear();
+        ctx.asking = None;
+        typed.clear();
         for (mut text, mut font) in &mut line {
             text.0 = DIALOG_TEXT.to_string();
             font.font = assets.load(DIALOG_FONT);
@@ -567,31 +682,142 @@ fn dialog_menu(
         for mut text in &mut options {
             text.0 = MENU_TEXT.to_string();
         }
+        for (mut text, mut visibility) in &mut input {
+            text.0.clear();
+            *visibility = Visibility::Hidden;
+        }
     }
+    let label = ctx.voice.as_ref().map_or_else(|| "NPC".to_string(), |v| v.label.clone());
     let mut shown: Option<String> = None;
-    if keys.just_pressed(KeyCode::Digit1) || keys.just_pressed(KeyCode::Numpad1) {
-        match npc_reply(&mut book, worker.as_deref(), &ctx) {
-            Reply::Say(message) => {
+
+    if ctx.typing {
+        // --- campo di testo: la tastiera e' sua finche' si scrive ---
+        let (mut submit, mut cancel) = (false, false);
+        for ev in typed.read() {
+            if ev.state != ButtonState::Pressed {
+                continue;
+            }
+            match &ev.logical_key {
+                Key::Enter => submit = true,
+                Key::Escape => cancel = true,
+                Key::Backspace => {
+                    ctx.buffer.pop();
+                }
+                Key::Space => push_typed(&mut ctx.buffer, ' '),
+                Key::Character(s) => {
+                    for c in s.chars() {
+                        push_typed(&mut ctx.buffer, c);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut finished = cancel;
+        if submit && !cancel {
+            match clean_question(&ctx.buffer) {
+                // domanda vuota: si continua a scrivere
+                None => {}
+                Some(question) => {
+                    finished = true;
+                    let description = ctx.voice.as_ref().map(|v| v.description.clone()).unwrap_or_default();
+                    match worker.as_deref().and_then(|w| w.ask(&ctx.city_name, &description, &question)) {
+                        Some(id) => {
+                            ctx.asking = Some(id);
+                            shown = Some(format!("{label} considers your question..."));
+                        }
+                        None => shown = Some(format!("{label} says nothing.")),
+                    }
+                    // resta l'eco della domanda sotto il menu
+                    for (mut text, mut visibility) in &mut input {
+                        text.0 = format!("> {question}");
+                        *visibility = Visibility::Inherited;
+                    }
+                }
+            }
+        }
+        if finished {
+            ctx.typing = false;
+            ctx.buffer.clear();
+            for mut text in &mut options {
+                text.0 = MENU_TEXT.to_string();
+            }
+            if cancel {
+                for (mut text, mut visibility) in &mut input {
+                    text.0.clear();
+                    *visibility = Visibility::Hidden;
+                }
+            }
+        } else {
+            // cursore lampeggiante
+            let cursor = if (time.elapsed_secs() * 2.0) as u32 % 2 == 0 { "_" } else { " " };
+            for (mut text, mut visibility) in &mut input {
+                text.0 = format!("> {}{cursor}", ctx.buffer);
+                *visibility = Visibility::Inherited;
+            }
+        }
+    } else {
+        typed.clear();
+        let idle = ctx.asking.is_none();
+        let pressed = |a: KeyCode, b: KeyCode| keys.just_pressed(a) || keys.just_pressed(b);
+        if idle && pressed(KeyCode::Digit2, KeyCode::Numpad2) {
+            if worker.is_none() {
+                shown = Some(format!("{label} doesn't seem to want to talk."));
+            } else {
+                ctx.typing = true;
+                ctx.awaiting = false;
+                ctx.buffer.clear();
+                for mut text in &mut options {
+                    text.0 = ASK_HINT.to_string();
+                }
+                for (mut text, mut visibility) in &mut input {
+                    text.0 = "> _".to_string();
+                    *visibility = Visibility::Inherited;
+                }
+            }
+        } else if idle && pressed(KeyCode::Digit1, KeyCode::Numpad1) {
+            match npc_reply(&mut book, worker.as_deref(), &ctx) {
+                Reply::Say(message) => {
+                    ctx.awaiting = false;
+                    shown = Some(message);
+                }
+                Reply::Wait(message) => {
+                    ctx.awaiting = true;
+                    shown = Some(message);
+                }
+            }
+        } else if ctx.awaiting {
+            // la voce arriva dal thread: appena e' pronta (o fallita) si mostra
+            if let Reply::Say(message) = npc_reply(&mut book, worker.as_deref(), &ctx) {
                 ctx.awaiting = false;
                 shown = Some(message);
             }
-            Reply::Wait(message) => {
-                ctx.awaiting = true;
-                shown = Some(message);
+        }
+        // la risposta alla domanda arriva dal thread
+        if let Some(id) = ctx.asking {
+            if let Some(result) = book.take_answer(id) {
+                ctx.asking = None;
+                shown = Some(answer_message(&label, &result));
             }
         }
-    } else if ctx.awaiting {
-        // la voce arriva dal thread: appena e' pronta (o fallita) si mostra
-        if let Reply::Say(message) = npc_reply(&mut book, worker.as_deref(), &ctx) {
-            ctx.awaiting = false;
-            shown = Some(message);
-        }
     }
+
     if let Some(message) = shown {
         for (mut text, mut font) in &mut line {
             text.0 = message.clone();
             font.font = assets.load(RUMOR_FONT);
             font.font_size = RUMOR_FONT_SIZE;
+        }
+        // il PNG pronuncia quello che dice
+        if let (Some(spoken), Some(voice)) = (spoken_part(&message), ctx.voice.as_ref()) {
+            speak.send(SpeakEvent {
+                text: spoken,
+                speaker: Speaker {
+                    key: voice.key.clone(),
+                    gender: voice.gender,
+                    role: voice.role,
+                    temperament: voice.temperament,
+                },
+            });
         }
     }
 }
@@ -747,8 +973,58 @@ mod tests {
     }
 
     #[test]
+    fn only_quoted_speech_is_spoken() {
+        assert_eq!(spoken_part("Nord woman (merchant): \"Hush, now.\"").as_deref(), Some("Hush, now."));
+        assert_eq!(spoken_part("guard: \"He said \"no\" to me.\"").as_deref(), Some("He said \"no\" to me."));
+        assert_eq!(spoken_part("They shrug. They don't seem to know anything about it."), None);
+        assert_eq!(spoken_part("You don't hear anything interesting."), None);
+        assert_eq!(spoken_part("old beggar is thinking about it..."), None);
+        assert_eq!(spoken_part("x: \"\""), None);
+    }
+
+    #[test]
+    fn speaker_descriptors_reach_the_voice_info() {
+        let ctx = voice_ctx(Some((1, 1))).with_speaker(Some(Gender::Female), Some(Tone::Noble), "proud");
+        let v = ctx.voice.unwrap();
+        assert_eq!((v.gender, v.role, v.temperament), (Some(Gender::Female), Some(Tone::Noble), "proud"));
+        assert_eq!(v.key, "walker:37");
+    }
+
+    #[test]
+    fn typed_characters_are_filtered_and_limited() {
+        let mut b = String::new();
+        for c in "Where is the inn?\n\t\u{7}è".chars() {
+            push_typed(&mut b, c);
+        }
+        assert_eq!(b, "Where is the inn?è"); // niente caratteri di controllo
+        let mut long = String::new();
+        for _ in 0..QUESTION_MAX_CHARS + 50 {
+            push_typed(&mut long, 'a');
+        }
+        assert_eq!(long.chars().count(), QUESTION_MAX_CHARS);
+    }
+
+    #[test]
+    fn answer_message_is_spoken_only_when_there_is_an_answer() {
+        let ok = answer_message("old beggar", &Ok("Daggerfall, friend. That's all I know.".to_string()));
+        assert_eq!(ok, "old beggar: \"Daggerfall, friend. That's all I know.\"");
+        assert_eq!(spoken_part(&ok).as_deref(), Some("Daggerfall, friend. That's all I know."));
+        let fail = answer_message("old beggar", &Err(()));
+        assert_eq!(fail, "old beggar says nothing.");
+        assert_eq!(spoken_part(&fail), None);
+        // la punteggiatura tipografica diventa ASCII
+        assert_eq!(answer_message("x", &Ok("It\u{2019}s \u{201c}fine\u{201d}.".to_string())), "x: \"It's \"fine\".\"");
+    }
+
+    #[test]
+    fn menu_offers_both_options() {
+        assert!(MENU_TEXT.contains("[1]") && MENU_TEXT.contains("[2]") && MENU_TEXT.contains("[E]"));
+        assert!(ASK_HINT.contains("[Invio]") && ASK_HINT.contains("[Esc]"));
+    }
+
+    #[test]
     fn waiting_text_names_the_npc() {
-        let v = NpcVoiceInfo { key: "k".into(), label: "old beggar".into(), description: String::new() };
+        let v = NpcVoiceInfo { key: "k".into(), label: "old beggar".into(), ..Default::default() };
         assert_eq!(waiting_text(&v), "old beggar is thinking about it...");
     }
 }

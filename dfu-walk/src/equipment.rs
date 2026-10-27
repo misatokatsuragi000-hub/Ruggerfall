@@ -23,16 +23,16 @@ pub const DOLL_WIDTH: usize = 110;
 pub const DOLL_HEIGHT: usize = 184;
 
 // --- UI Styling & Colors: Dark Fantasy Semitrasparente ---
-const OVERLAY: Color = Color::srgba(0.02, 0.015, 0.01, 0.45);          // Velo scuro leggero sul mondo di gioco
-const PANEL: Color = Color::srgba(0.10, 0.075, 0.055, 0.88);           // Noce e cuoio semi-trasparente (alpha 0.72)
-const PANEL_BORDER: Color = Color::srgba(0.75, 0.58, 0.28, 0.50);      // Bordo in ottone lucido
-const CARD: Color = Color::srgba(0.12, 0.09, 0.065, 0.75);             // Schede interne traslucide (alpha 0.55)
-const SLOT_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.35);              // Incavi slot
-const SLOT_BORDER: Color = Color::srgba(0.60, 0.45, 0.22, 0.40);       // Bordi slot
-const ACCENT: Color = Color::srgb(0.96, 0.78, 0.32);                   // Oro splendente
-const EQUIPPED_GREEN: Color = Color::srgb(0.40, 0.88, 0.45);           // Verde smeraldo per equipaggiato
-const TEXT: Color = Color::srgb(0.96, 0.93, 0.85);                     // Pergamena chiara
-const MUTED: Color = Color::srgb(0.74, 0.67, 0.54);                    // Pergamena antica / sabbia calda
+const OVERLAY: Color = Color::srgba(0.02, 0.015, 0.01, 0.45);
+const PANEL: Color = Color::srgba(0.10, 0.075, 0.055, 0.88);
+const PANEL_BORDER: Color = Color::srgba(0.75, 0.58, 0.28, 0.50);
+const CARD: Color = Color::srgba(0.12, 0.09, 0.065, 0.75);
+const SLOT_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.35);
+const SLOT_BORDER: Color = Color::srgba(0.60, 0.45, 0.22, 0.40);
+const ACCENT: Color = Color::srgb(0.96, 0.78, 0.32);
+const EQUIPPED_GREEN: Color = Color::srgb(0.40, 0.88, 0.45);
+const TEXT: Color = Color::srgb(0.96, 0.93, 0.85);
+const MUTED: Color = Color::srgb(0.74, 0.67, 0.54);
 
 const DOLL_HEIGHT_VH: f32 = 50.0;
 const DEFAULT_DOLL_ASPECT: f32 = DOLL_WIDTH as f32 / DOLL_HEIGHT as f32;
@@ -759,21 +759,16 @@ fn compose_doll(
         rgba[o..o + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
     };
 
-    // 1. Body
     for (i, &index) in body.pixels.iter().enumerate() {
         let bx = body.x + (i % body.width) as i32;
         let by = body.y + (i / body.width) as i32;
         put(bx, by, index);
     }
-
-    // 2. Head
     for (i, &index) in head.pixels.iter().enumerate() {
         let hx = head.x + (i % head.width) as i32;
         let hy = head.y + (i / head.width) as i32;
         put(hx, hy, index);
     }
-
-    // 3. Armor and weapons/shields
     for armor in armor_pieces {
         for (i, &index) in armor.pixels.iter().enumerate() {
             let ax = armor.x + (i % armor.width) as i32;
@@ -943,7 +938,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                     BorderRadius::all(Val::Px(18.0)),
         ))
         .with_children(|panel| {
-            // Header
             panel
             .spawn(Node {
                 align_items: AlignItems::Center,
@@ -977,11 +971,9 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                 });
             });
 
-            // Main Section: [Left Slots] - [Paperdoll] - [Right Slots] - [Backpack Grid]
             panel
             .spawn(Node { align_items: AlignItems::FlexStart, column_gap: Val::Px(16.0), ..default() })
             .with_children(|body| {
-                // Left Slots
                 slot_column(body, &[
                     EquipSlot::Head,
                     EquipSlot::Shoulders,
@@ -991,7 +983,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                     EquipSlot::Feet,
                 ]);
 
-                // Paperdoll Card
                 body.spawn((
                     Node {
                         flex_direction: FlexDirection::Column,
@@ -1009,7 +1000,7 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                     card.spawn((
                         Node {
                             position_type: PositionType::Relative,
-                            left: Val::Px(-200.0), // <-- Offset a sinistra di 200 pixel
+                            left: Val::Px(-350.0),
                                 height: Val::Vh(DOLL_HEIGHT_VH),
                                 aspect_ratio: Some(DEFAULT_DOLL_ASPECT),
                                 ..default()
@@ -1033,7 +1024,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                     ));
                 });
 
-                // Right Slots
                 slot_column(body, &[
                     EquipSlot::RightHand,
                     EquipSlot::LeftHand,
@@ -1043,9 +1033,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                     EquipSlot::Cloak,
                 ]);
 
-                // ==========================================
-                // BACKPACK PANEL (ICON GRID)
-                // ==========================================
                 body.spawn((
                     Node {
                         width: Val::Px(350.0),
@@ -1060,7 +1047,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                             BorderRadius::all(Val::Px(16.0)),
                 ))
                 .with_children(|backpack_panel| {
-                    // Backpack Header
                     backpack_panel.spawn((
                         Node {
                             justify_content: JustifyContent::SpaceBetween,
@@ -1081,7 +1067,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                         ));
                     });
 
-                    // Backpack Icons Grid
                     backpack_panel.spawn((
                         Node {
                             flex_direction: FlexDirection::Row,
@@ -1110,7 +1095,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                                         BorderRadius::all(Val::Px(8.0)),
                             ))
                             .with_children(|slot_node| {
-                                // Item Icon
                                 slot_node.spawn((
                                     ImageNode::default(),
                                                  Node {
@@ -1120,7 +1104,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                                                  },
                                                  BackpackSlotIcon(idx),
                                 ));
-                                // Quick Key (1..9)
                                 slot_node.spawn((
                                     Node {
                                         position_type: PositionType::Absolute,
@@ -1132,7 +1115,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                                                  TextFont { font_size: 10.0, ..default() },
                                                  TextColor(MUTED),
                                 ));
-                                // Equipped "E" Badge
                                 slot_node.spawn((
                                     Node {
                                         position_type: PositionType::Absolute,
@@ -1160,9 +1142,6 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
         });
     });
 
-    // ==========================================
-    // FLOATING POPUP TOOLTIP
-    // ==========================================
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
@@ -1282,7 +1261,6 @@ pub fn toggle_equipment(
             }
         }
 
-        // Quick keys 1..9
         for (i, key) in [
             KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
             KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8,
@@ -1483,7 +1461,6 @@ fn update_inventory_ui(
     }
     inventory.dirty = false;
 
-    // 1. Backpack Summary
     if let Ok(mut summary_text) = summary_q.get_single_mut() {
         **summary_text = format!(
             "Weight: {:.1} kg  |  Armor: +{}  |  Gold: {} GP",
@@ -1493,7 +1470,6 @@ fn update_inventory_ui(
         );
     }
 
-    // 2. Backpack slot icons, borders, and badges
     for (btn, mut border) in &mut bp_slots {
         if let Some(item) = inventory.items.get(btn.0) {
             *border = if item.equipped {
@@ -1518,7 +1494,6 @@ fn update_inventory_ui(
         }
     }
 
-    // 3. Equipped paperdoll slots
     for (slot_comp, mut img_node, mut vis) in &mut eq_icons {
         if let Some(item) = inventory.equipped_in(slot_comp.0) {
             let (handle, flip) = load_item_icon(&data, *look, item, &mut images, &mut mods, &mut icon_cache);
@@ -1560,6 +1535,14 @@ fn layer_image(img: &DfImage, palette: &Palette) -> Image {
     image
 }
 
+/// Costruisce i layer HD del paperdoll.
+///
+/// Non richiede più la presenza dei file nativi `BODYxxI0.IMG`/`FACEyyI0.CIF`: se ci sono, li
+/// usa solo come riferimento di posizione e dimensione del layer; se mancano, prende posizione
+/// e dimensione dalla texture HD stessa (dfmod o PNG sciolto).
+///
+/// Restituisce `Some((size, layers))` se **almeno una** texture HD è stata trovata, `None`
+/// altrimenti (il chiamante userà il fallback vanilla).
 fn build_hd_layers(
     data: &GameData,
     look: PlayerAppearance,
@@ -1568,25 +1551,40 @@ fn build_hd_layers(
     images: &mut Assets<Image>,
 ) -> Option<(Vec2, Vec<HdLayer>)> {
     let (body_name, head_name) = doll_file_names(look);
-    let read = |name: &str| -> Option<Vec<u8>> { std::fs::read(find_file_ci(&data.dir, name)?).ok() };
-    let body = read_img(&read(&body_name)?)?;
-    let head = read_cif(&read(&head_name)?, look.face)?;
+    let read = |name: &str| -> Option<Vec<u8>> {
+        std::fs::read(find_file_ci(&data.dir, name)?).ok()
+    };
+
+    // I nativi possono mancare (o essere in BSA): non sono obbligatori.
+    let body_native = read(&body_name).and_then(|b| read_img(&b));
+    let head_native = read(&head_name).and_then(|h| read_cif(&h, look.face));
+
     let palette = find_file_ci(&data.dir, DOLL_PALETTE)
     .and_then(|p| Palette::open(p).ok())
     .unwrap_or_else(|| (*data.palette).clone());
 
-    let w = DOLL_WIDTH
-    .max((body.x.max(0) as usize).saturating_add(body.width))
-    .max((head.x.max(0) as usize).saturating_add(head.width));
-    let h = DOLL_HEIGHT
-    .max((body.y.max(0) as usize).saturating_add(body.height))
-    .max((head.y.max(0) as usize).saturating_add(head.height));
-
     let (g, r) = (look.female as u8, look.race % 8);
-    let mut sources: Vec<(DfImage, Vec<String>, Vec<String>)> = vec![
-        (body, vec![format!("body{g}{r}i0")], Vec::new()),
-        (head, vec![format!("face{g}{r}i0.cif_{}-0", look.face)], Vec::new()),
+
+    // Varianti di prefisso per body e head.
+    let body_prefixes = vec![
+        format!("body{g}{r}i0"),
+            format!("body{g}_{r}_i0"),
+                format!("body{g}{r}"),
+                    format!("body{g}_{r}"),
     ];
+    let head_prefixes = vec![
+        format!("face{g}{r}i0.cif_{}-0", look.face),
+            format!("face{g}{r}i0.cif_{}", look.face),
+                format!("face{g}{r}i0_{}-0", look.face),
+                    format!("face{g}{r}i0.cif"),
+                        format!("face{g}{r}i0"),
+    ];
+
+    let mut sources: Vec<(Option<DfImage>, Vec<String>, Vec<String>, &'static str)> = vec![
+        (body_native, body_prefixes, Vec::new(), "body"),
+        (head_native, head_prefixes, Vec::new(), "head"),
+    ];
+
     let slot_order = [
         EquipSlot::Legs,
         EquipSlot::Feet,
@@ -1600,40 +1598,121 @@ fn build_hd_layers(
     for slot in slot_order {
         let Some(item) = inventory.equipped_in(slot) else { continue };
         let Some(record) = item.paperdoll_record else { continue };
-        let Some(native) = load_paperdoll_item_sprite(data, look, item, record) else { continue };
+        let native = load_paperdoll_item_sprite(data, look, item, record);
         let mut archives = vec![paperdoll_archive(look, slot)];
         if slot == EquipSlot::RightHand {
             archives.push(WEAPON_ARCHIVE_FALLBACK);
         }
-        let prefixes: Vec<String> = archives
-        .iter()
-        .flat_map(|a| [format!("{a:03}_{record}-0"), format!("{a}_{record}-0")])
-        .collect();
-        let prefer = material_from_name(&item.name).map(|m| vec![format!("_{m}")]).unwrap_or_default();
-        sources.push((native, prefixes, prefer));
+        let mut prefixes: Vec<String> = Vec::new();
+        for a in &archives {
+            prefixes.push(format!("{a:03}_{record}-0"));
+            prefixes.push(format!("{a}_{record}-0"));
+            prefixes.push(format!("{a:03}_{record}"));
+            prefixes.push(format!("{a}_{record}"));
+        }
+        let prefer = material_from_name(&item.name)
+        .map(|m| vec![format!("_{m}")])
+        .unwrap_or_default();
+        sources.push((native, prefixes, prefer, "item"));
     }
 
     let mut any_hd = false;
     let mut layers = Vec::with_capacity(sources.len());
-    for (native, prefixes, prefer) in sources {
-        let hd = prefixes.iter().find_map(|p| mods.image_by_prefix(p, &prefer, images));
-        let (image, flip_y) = match hd {
-            Some(handle) => {
-                any_hd = true;
-                let flip = mods.needs_v_flip(&handle);
-                (handle, flip)
+    let mut used_body_size: Option<Vec2> = None;
+
+    for (native_opt, prefixes, prefer, label) in sources {
+        // 1. Cerca una texture HD: prima nei .dfmod, poi nei file sciolti (via find_by_prefix).
+        let mut hd_choice: Option<(String, Handle<Image>, bool)> = None;
+        for p in &prefixes {
+            if let Some(name) = mods.find_by_prefix(p, &prefer) {
+                if let Some(handle) = mods.image_by_name(&name, images) {
+                    let flip = mods.needs_v_flip(&handle);
+                    hd_choice = Some((name, handle, flip));
+                    break;
+                }
             }
-            None => (images.add(layer_image(&native, &palette)), false),
+        }
+
+        let layer = match (hd_choice, native_opt) {
+            (Some((name, handle, flip)), Some(native)) => {
+                any_hd = true;
+                info!(
+                    "paperdoll `{label}`: HD `{name}` (nativo {}x{})",
+                      native.width, native.height
+                );
+                if label == "body" {
+                    used_body_size = Some(Vec2::new(native.width as f32, native.height as f32));
+                }
+                HdLayer {
+                    image: handle,
+                    flip_y: flip,
+                    x: native.x,
+                    y: native.y,
+                    w: native.width,
+                    h: native.height,
+                }
+            }
+            (Some((name, handle, flip)), None) => {
+                any_hd = true;
+                let (w, h) = mods
+                .size_by_name(&name)
+                .map(|(w, h)| (w as usize, h as usize))
+                .unwrap_or((DOLL_WIDTH, DOLL_HEIGHT));
+                info!("paperdoll `{label}`: HD `{name}` senza nativo, dimensioni {w}x{h}");
+                if label == "body" {
+                    used_body_size = Some(Vec2::new(w as f32, h as f32));
+                }
+                HdLayer {
+                    image: handle,
+                    flip_y: flip,
+                    x: 0,
+                    y: 0,
+                    w,
+                    h,
+                }
+            }
+            (None, Some(native)) => {
+                warn!(
+                    "paperdoll `{label}`: nessuna texture HD trovata (prefissi: {:?}, prefer: {:?}); uso il nativo",
+                      prefixes, prefer
+                );
+                if label == "body" {
+                    used_body_size = Some(Vec2::new(native.width as f32, native.height as f32));
+                }
+                HdLayer {
+                    image: images.add(layer_image(&native, &palette)),
+                    flip_y: false,
+                    x: native.x,
+                    y: native.y,
+                    w: native.width,
+                    h: native.height,
+                }
+            }
+            (None, None) => {
+                warn!(
+                    "paperdoll `{label}`: nessuna texture (né HD né nativa); salto il layer"
+                );
+                continue;
+            }
         };
-        layers.push(HdLayer { image, flip_y, x: native.x, y: native.y, w: native.width, h: native.height });
+        layers.push(layer);
     }
+
     if !any_hd {
         warn!(
-            "Nessuna texture HD per la bambola (cercato 'body{g}{r}i0'); nomi con 'body' nelle mod: {:?}",
-              mods.names_containing("body", 8)
+            "paperdoll: nessuna texture HD trovata per `{}` (race {}, female {}, face {}). \
+Uso il fallback vanilla. Controlla che `DREAM - Portraits` (o simile) sia caricato \
+e che i nomi corrispondano a: body{g}{r}i0 / face{g}{r}i0.cif_{{face}}-0",
+appearance_label(look), look.race, look.female, look.face
         );
+        return None;
     }
-    any_hd.then(|| (Vec2::new(w as f32, h as f32), layers))
+
+    let body_size = used_body_size.unwrap_or(Vec2::new(DOLL_WIDTH as f32, DOLL_HEIGHT as f32));
+    let w = body_size.x.max(DOLL_WIDTH as f32);
+    let h = body_size.y.max(DOLL_HEIGHT as f32);
+
+    Some((Vec2::new(w, h), layers))
 }
 
 fn layer_rect_percent(layer: &HdLayer, doll: Vec2) -> (f32, f32, f32, f32) {

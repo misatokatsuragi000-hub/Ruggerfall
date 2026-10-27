@@ -24,6 +24,7 @@
 //!                               (facoltativi) sostituiscono i prompt incorporati.
 //!   - `quest_npc_voices.txt`    le voci generate su richiesta, una per riga in JSON.
 //!   - `quest_npc_voice_prompt.txt` (facoltativo) prompt delle voci su richiesta.
+//!   - `quest_npc_ask_prompt.txt` (facoltativo) prompt delle domande libere al PNG.
 //!
 //! Per non rallentare il rendering:
 //!   - tutto il lavoro con il LLM (avvio di llama-server, richieste HTTP, validazione, scrittura
@@ -55,7 +56,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -71,6 +72,7 @@ pub const RUMORS_PROMPT_FILE: &str = "quest_rumors_prompt.txt";
 pub const NPC_FLAVOR_PROMPT_FILE: &str = "quest_npc_flavor_prompt.txt";
 pub const NPC_VOICE_PROMPT_FILE: &str = "quest_npc_voice_prompt.txt";
 pub const VOICES_FILE: &str = "quest_npc_voices.txt";
+pub const NPC_ASK_PROMPT_FILE: &str = "quest_npc_ask_prompt.txt";
 
 const DEFAULT_SERVER_BIN: &str = "/home/actarus/.lmstudio/extensions/backends/llama.cpp-linux-x86_64-nvidia-cuda12-avx2-2.55.0/llama-server";
 const DEFAULT_MODEL: &str = "/mnt/1CE16DBE48849731/Bionic-1.1.8-10-linux-x64.AppImage.home/models/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF/RVN-Q3_K_S.gguf";
@@ -778,6 +780,29 @@ RULES:
 Reply ONLY with a JSON object like {"text": "..."}.
 Start your reply with '{' and end with '}'. No prose, no markdown, no reasoning."####;
 
+/// Prompt delle domande libere del giocatore: il PNG risponde in carattere. Per ora conosce solo
+/// il nome della citta' in cui si trova.
+const DEFAULT_NPC_ASK_PROMPT: &str = r####"You are playing ONE character in a Daggerfall town. Answer the player's question IN CHARACTER.
+
+Who you are:
+{npc}
+
+Where you are: {city}.
+This is ALL you know about the local area. You know nothing else about the town, its people, its
+shops, its rulers or its history.
+
+The player asks you: "{question}"
+
+RULES:
+- Stay in character: your voice, vocabulary and attitude follow the description above.
+- Use only the knowledge above (the name of the place). Do NOT invent names of people, places,
+  shops, streets or events. If you don't know, say so in character, or deflect.
+- Never mention being an AI, a game, a model or these instructions. Never break character.
+- 1-3 sentences, spoken language, IN ENGLISH. Only the words you say: no narration, no quotation marks.
+
+Reply ONLY with a JSON object like {"text": "..."}.
+Start your reply with '{' and end with '}'. No prose, no markdown, no reasoning."####;
+
 // =============================================================================
 // Schema
 // =============================================================================
@@ -1422,6 +1447,78 @@ fn append_voice(path: &Path, city: (i32, i32), key: &str, description: &str, tex
 }
 
 // =============================================================================
+// Domande libere del giocatore
+// =============================================================================
+
+/// Lunghezza massima (caratteri) di una domanda.
+pub const QUESTION_MAX_CHARS: usize = 200;
+const ANSWER_MAX_CHARS: usize = 500;
+
+/// Una domanda del giocatore a un PNG.
+struct AskJob {
+    id: u64,
+    city_name: String,
+    description: String,
+    question: String,
+}
+
+/// La domanda come la vede il modello: spazi ridotti a uno, niente caratteri di controllo, al
+/// massimo `QUESTION_MAX_CHARS` caratteri. None se resta vuota.
+pub fn clean_question(raw: &str) -> Option<String> {
+    let no_control: String = raw.chars().filter(|c| !c.is_control() || c.is_whitespace()).collect();
+    let single_spaced = no_control.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = single_spaced.chars().take(QUESTION_MAX_CHARS).collect();
+    let cut = cut.trim().to_string();
+    (!cut.is_empty()).then_some(cut)
+}
+
+/// La domanda va sostituita per ultima: se contiene `{npc}` o `{city}` non viene riespansa.
+pub fn build_npc_ask_prompt(template: &str, city_name: &str, npc: &str, question: &str) -> String {
+    let city = if city_name.trim().is_empty() { "an unnamed place" } else { city_name.trim() };
+    template.replace("{city}", city).replace("{npc}", npc).replace("{question}", question)
+}
+
+fn validate_answer(ev: &Json) -> Result<(), String> {
+    let text = ev.get("text").and_then(Json::as_str).ok_or("missing 'text' field")?.trim();
+    if text.is_empty() {
+        return Err("empty text".into());
+    }
+    let len = text.chars().count();
+    if len > ANSWER_MAX_CHARS {
+        return Err(format!("text too long ({len} chars, max {ANSWER_MAX_CHARS})"));
+    }
+    let lower = text.to_lowercase();
+    for phrase in ["as an ai", "language model", "i am an ai", "i'm an ai", "as a language", "i cannot assist"] {
+        if lower.contains(phrase) {
+            return Err(format!("breaks character ('{phrase}'): stay in character, you are a person in the town"));
+        }
+    }
+    Ok(())
+}
+
+fn generate_answer(cfg: &QuestConfig, tpl: &Templates, job: &AskJob) -> Result<String, String> {
+    let prompt = build_npc_ask_prompt(&tpl.ask, &job.city_name, &job.description, &job.question);
+    let ev = try_json(cfg, &prompt, "NPC_ASK", validate_answer)?;
+    let text = ev.get("text").and_then(Json::as_str).unwrap_or("").trim();
+    Ok(text.trim_matches('"').trim().to_string())
+}
+
+/// Una domanda del giocatore: avvia il server se serve, genera la risposta e la restituisce.
+fn run_ask(cfg: &QuestConfig, tpl: &Templates, server: &SharedServer, a: &AskJob) -> QuestMsg {
+    let started = Instant::now();
+    match ensure_server(cfg, server).and_then(|_| generate_answer(cfg, tpl, a)) {
+        Ok(text) => {
+            info!("Quest: answer #{} ready in {:?}", a.id, started.elapsed());
+            QuestMsg::Answer { id: a.id, text }
+        }
+        Err(reason) => {
+            warn!("Quest: answer #{}: {reason}", a.id);
+            QuestMsg::AnswerFailed { id: a.id }
+        }
+    }
+}
+
+// =============================================================================
 // Estrazione del JSON dalla risposta del modello
 // =============================================================================
 
@@ -1842,6 +1939,7 @@ struct Templates {
     rumors: String,
     npc_flavor: String,
     voice: String,
+    ask: String,
 }
 
 struct Job {
@@ -1923,6 +2021,9 @@ enum QuestMsg {
     /// Voce di un PNG generata su richiesta.
     Voice { city: (i32, i32), key: String, text: String },
     VoiceFailed { city: (i32, i32), key: String },
+    /// Risposta a una domanda libera del giocatore.
+    Answer { id: u64, text: String },
+    AnswerFailed { id: u64 },
 }
 
 /// Ogni quanto il thread controlla le richieste di voce mentre aspetta una quest.
@@ -1961,7 +2062,8 @@ fn worker_main(
     server: SharedServer,
 ) {
     let (_voice_tx, voice_rx) = mpsc::channel();
-    worker_loop(cfg, tpl, quests_path, PathBuf::from("quest_npc_voices.test.txt"), jobs, voice_rx, results, server);
+    let (_ask_tx, ask_rx) = mpsc::channel();
+    worker_loop(cfg, tpl, quests_path, PathBuf::from("quest_npc_voices.test.txt"), jobs, voice_rx, ask_rx, results, server);
 }
 
 /// Il thread di lavoro: genera le quest (prioritarie) e le voci su richiesta, una cosa per volta.
@@ -1973,6 +2075,7 @@ fn worker_loop(
     voices_path: PathBuf,
     jobs: Receiver<Job>,
     voice_jobs: Receiver<VoiceJob>,
+    ask_jobs: Receiver<AskJob>,
     results: Sender<QuestMsg>,
     server: SharedServer,
 ) {
@@ -2016,8 +2119,15 @@ fn worker_loop(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        // una voce per giro: se nel frattempo arriva una quest, ha la precedenza
-        if let Ok(v) = voice_jobs.try_recv() {
+        // le domande del giocatore (interattive) hanno la precedenza sulle voci; una cosa per giro,
+        // e se nel frattempo arriva una quest, ha la precedenza su tutto
+        if let Ok(a) = ask_jobs.try_recv() {
+            let msg = run_ask(&cfg, &tpl, &server, &a);
+            if results.send(msg).is_err() {
+                break;
+            }
+            last_work = Instant::now();
+        } else if let Ok(v) = voice_jobs.try_recv() {
             let msg = run_voice(&cfg, &tpl, &server, &voices_path, &v);
             if results.send(msg).is_err() {
                 break;
@@ -2046,6 +2156,8 @@ pub struct QuestBook {
     voices: HashMap<((i32, i32), String), String>,
     voices_pending: HashSet<((i32, i32), String)>,
     voices_failed: HashSet<((i32, i32), String)>,
+    /// Risposte alle domande libere, in attesa che il dialogo le ritiri.
+    answers: HashMap<u64, Result<String, ()>>,
 }
 
 /// Stato della voce su richiesta di un PNG.
@@ -2158,6 +2270,19 @@ impl QuestBook {
         self.voices_failed.insert((city, key));
     }
 
+    pub fn store_answer(&mut self, id: u64, text: String) {
+        self.answers.insert(id, Ok(text));
+    }
+
+    pub fn fail_answer(&mut self, id: u64) {
+        self.answers.insert(id, Err(()));
+    }
+
+    /// La risposta alla domanda `id`, se e' arrivata (viene consumata).
+    pub fn take_answer(&mut self, id: u64) -> Option<Result<String, ()>> {
+        self.answers.remove(&id)
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_voice_pending(&mut self, city: (i32, i32), key: &str) {
         self.voices_pending.insert((city, key.to_string()));
@@ -2231,11 +2356,23 @@ fn theme_for(city: (i32, i32)) -> &'static str {
 pub struct QuestWorker {
     jobs: Sender<Job>,
     voice_jobs: Sender<VoiceJob>,
+    ask_jobs: Sender<AskJob>,
+    next_ask: AtomicU64,
     results: Mutex<Receiver<QuestMsg>>,
     server: SharedServer,
 }
 
 impl QuestWorker {
+    /// Manda al LLM la domanda del giocatore: il PNG risponde in carattere, sapendo solo il nome
+    /// della citta'. Restituisce l'id con cui ritirare la risposta (`QuestBook::take_answer`), o
+    /// None se la domanda e' vuota o il thread di lavoro non c'e' piu'.
+    pub fn ask(&self, city_name: &str, description: &str, question: &str) -> Option<u64> {
+        let question = clean_question(question)?;
+        let id = self.next_ask.fetch_add(1, Ordering::Relaxed);
+        let job = AskJob { id, city_name: city_name.to_string(), description: description.to_string(), question };
+        self.ask_jobs.send(job).is_ok().then_some(id)
+    }
+
     /// Chiede al thread la voce di un PNG. Serve la quest della citta' (il seed) e la voce non
     /// deve essere gia' pronta, in corso o fallita. Restituisce true se la richiesta e' partita.
     pub fn request_voice(&self, book: &mut QuestBook, city: (i32, i32), key: &str, description: &str) -> bool {
@@ -2291,9 +2428,11 @@ impl Plugin for QuestPlugin {
             rumors: read_prompt(RUMORS_PROMPT_FILE, DEFAULT_RUMORS_PROMPT),
             npc_flavor: read_prompt(NPC_FLAVOR_PROMPT_FILE, DEFAULT_NPC_FLAVOR_PROMPT),
             voice: read_prompt(NPC_VOICE_PROMPT_FILE, DEFAULT_NPC_VOICE_PROMPT),
+            ask: read_prompt(NPC_ASK_PROMPT_FILE, DEFAULT_NPC_ASK_PROMPT),
         };
         let (job_tx, job_rx) = mpsc::channel();
         let (voice_tx, voice_rx) = mpsc::channel();
+        let (ask_tx, ask_rx) = mpsc::channel();
         let (res_tx, res_rx) = mpsc::channel();
         let server: SharedServer = Arc::new(Mutex::new(None));
         let thread_server = Arc::clone(&server);
@@ -2307,6 +2446,7 @@ impl Plugin for QuestPlugin {
                 PathBuf::from(VOICES_FILE),
                 job_rx,
                 voice_rx,
+                ask_rx,
                 res_tx,
                 thread_server,
             )
@@ -2315,7 +2455,14 @@ impl Plugin for QuestPlugin {
             warn!("Quest: cannot start generator thread: {e}");
             return;
         }
-        app.insert_resource(QuestWorker { jobs: job_tx, voice_jobs: voice_tx, results: Mutex::new(res_rx), server })
+        app.insert_resource(QuestWorker {
+            jobs: job_tx,
+            voice_jobs: voice_tx,
+            ask_jobs: ask_tx,
+            next_ask: AtomicU64::new(1),
+            results: Mutex::new(res_rx),
+            server,
+        })
         .add_systems(Update, (quest_trigger, quest_poll));
     }
 }
@@ -2368,6 +2515,8 @@ fn quest_poll(worker: Res<QuestWorker>, mut book: ResMut<QuestBook>) {
             }
             QuestMsg::Voice { city, key, text } => book.store_voice(city, key, text),
             QuestMsg::VoiceFailed { city, key } => book.fail_voice(city, key),
+            QuestMsg::Answer { id, text } => book.store_answer(id, text),
+            QuestMsg::AnswerFailed { id } => book.fail_answer(id),
         }
     }
 }
@@ -2670,6 +2819,7 @@ mod tests {
             rumors: DEFAULT_RUMORS_PROMPT.to_string(),
             npc_flavor: DEFAULT_NPC_FLAVOR_PROMPT.to_string(),
             voice: DEFAULT_NPC_VOICE_PROMPT.to_string(),
+            ask: DEFAULT_NPC_ASK_PROMPT.to_string(),
         }
     }
 
@@ -3092,9 +3242,12 @@ mod tests {
         let (job_tx, _job_rx) = mpsc::channel();
         let (voice_tx, voice_rx) = mpsc::channel();
         let (_res_tx, res_rx) = mpsc::channel();
+        let (ask_tx, _ask_rx) = mpsc::channel();
         let worker = QuestWorker {
             jobs: job_tx,
             voice_jobs: voice_tx,
+            ask_jobs: ask_tx,
+            next_ask: AtomicU64::new(1),
             results: Mutex::new(res_rx),
             server: Arc::new(Mutex::new(None)),
         };
@@ -3139,7 +3292,8 @@ mod tests {
         let (res_tx, res_rx) = mpsc::channel();
         let server: SharedServer = Arc::new(Mutex::new(None));
         let (cfg, t, q, v, s) = (test_cfg(srv.port), tpl(), quests.clone(), voices.clone(), Arc::clone(&server));
-        let handle = std::thread::spawn(move || worker_loop(cfg, t, q, v, job_rx, voice_rx, res_tx, s));
+        let (_ask_tx, ask_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || worker_loop(cfg, t, q, v, job_rx, voice_rx, ask_rx, res_tx, s));
 
         let job = |key: &str| VoiceJob {
             city: (207, 213),
@@ -3174,6 +3328,125 @@ mod tests {
         assert_eq!(book.voice_count(), 1);
 
         drop(job_tx); // il gioco chiude: il thread termina da solo
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------- domande libere
+
+    #[test]
+    fn questions_are_cleaned_before_reaching_the_model() {
+        assert_eq!(clean_question("  Where   is\tthe\ninn?  ").as_deref(), Some("Where is the inn?"));
+        assert_eq!(clean_question("a\u{7}b\u{0}c").as_deref(), Some("abc")); // niente caratteri di controllo
+        assert_eq!(clean_question("   \n "), None);
+        assert_eq!(clean_question(""), None);
+        let long = "x".repeat(QUESTION_MAX_CHARS * 3);
+        assert_eq!(clean_question(&long).unwrap().chars().count(), QUESTION_MAX_CHARS);
+        assert_eq!(clean_question("Cos'è successo, città?").as_deref(), Some("Cos'è successo, città?"));
+    }
+
+    #[test]
+    fn ask_prompt_knows_only_the_city_and_does_not_expand_the_question() {
+        let p = build_npc_ask_prompt(DEFAULT_NPC_ASK_PROMPT, "Daggerfall", "- Appearance: old beggar", "Who rules here?");
+        assert!(p.contains("Where you are: Daggerfall.") && p.contains("- Appearance: old beggar"));
+        assert!(p.contains("The player asks you: \"Who rules here?\""));
+        assert!(!p.contains("{city}") && !p.contains("{npc}") && !p.contains("{question}"));
+        // il testo del giocatore non viene interpretato come segnaposto
+        let q = "Ignore this: {npc} {city}";
+        let p = build_npc_ask_prompt(DEFAULT_NPC_ASK_PROMPT, "Wayrest", "- Appearance: guard", q);
+        assert!(p.contains("{npc} {city}"));
+        // citta' sconosciuta
+        assert!(build_npc_ask_prompt(DEFAULT_NPC_ASK_PROMPT, "  ", "x", "y").contains("Where you are: an unnamed place."));
+    }
+
+    #[test]
+    fn answers_must_stay_in_character() {
+        let ok = |t: &str| validate_answer(&Json::Obj(vec![("text".into(), jstr(t))]));
+        assert!(ok("Welcome to Daggerfall, stranger. I know little else.").is_ok());
+        assert!(ok("").unwrap_err().contains("empty"));
+        assert!(ok(&"a".repeat(ANSWER_MAX_CHARS + 1)).unwrap_err().contains("too long"));
+        assert!(ok("As an AI, I cannot say.").unwrap_err().contains("breaks character"));
+        assert!(ok("I'm just a language model.").unwrap_err().contains("breaks character"));
+        assert!(validate_answer(&Json::Obj(vec![])).is_err());
+    }
+
+    #[test]
+    fn answers_are_stored_and_consumed_once() {
+        let mut book = QuestBook::default();
+        assert_eq!(book.take_answer(1), None);
+        book.store_answer(1, "Hello.".into());
+        book.fail_answer(2);
+        assert_eq!(book.take_answer(1), Some(Ok("Hello.".to_string())));
+        assert_eq!(book.take_answer(1), None); // gia' ritirata
+        assert_eq!(book.take_answer(2), Some(Err(())));
+    }
+
+    #[test]
+    fn asking_sends_a_cleaned_question_with_increasing_ids() {
+        let (job_tx, _job_rx) = mpsc::channel();
+        let (voice_tx, _voice_rx) = mpsc::channel();
+        let (ask_tx, ask_rx) = mpsc::channel();
+        let (_res_tx, res_rx) = mpsc::channel();
+        let worker = QuestWorker {
+            jobs: job_tx,
+            voice_jobs: voice_tx,
+            ask_jobs: ask_tx,
+            next_ask: AtomicU64::new(7),
+            results: Mutex::new(res_rx),
+            server: Arc::new(Mutex::new(None)),
+        };
+        assert_eq!(worker.ask("Daggerfall", "- Appearance: x", "   "), None); // domanda vuota: niente
+        assert!(ask_rx.try_recv().is_err());
+        assert_eq!(worker.ask("Daggerfall", "- Appearance: x", "  Who  are you? "), Some(7));
+        assert_eq!(worker.ask("Daggerfall", "- Appearance: x", "Where is the inn?"), Some(8));
+        let first = ask_rx.try_recv().unwrap();
+        assert_eq!((first.id, first.question.as_str(), first.city_name.as_str()), (7, "Who are you?", "Daggerfall"));
+        assert_eq!(ask_rx.try_recv().unwrap().id, 8);
+        // thread di lavoro chiuso: nessuna risposta in arrivo
+        drop(ask_rx);
+        assert_eq!(worker.ask("Daggerfall", "x", "hello?"), None);
+    }
+
+    #[test]
+    fn worker_answers_questions_before_voices_and_retries_out_of_character_replies() {
+        let srv = fake_server(vec![
+            (200, r#"{"text": "I am an AI and cannot help."}"#.into()),                  // fuori carattere
+            (200, r#"{"text": "Daggerfall? Aye, that's where we are, friend."}"#.into()), // ok
+        ]);
+        let dir = std::env::temp_dir().join(format!("quest_ask_worker_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (job_tx, job_rx) = mpsc::channel();
+        let (voice_tx, voice_rx) = mpsc::channel();
+        let (ask_tx, ask_rx) = mpsc::channel();
+        let (res_tx, res_rx) = mpsc::channel();
+        let server: SharedServer = Arc::new(Mutex::new(None));
+        let (cfg, t, q, v, s) = (test_cfg(srv.port), tpl(), dir.join("q.txt"), dir.join("v.txt"), Arc::clone(&server));
+        let handle = std::thread::spawn(move || worker_loop(cfg, t, q, v, job_rx, voice_rx, ask_rx, res_tx, s));
+
+        ask_tx
+            .send(AskJob {
+                id: 3,
+                city_name: "Daggerfall".into(),
+                description: "- Appearance: old beggar".into(),
+                question: "What is this place?".into(),
+            })
+            .unwrap();
+        match res_rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+            QuestMsg::Answer { id, text } => {
+                assert_eq!(id, 3);
+                assert_eq!(text, "Daggerfall? Aye, that's where we are, friend.");
+            }
+            _ => panic!("doveva rispondere"),
+        }
+        let bodies = srv.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("What is this place?") && bodies[0].contains("old beggar"));
+        assert!(bodies[1].contains("WARNING") && bodies[1].contains("breaks character"), "{}", bodies[1]);
+        // la risposta non si salva su file: e' una conversazione, non una voce
+        assert!(!dir.join("v.txt").exists());
+
+        drop(job_tx);
+        drop(voice_tx);
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

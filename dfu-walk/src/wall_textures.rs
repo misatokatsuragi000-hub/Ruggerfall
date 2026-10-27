@@ -71,7 +71,7 @@ pub struct WallTextures {
 
 // --- Parallax mapping dalla luminosita' della texture colore ---
 /// Spegne il parallax (le normal map restano).
-const USE_PARALLAX: bool = true;
+const USE_PARALLAX: bool = false;
 /// Profondita' dell'effetto in spazio UV: 0.02 sottile, 0.05 marcato.
 const PARALLAX_DEPTH_SCALE: f32 = 0.03;
 /// Passi massimi lungo il raggio visivo (piu' alto = piu' preciso e piu' lento).
@@ -188,7 +188,7 @@ fn derive_normal_map(rgba: &[u8], w: usize, h: usize) -> Image {
         blurred[cy * w + cx]
     };
 
-    const STRENGTH: f32 = 1.0;
+    const STRENGTH: f32 = 0.0;
     let mut out = vec![0u8; w * h * 4];
     for y in 0..h {
         for x in 0..w {
@@ -224,7 +224,7 @@ fn derive_normal_map(rgba: &[u8], w: usize, h: usize) -> Image {
 /// chiaro = sporgenza. Output `Rgba8Unorm` lineare (Bevy vuole la depth map non sRGB), stesso
 /// ordine di righe dell'input.
 fn derive_depth_map(rgba: &[u8], w: usize, h: usize) -> Image {
-    debug_assert_eq!(rgba.len(), w * h * 4);
+
     // luminosita' percettiva: i byte della texture sono gia' in sRGB
     let lum: Vec<f32> = rgba
         .chunks_exact(4)

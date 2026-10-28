@@ -1,0 +1,3 @@
+cargo run --release --bin view_mod -- \
+  "/mnt/1CE16DBE48849731/Daggerfall/DaggerfallUnity_Data/StreamingAssets/Mods/dream - hud & menu.dfmod"
+

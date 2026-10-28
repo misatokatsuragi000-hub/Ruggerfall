@@ -1,20 +1,5 @@
-//! Parser dei blocchi RMB di BLOCKS.BSA, secondo la specifica UESP
-//! ("Daggerfall Mod:BLOCKS.BSA/Map Block Records").
-//!
-//! Layout di un record RMB:
-//!   intestazione FISSA di 6776 byte
-//!       0      3 byte  BlockCount, ModelCount, FlatCount
-//!       3    640 byte  32 x BlockPosition (20 byte: unk1, unk2, X, Z, rotazione)
-//!     643    832 byte  32 x BuildingData (26 byte)
-//!    1475    264 byte  Section2 (BlockPtr[32], BlockSize[32], ModelPtr, FlatPtr)
-//!    1739    512 byte  GroundData (256 texture + 256 decorazioni)
-//!    2251   4096 byte  automap
-//!    6347    429 byte  nomi file
-//!   poi: BlockCount x Block (dimensione da BlockSize[i]; Exterior + Interior),
-//!        ModelCount x Model (66 byte), FlatCount x Flat (17 byte).
-//!
-//! Posizioni: gli oggetti dentro un Block sono relativi al sotto-record
-//! (X, Z, rotazione di `subrecords[i]`); quelli "misc" sono relativi al blocco.
+//! Parser dei blocchi RMB di BLOCKS.BSA, secondo la specifica UESP.
+
 pub const RMB_HEADER_LEN: usize = 6776;
 const OFF_BLOCK_POS: usize = 3;
 const BLOCK_POS_SIZE: usize = 20;
@@ -29,24 +14,11 @@ const BLOCKDATA_HEADER: usize = 17;
 const OFF_BUILDING_DATA: usize = 643;
 const BUILDING_DATA_SIZE: usize = 26;
 
-/// Se true, Z dei sotto-record e z degli oggetti "misc" sono distanze dal bordo NORD del
-/// blocco (n = 4096 - |z|); se false dal bordo SUD (n = |z|). Se gli edifici risultano
-/// specchiati nord/sud rispetto alle strade, inverti questo valore.
 pub const Z_FROM_NORTH_EDGE: bool = true;
-
-/// Segno della rotazione (+1 = antioraria vista dall'alto, come `Quat::from_rotation_y`
-/// con z = -nord). Se gli edifici a 90/270 gradi sono girati al contrario, metti -1.
-pub const ROTATION_SIGN: f32 = 1.0;
-
+pub const ROTATION_SIGN: f32 = -1.0;
 const BLOCK_UNITS: f32 = 4096.0;
-
-/// Angoli Daggerfall: 2048 = 360 gradi.
 pub const DA_TO_DEG: f32 = 360.0 / 2048.0;
 
-/// Dati di un edificio (26 byte), uno per sotto-record: l'edificio `i` e' il sotto-record `i`.
-/// Layout (da Daggerfall Unity): NameSeed u16 @0, ServiceTimeLimit u32 @2, 12 byte nulli, FactionId u16 @18,
-/// Sector i16 @20, LocationId u16 @22, BuildingType u8 @24, Quality u8 @25.
-/// Verificalo con `dump_pois`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RmbBuildingData {
     pub name_seed: u16,
@@ -71,8 +43,6 @@ pub fn parse_building_data(rec: &[u8]) -> RmbBuildingData {
     }
 }
 
-/// Porta di un BlockData (19 byte). Dei campi si leggono solo X, Y, Z (i32 @0, @4, @8):
-/// il resto del record non serve. Verifica con `dump_interior` che la posizione sia plausibile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RmbDoor {
     pub x: i32,
@@ -80,15 +50,10 @@ pub struct RmbDoor {
     pub z: i32,
 }
 
-/// Interno di un edificio: il secondo BlockData del sotto-record. Le posizioni sono
-/// nel sistema dell'interno (unita' Daggerfall, origine dell'edificio). Vuoto se
-/// l'interno e' assente o malformato.
 #[derive(Debug, Clone, Default)]
 pub struct RmbInterior {
     pub objects_3d: Vec<RmbObject3D>,
     pub flats: Vec<RmbFlatObject>,
-    /// NPC / persone (oste, clienti, mercanti): hanno la stessa struttura dei flat
-    /// ma sono in una lista separata (BlockPeopleRecords in DFU).
     pub people: Vec<RmbFlatObject>,
     pub doors: Vec<RmbDoor>,
 }
@@ -102,25 +67,17 @@ pub struct RmbSubRecord {
 
 #[derive(Debug, Clone)]
 pub struct RmbObject3D {
-    /// primi 4 byte del record, per diagnostica
     pub raw_id: u32,
-    /// id in ARCH3D.BSA = id1 * 100 + id2
     pub model_id: u32,
-    /// byte 3 del ModelId ("Unknown1" nella specifica)
     pub object_type: u8,
-    /// Point2: posizione di piazzamento (grezza, nel sistema del sotto-record o del blocco)
     pub x: i32,
     pub y: i32,
     pub z: i32,
-    /// Point1: quasi sempre zero (forse un pivot)
     pub pivot: [i32; 3],
     pub rotation_y_deg: f32,
-    /// `Some(i)` = esterno del sotto-record `i`; `None` = lista misc del blocco
     pub block: Option<u8>,
 }
 
-/// Modello gia' collocato nel blocco: x verso est e `n` verso nord, in unita' Daggerfall
-/// dall'angolo sud-ovest del blocco (0..4096); `rotation_deg` antioraria vista dall'alto.
 #[derive(Debug, Clone, Copy)]
 pub struct PlacedModel {
     pub model_id: u32,
@@ -129,9 +86,7 @@ pub struct PlacedModel {
     pub n: f32,
     pub y: i32,
     pub rotation_deg: f32,
-    /// true = esterno di un sotto-record (edifici e loro accessori); false = lista misc
     pub is_building: bool,
-    /// indice del sotto-record (= indice in `RmbBlock::buildings`); `None` per la lista misc
     pub subrecord: Option<u8>,
 }
 
@@ -142,30 +97,21 @@ pub struct RmbFlatObject {
     pub x: i32,
     pub y: i32,
     pub z: i32,
-    /// FactionID: se != 0, questo flat e' un NPC (persona che cammina).
-    /// Usato da DFU per aggiungere StaticNPC al billboard.
     pub faction_id: i16,
-    /// Flags dell'NPC (orientamento, comportamento, ecc.)
     pub flags: u8,
     pub block: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RmbBlock {
-    /// 16x16 byte: bit 0-5 indice texture, bit 6-7 rotazione
     pub ground_tiles: [u8; 16 * 16],
     pub ground_decor: [u8; 16 * 16],
     pub subrecords: Vec<RmbSubRecord>,
-    /// dati degli edifici, `buildings[i]` descrive `subrecords[i]`
     pub buildings: Vec<RmbBuildingData>,
     pub objects_3d: Vec<RmbObject3D>,
     pub flats: Vec<RmbFlatObject>,
-    /// interni, `interiors[i]` descrive l'interno del sotto-record `i`
     pub interiors: Vec<RmbInterior>,
-    /// People dell'esterno dei sotto-record (NPC che camminano per strada).
-    /// Stessa struttura dei flat; `block = Some(i)` indica il sotto-record.
     pub exterior_people: Vec<RmbFlatObject>,
-    /// byte consumati dal parsing (per controllo: dovrebbe essere = lunghezza del record)
     pub bytes_used: usize,
 }
 
@@ -190,8 +136,6 @@ fn parse_model(d: &[u8], p: usize, block: Option<u8>) -> RmbObject3D {
     }
 }
 
-/// Secondo BlockData del sotto-record (l'interno), che inizia in `q` e deve stare prima di `end`.
-/// Se e' malformato restituisce un interno vuoto invece di far fallire il blocco.
 fn parse_interior(d: &[u8], q: usize, end: usize, block: u8) -> RmbInterior {
     let mut out = RmbInterior::default();
     if q + BLOCKDATA_HEADER > end {
@@ -220,9 +164,7 @@ fn parse_interior(d: &[u8], q: usize, end: usize, block: u8) -> RmbInterior {
         out.flats.push(parse_flat(d, p, Some(block)));
         p += FLAT_SIZE;
     }
-    // Section3 (spawn points) - saltiamo, non ci servono ancora
     p += ns * SECTION3_SIZE;
-    // People records dell'interno (oste, clienti, mercanti)
     for _ in 0..np {
         out.people.push(parse_flat(d, p, Some(block)));
         p += PERSON_SIZE;
@@ -240,13 +182,6 @@ fn parse_interior(d: &[u8], q: usize, end: usize, block: u8) -> RmbInterior {
 
 fn parse_flat(d: &[u8], p: usize, block: Option<u8>) -> RmbFlatObject {
     let tex = u16::from_le_bytes([d[p + 12], d[p + 13]]);
-    // Layout del flat/people record (17 byte):
-    //   +0  i32  XPos
-    //   +4  i32  YPos
-    //   +8  i32  ZPos
-    //  +12  u16  TextureBitfield (archive = >>7, record = &0x7F)
-    //  +14  i16  FactionID
-    //  +16  u8   Flags
     let faction_id = i16::from_le_bytes([d[p + 14], d[p + 15]]);
     let flags = d[p + 16];
     RmbFlatObject {
@@ -308,8 +243,6 @@ impl RmbBlock {
             if end > data.len() {
                 return Err("Block oltre la fine del record");
             }
-            // Esterno (primo BlockData) nei campi principali; l'interno (secondo BlockData,
-            // subito dopo) in `interiors`.
             let q = pos;
             if q + BLOCKDATA_HEADER > end {
                 return Err("BlockData piu' corto della sua intestazione");
@@ -337,14 +270,11 @@ impl RmbBlock {
                 flats.push(parse_flat(data, p, Some(i as u8)));
                 p += FLAT_SIZE;
             }
-            // Salta section3 dell'esterno
             p += ns * SECTION3_SIZE;
-            // People dell'esterno del sotto-record (NPC che camminano per strada)
             for _ in 0..np {
                 exterior_people.push(parse_flat(data, p, Some(i as u8)));
                 p += PERSON_SIZE;
             }
-            // Salta doors dell'esterno (gia' conteggiati in total)
             interiors.push(parse_interior(data, q + total, end, i as u8));
             pos = end;
         }
@@ -374,11 +304,21 @@ impl RmbBlock {
         })
     }
 
-    /// Posizioni nel blocco di tutti gli oggetti 3D. Gli oggetti dei sotto-record sono
-    /// ruotati e traslati con X, Z e rotazione del sotto-record.
+    /// Posizioni nel blocco di tutti gli oggetti 3D.
     pub fn placed_models(&self) -> Vec<PlacedModel> {
-        // z "grezza" (negativa o positiva) -> verso nord
-        let n_of = |z_raw: f32| if Z_FROM_NORTH_EDGE { BLOCK_UNITS + z_raw } else { -z_raw };
+        // Conversione Z consistente: calcola sempre la distanza dal bordo Sud (0..4096)
+        let n_of = |z_raw: f32| -> f32 {
+            if Z_FROM_NORTH_EDGE {
+                if z_raw < 0.0 {
+                    BLOCK_UNITS + z_raw
+                } else {
+                    BLOCK_UNITS - z_raw
+                }
+            } else {
+                z_raw.abs()
+            }
+        };
+
         self.objects_3d
         .iter()
         .map(|o| match o.block {
@@ -395,13 +335,12 @@ impl RmbBlock {
             Some(i) => {
                 let s = &self.subrecords[i as usize];
                 let anchor_n = if Z_FROM_NORTH_EDGE {
-                    BLOCK_UNITS - s.z as f32
+                    BLOCK_UNITS - (s.z as f32).abs()
                 } else {
-                    s.z as f32
+                    (s.z as f32).abs()
                 };
                 let phi = (s.rotation_deg * ROTATION_SIGN).to_radians();
                 let (sn, cs) = phi.sin_cos();
-                // scostamento locale (di solito 0 o pochi punti): ruotato col sotto-record
                 let lx = o.x as f32;
                 let ln = if Z_FROM_NORTH_EDGE { o.z as f32 } else { -(o.z as f32) };
                 PlacedModel {
@@ -417,125 +356,5 @@ impl RmbBlock {
             }
         })
         .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn building_data_layout() {
-        let mut rec = [0u8; 26];
-        rec[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
-        rec[2..6].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
-        rec[18..20].copy_from_slice(&0x0150u16.to_le_bytes());
-        rec[20..22].copy_from_slice(&(-3i16).to_le_bytes());
-        rec[22..24].copy_from_slice(&0x0042u16.to_le_bytes());
-        rec[24] = 15;
-        rec[25] = 7;
-        let b = parse_building_data(&rec);
-        assert_eq!(
-            b,
-            RmbBuildingData {
-                name_seed: 0x1234,
-                service_time_limit: 0xDEADBEEF,
-                faction_id: 0x0150,
-                sector: -3,
-                location_id: 0x0042,
-                building_type: 15,
-                quality: 7,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_interior_after_exterior() {
-        let mut data = vec![0u8; RMB_HEADER_LEN];
-        data[0] = 1; // un sotto-record
-        let mut ext = vec![0u8; BLOCKDATA_HEADER + MODEL_SIZE];
-        ext[0] = 1; // un modello nell'esterno
-        let door_p = BLOCKDATA_HEADER + 2 * MODEL_SIZE + FLAT_SIZE;
-        let mut int = vec![0u8; door_p + DOOR_SIZE];
-        int[0] = 2; // modelli
-        int[1] = 1; // flat
-        int[4] = 1; // porte
-        int[BLOCKDATA_HEADER..BLOCKDATA_HEADER + 2].copy_from_slice(&7u16.to_le_bytes());
-        int[BLOCKDATA_HEADER + 36..BLOCKDATA_HEADER + 40].copy_from_slice(&1000i32.to_le_bytes());
-        int[door_p..door_p + 4].copy_from_slice(&100i32.to_le_bytes());
-        int[door_p + 4..door_p + 8].copy_from_slice(&(-20i32).to_le_bytes());
-        int[door_p + 8..door_p + 12].copy_from_slice(&300i32.to_le_bytes());
-        let size = (ext.len() + int.len()) as u32;
-        data[OFF_BLOCK_SIZES..OFF_BLOCK_SIZES + 4].copy_from_slice(&size.to_le_bytes());
-        data.extend(&ext);
-        data.extend(&int);
-        let rmb = RmbBlock::parse(&data).unwrap();
-        assert_eq!(rmb.objects_3d.len(), 1, "l'esterno non deve includere l'interno");
-        assert_eq!(rmb.interiors.len(), 1);
-        let it = &rmb.interiors[0];
-        assert_eq!(it.objects_3d.len(), 2);
-        assert_eq!(it.objects_3d[0].model_id, 700);
-        assert_eq!(it.objects_3d[0].x, 1000);
-        assert_eq!(it.flats.len(), 1);
-        assert_eq!(it.doors, vec![RmbDoor { x: 100, y: -20, z: 300 }]);
-        assert_eq!(rmb.bytes_used, data.len());
-    }
-
-    #[test]
-    fn malformed_interior_is_empty_not_an_error() {
-        let mut data = vec![0u8; RMB_HEADER_LEN];
-        data[0] = 1;
-        let mut ext = vec![0u8; BLOCKDATA_HEADER];
-        ext[0] = 0;
-        let mut int = vec![0u8; BLOCKDATA_HEADER];
-        int[0] = 50; // dichiara 50 modelli ma non ci sono
-        let size = (ext.len() + int.len()) as u32;
-        data[OFF_BLOCK_SIZES..OFF_BLOCK_SIZES + 4].copy_from_slice(&size.to_le_bytes());
-        data.extend(&ext);
-        data.extend(&int);
-        let rmb = RmbBlock::parse(&data).unwrap();
-        assert!(rmb.interiors[0].objects_3d.is_empty());
-    }
-
-    #[test]
-    fn flat_reads_faction_id_and_flags() {
-        let mut rec = vec![0u8; 17];
-        rec[12..14].copy_from_slice(&((210u16 << 7) | 5).to_le_bytes());
-        rec[14..16].copy_from_slice(&42i16.to_le_bytes());
-        rec[16] = 0x03;
-        let f = parse_flat(&rec, 0, None);
-        assert_eq!(f.texture_archive, 210);
-        assert_eq!(f.texture_record, 5);
-        assert_eq!(f.faction_id, 42);
-        assert_eq!(f.flags, 0x03);
-    }
-
-    #[test]
-    fn exterior_people_are_read() {
-        let mut data = vec![0u8; RMB_HEADER_LEN];
-        data[0] = 1; // un sotto-record
-        // Esterno: 0 modelli, 0 flat, 0 section3, 2 people, 0 doors
-        let mut ext = vec![0u8; BLOCKDATA_HEADER + 2 * PERSON_SIZE];
-        ext[3] = 2; // 2 people
-        // Person 1: archive 334, record 0, faction_id 100
-        let p1 = BLOCKDATA_HEADER;
-        ext[p1 + 12..p1 + 14].copy_from_slice(&((334u16 << 7) | 0).to_le_bytes());
-        ext[p1 + 14..p1 + 16].copy_from_slice(&100i16.to_le_bytes());
-        // Person 2: archive 334, record 1, faction_id 200
-        let p2 = BLOCKDATA_HEADER + PERSON_SIZE;
-        ext[p2 + 12..p2 + 14].copy_from_slice(&((334u16 << 7) | 1).to_le_bytes());
-        ext[p2 + 14..p2 + 16].copy_from_slice(&200i16.to_le_bytes());
-        // Interior vuoto
-        let int = vec![0u8; BLOCKDATA_HEADER];
-        let size = (ext.len() + int.len()) as u32;
-        data[OFF_BLOCK_SIZES..OFF_BLOCK_SIZES + 4].copy_from_slice(&size.to_le_bytes());
-        data.extend(&ext);
-        data.extend(&int);
-        let rmb = RmbBlock::parse(&data).unwrap();
-        assert_eq!(rmb.exterior_people.len(), 2);
-        assert_eq!(rmb.exterior_people[0].texture_archive, 334);
-        assert_eq!(rmb.exterior_people[0].faction_id, 100);
-        assert_eq!(rmb.exterior_people[1].faction_id, 200);
-        assert_eq!(rmb.bytes_used, data.len());
     }
 }

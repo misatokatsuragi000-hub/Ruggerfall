@@ -1,22 +1,11 @@
 //! Sistema di gestione dei Dungeon in Bevy: transizione con E/U, camminata,
 //! collisioni sotterranee e porte apribili col tasto E o col tasto sinistro.
 //!
-//! ## Angolo di apertura
-//!
-//! In DFU `OpenAngle = -90°` è fisso, perché ogni modello di porta è orientato
-//! in modo che la cerniera stia all'origine e il pannello si estenda sempre
-//! dallo stesso lato. Nel nostro codice la mesh ha i vertici originali, quindi
-//! per le porte con cerniera "dall'altra parte" (tipiche delle `DDR` a doppia
-//! anta) l'angolo va invertito: `dungeon_builder::compute_open_angle` lo fa
-//! per ogni porta e lo salva in `DungeonDoor::open_angle_deg`.
-//!
 //! ## Nemici
 //!
 //! I nemici sono i flat editor 199 con `FactionID != 0`, estratti da
-//! `dungeon_builder::build_dungeon` in `BuiltDungeon::enemies`. Ogni enemy
-//! viene spawnato come billboard figlio della radice del dungeon e animato da
-//! `update_dungeon_enemies`: quando il giocatore è vicino passa a `Chase`, se
-//! è a portata passa ad `Attack`.
+//! `dungeon_builder::build_dungeon` in `BuiltDungeon::enemies`. Vengono gestiti
+//! da `dungeon_enemies` tramite l'evento `SpawnDungeonEnemies`.
 
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
@@ -24,21 +13,22 @@ use bevy::render::render_asset::RenderAssetUsages;
 use crate::data::bsa::BsaArchive;
 use crate::data::building_gen::{BLOCK_SIZE_M, DF_UNIT};
 use crate::data::dungeon_builder::{
-    build_dungeon, mobile_texture_public, BuiltDungeon,
+    build_dungeon, BuiltDungeon,
 };
 use crate::data::dungeon_layout::DungeonData;
 use crate::data::maps::DFLocation;
 use crate::data::mesh_builder::{Submesh, WorldMesh};
 use crate::data::terrain_mesh::MAP_PIXEL_SIZE;
 use crate::dialog::DialogState;
+use crate::dungeon_enemies::{
+    SpawnDungeonEnemies, DungeonKind, DEFAULT_MONSTER_POWER,
+};
 use crate::fps_weapon::FpsWeaponState;
 use crate::mod_textures::ModTextures;
 use crate::player::{Player, EYE_HEIGHT};
-use crate::tiles::{build_enemy_sprites, EnemySpriteSet, RecordSet, climate_of};
 use crate::wall_textures::WallTextures;
 use crate::world::*;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 const DUNGEON_Y: f32 = 12000.0;
 const DUNGEON_EXIT_DISTANCE: f32 = 4.0;
@@ -59,14 +49,6 @@ const DOOR_INTERACTION_REACH: f32 = 2.8;
 /// Con l'arma sguainata il click sinistro è del combattimento e non apre porte.
 const CLICK_OPENS_DOORS: bool = true;
 
-// --- Nemici ---
-const ENEMY_NOTICE_DISTANCE: f32 = 18.0;
-const ENEMY_LOSE_DISTANCE: f32 = 30.0;
-const ENEMY_MELEE_RANGE: f32 = 2.0;
-const ENEMY_CHASE_SPEED: f32 = 3.4;
-const ENEMY_FRAME_SECONDS: f32 = 0.18;
-const ENEMY_ATTACK_COOLDOWN: f32 = 1.6;
-
 #[derive(Component)]
 pub struct DungeonFlat;
 
@@ -75,34 +57,6 @@ pub struct DungeonDoorEntity {
     pub index: usize,
     pub closed_yaw: f32,
     pub progress: f32,
-}
-
-/// Modalità AI di un nemico del dungeon.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DungeonEnemyMode {
-    Idle,
-    Chase,
-    Attack,
-}
-
-/// Nemico del dungeon: billboard animato con AI semplice (Idle → Chase → Attack).
-#[derive(Component)]
-pub struct DungeonEnemy {
-    pub sprite: Arc<EnemySpriteSet>,
-    /// Posizione in coordinate locali del dungeon (relative alla radice).
-    pub local_pos: Vec3,
-    pub mode: DungeonEnemyMode,
-    /// Direzione di movimento corrente (XZ), per scegliere la vista.
-    pub heading: Vec2,
-    /// Frame corrente dell'animazione.
-    pub frame: usize,
-    pub frame_timer: f32,
-    /// Ultimo (kind, orientamento, flip, frame) mostrato, per evitare swap inutili.
-    pub shown: Option<(u8, usize, bool, usize)>,
-    /// Cooldown attacco.
-    pub attack_cooldown: f32,
-    /// MobileID originale (per debug).
-    pub mobile_id: u8,
 }
 
 pub struct ActiveDungeon {
@@ -138,7 +92,6 @@ impl Plugin for DungeonPlugin {
              dungeon_enter_exit,
              handle_dungeon_door_click,
              dungeon_move,
-             update_dungeon_enemies,
              face_dungeon_flats,
             )
             .chain()
@@ -230,6 +183,7 @@ fn player_distance_from_palace(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_and_enter_dungeon(
     commands: &mut Commands,
+    enemy_events: &mut EventWriter<SpawnDungeonEnemies>,
     data: &GameData,
     origin: &Origin,
     state: &mut DungeonState,
@@ -279,7 +233,7 @@ pub fn spawn_and_enter_dungeon(
     ensure_spawn_is_free(&mut built);
 
     let origin_world = Vec3::new(tf.translation.x, DUNGEON_Y, tf.translation.z);
-    let climate = climate_of(data, mx, my);
+    let climate = crate::tiles::climate_of(data, mx, my);
 
     let root = commands
     .spawn((Transform::from_translation(origin_world), Visibility::default()))
@@ -382,60 +336,19 @@ pub fn spawn_and_enter_dungeon(
                           DungeonFlat,
             ));
         }
-
-        // --- Nemici ---
-        let mut enemies_spawned = 0usize;
-        for spawn in &built.enemies {
-            let Some((archive, record)) = mobile_texture_public(spawn.mobile_id) else {
-                warn!(
-                    "Dungeon: MobileID {} senza texture nota, salto",
-                    spawn.mobile_id
-                );
-                continue;
-            };
-            let _ = record; // non serve direttamente, lo carica build_enemy_sprites
-            let Some(sprite) = build_enemy_sprites(
-                archive, true, data, mods, images, materials,
-            ).map(Arc::new) else {
-                warn!(
-                    "Dungeon: impossibile caricare mostro MobileID {} (archivio {})",
-                      spawn.mobile_id, archive
-                );
-                continue;
-            };
-
-            let quad = meshes.add(Rectangle::new(1.0, 1.0));
-            let size = sprite.walk.1[0];
-            parent.spawn((
-                Mesh3d(quad),
-                          MeshMaterial3d(sprite.walk.0[0][0].clone()),
-                          Transform::from_xyz(
-                              spawn.pos[0],
-                              spawn.pos[1] + size.y * 0.5,
-                              spawn.pos[2],
-                          )
-                          .with_scale(size.extend(1.0)),
-                          DungeonEnemy {
-                              sprite,
-                              local_pos: Vec3::from(spawn.pos),
-                          mode: DungeonEnemyMode::Idle,
-                          heading: Vec2::Y,
-                          frame: 0,
-                          frame_timer: 0.0,
-                          shown: None,
-                          attack_cooldown: 0.0,
-                          mobile_id: spawn.mobile_id,
-                          },
-            ));
-            enemies_spawned += 1;
-        }
-        println!(
-            "Dungeon: {} nemici spawnati su {} trovati",
-            enemies_spawned,
-            built.enemies.len()
-        );
     })
     .id();
+
+    // --- Nemici ---
+    // Invia l'evento PRIMA di spostare `built` in `ActiveDungeon` (che lo consuma).
+    // Il plugin `dungeon_enemies` farà nascere i nemici come figli di `root`.
+    enemy_events.send(SpawnDungeonEnemies::from_built(
+        root,
+        &built,
+        DungeonKind::Crypt,
+        loc.location_id,
+        DEFAULT_MONSTER_POWER,
+    ));
 
     let spawn = built.spawn_pos;
     let floor_y = built
@@ -469,6 +382,7 @@ pub fn spawn_and_enter_dungeon(
 #[allow(clippy::too_many_arguments)]
 fn check_initial_dungeon_spawn(
     mut commands: Commands,
+    mut enemy_events: EventWriter<SpawnDungeonEnemies>,
     mut started: Local<bool>,
     data: Res<GameData>,
     origin: Res<Origin>,
@@ -499,7 +413,7 @@ fn check_initial_dungeon_spawn(
     let Some(loc) = target_loc else { return };
 
     if spawn_and_enter_dungeon(
-        &mut commands, &data, &origin, &mut state, &mut clear,
+        &mut commands, &mut enemy_events, &data, &origin, &mut state, &mut clear,
         &mut meshes, &mut images, &mut materials, &mut wall_textures, &mut mods,
         &mut p, &mut tf, loc, mx, my,
     ) {
@@ -514,6 +428,7 @@ fn check_initial_dungeon_spawn(
 #[allow(clippy::too_many_arguments)]
 pub fn dungeon_enter_exit(
     mut commands: Commands,
+    mut enemy_events: EventWriter<SpawnDungeonEnemies>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     data: Res<GameData>,
     origin: Res<Origin>,
@@ -568,7 +483,7 @@ pub fn dungeon_enter_exit(
     let Some(loc) = data.locations.get(&(mx, my)) else { return };
 
     if spawn_and_enter_dungeon(
-        &mut commands, &data, &origin, &mut state, &mut clear,
+        &mut commands, &mut enemy_events, &data, &origin, &mut state, &mut clear,
         &mut meshes, &mut images, &mut materials, &mut wall_textures, &mut mods,
         &mut p, &mut tf, loc, mx, my,
     ) {
@@ -731,183 +646,6 @@ pub fn dungeon_move(
 
     pos.y = p.feet_y + EYE_HEIGHT;
     tf.translation = pos;
-}
-
-/// 0..=7: 0 = frontale rispetto alla camera, 4 = di spalle, 5..=7 = specchiati.
-fn orientation_offset(heading: Vec2, to_camera: Vec2) -> usize {
-    let dir = to_camera.normalize_or_zero();
-    if dir == Vec2::ZERO {
-        return 0;
-    }
-    let right = Vec2::new(dir.y, -dir.x);
-    let angle = (-heading.dot(right)).atan2(heading.dot(dir));
-    ((angle / std::f32::consts::FRAC_PI_4).round() as i32).rem_euclid(8) as usize
-}
-
-/// Aggiorna l'AI, l'animazione e la posizione dei nemici del dungeon.
-///
-/// - Idle se il player è lontano
-/// - Chase se il player è entro `ENEMY_NOTICE_DISTANCE`
-/// - Attack se il player è entro `ENEMY_MELEE_RANGE`
-pub fn update_dungeon_enemies(
-    time: Res<Time>,
-    state: Res<DungeonState>,
-    player: Query<&Transform, (With<Player>, Without<DungeonEnemy>)>,
-                              mut enemies: Query<(
-                                  &mut DungeonEnemy,
-                                  &mut Transform,
-                                  &mut MeshMaterial3d<StandardMaterial>,
-                              )>,
-) {
-    let Some(active) = state.active.as_ref() else { return };
-    let Ok(player_tf) = player.get_single() else { return };
-
-    let dt = time.delta_secs().min(0.1);
-    let player_local = player_tf.translation - active.origin;
-    let dungeon = &active.dungeon;
-
-    let forward = player_tf.forward();
-    let fwd_xz = Vec2::new(forward.x, forward.z).normalize_or_zero();
-    let cam_yaw = (fwd_xz != Vec2::ZERO).then(|| (-fwd_xz.x).atan2(-fwd_xz.y));
-
-    for (mut enemy, mut tf, mut material) in &mut enemies {
-        // Distanza (solo XZ) dal player, in coordinate locali del dungeon.
-        let to_player = Vec2::new(
-            player_local.x - enemy.local_pos.x,
-            player_local.z - enemy.local_pos.z,
-        );
-        let dist = to_player.length();
-
-        // Cambio modalità AI.
-        let new_mode = match enemy.mode {
-            DungeonEnemyMode::Idle => {
-                if dist < ENEMY_NOTICE_DISTANCE {
-                    DungeonEnemyMode::Chase
-                } else {
-                    DungeonEnemyMode::Idle
-                }
-            }
-            DungeonEnemyMode::Chase => {
-                if dist > ENEMY_LOSE_DISTANCE {
-                    DungeonEnemyMode::Idle
-                } else if dist <= ENEMY_MELEE_RANGE {
-                    DungeonEnemyMode::Attack
-                } else {
-                    DungeonEnemyMode::Chase
-                }
-            }
-            DungeonEnemyMode::Attack => {
-                if dist > ENEMY_MELEE_RANGE + 0.3 {
-                    DungeonEnemyMode::Chase
-                } else {
-                    DungeonEnemyMode::Attack
-                }
-            }
-        };
-        if new_mode != enemy.mode {
-            enemy.mode = new_mode;
-            enemy.frame = 0;
-            enemy.frame_timer = 0.0;
-            enemy.shown = None;
-        }
-
-        // Movimento verso il player, con slide sui muri.
-        if enemy.mode == DungeonEnemyMode::Chase && dist > 0.01 {
-            let dir = to_player / dist;
-            let step = ENEMY_CHASE_SPEED * dt;
-            let feet_y = enemy.local_pos.y;
-            let candidates = [
-                Vec2::new(dir.x, dir.y) * step,
-                Vec2::new(dir.x, 0.0) * step,
-                Vec2::new(0.0, dir.y) * step,
-            ];
-            let mut moved = false;
-            for c in candidates {
-                if c == Vec2::ZERO {
-                    continue;
-                }
-                let nx = enemy.local_pos.x + c.x;
-                let nz = enemy.local_pos.z + c.y;
-                if !dungeon.blocked(nx, nz, feet_y, 0.4)
-                    && dungeon.floor_at(nx, nz, feet_y, 0.6).is_some()
-                    {
-                        enemy.local_pos.x = nx;
-                        enemy.local_pos.z = nz;
-                        moved = true;
-                        break;
-                    }
-            }
-            if moved {
-                enemy.heading = dir;
-            }
-        }
-
-        // Avanza frame.
-        let (kind, fps) = match enemy.mode {
-            DungeonEnemyMode::Idle => (2u8, 4.0),
-            DungeonEnemyMode::Chase => (0u8, 1.0 / ENEMY_FRAME_SECONDS),
-            DungeonEnemyMode::Attack => (1u8, 10.0),
-        };
-        enemy.frame_timer += dt;
-        let frame_duration = 1.0 / fps;
-        if enemy.frame_timer >= frame_duration {
-            enemy.frame_timer -= frame_duration;
-            enemy.frame = enemy.frame.wrapping_add(1);
-        }
-
-        // Sceglie la vista in base a direzione e posizione della camera.
-        let to_camera = player_local - enemy.local_pos;
-        let to_cam_xz = Vec2::new(to_camera.x, to_camera.z);
-        let offset = orientation_offset(enemy.heading, to_cam_xz);
-        let flip = matches!(offset, 5..=7);
-        let visible_offset = if offset > 4 { 8 - offset } else { offset };
-
-        let set: &RecordSet = match kind {
-            1 => &enemy.sprite.attack,
-            2 => enemy.sprite.idle.as_ref().unwrap_or(&enemy.sprite.walk),
-            _ => &enemy.sprite.walk,
-        };
-        let frames = &set.0[visible_offset.min(4)];
-        let frame = if frames.is_empty() {
-            0
-        } else {
-            enemy.frame % frames.len()
-        };
-        let size = set.1[visible_offset.min(4)];
-
-        if enemy.shown != Some((kind, visible_offset, flip, frame)) {
-            *material = MeshMaterial3d(frames[frame].clone());
-            enemy.shown = Some((kind, visible_offset, flip, frame));
-        }
-
-        // Aggiorna il pavimento sotto (il nemico segue il dislivello).
-        if let Some(fy) = dungeon.floor_at(
-            enemy.local_pos.x,
-            enemy.local_pos.z,
-            enemy.local_pos.y,
-            1.0,
-        ) {
-            enemy.local_pos.y = fy;
-        }
-
-        // Transform (relativo alla radice del dungeon).
-        tf.translation.x = enemy.local_pos.x;
-        tf.translation.y = enemy.local_pos.y + size.y * 0.5;
-        tf.translation.z = enemy.local_pos.z;
-        tf.scale = Vec3::new(if flip { -size.x } else { size.x }, size.y, 1.0);
-        if let Some(yaw) = cam_yaw {
-            tf.rotation = Quat::from_rotation_y(yaw);
-        }
-
-        // Cooldown attacco (il danno al player non è ancora implementato).
-        if enemy.mode == DungeonEnemyMode::Attack {
-            enemy.attack_cooldown -= dt;
-            if enemy.attack_cooldown <= 0.0 {
-                enemy.attack_cooldown = ENEMY_ATTACK_COOLDOWN;
-                // TODO: decrementare PlayerVitals::health.
-            }
-        }
-    }
 }
 
 pub fn face_dungeon_flats(

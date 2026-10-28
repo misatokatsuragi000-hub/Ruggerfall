@@ -1,4 +1,4 @@
-//! Mappa locale della città (tasto L): corridoio del viale allargato a 52 metri.
+//! Mappa locale della città (tasto L): edifici e punti di interesse.
 
 use std::collections::{HashMap, HashSet};
 
@@ -55,7 +55,7 @@ pub fn poi_kind(building_type: u8) -> Option<PoiKind> {
         15 => Some(PoiKind::Tavern),
         11 | 14 => Some(PoiKind::Guild),
         16 => Some(PoiKind::Palace),
-        0 | 2 | 5 | 6 | 7 | 8 | 9 | 12 | 13 => Some(PoiKind::Shop),
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 12 | 13 => Some(PoiKind::Shop),
         _ => None,
     }
 }
@@ -117,7 +117,7 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
             return false;
         }
         let dist_x = (x - road_x).abs();
-        dist_x < 26.0 || (z <= road_z_north && dist_x < 46.0)
+        dist_x < 13.0 || (z <= road_z_north && dist_x < 36.0)
     };
 
     for by in 0..bh {

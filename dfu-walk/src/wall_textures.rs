@@ -1,45 +1,5 @@
 //! Texture originali di Daggerfall per le mura procedurali: un materiale per ogni
 //! (archivio, record), con clima e stagione applicati come per il resto del mondo.
-//!
-//! ## Normal map
-//!
-//! DREAM fornisce normal map in formato BC7 con canale verde **DirectX** (Y giù).
-//! Bevy le interpreta in **OpenGL** (Y su), quindi la luce risulterebbe invertita
-//! (i dettagli sembrano incavati invece che in rilievo). Per correggere:
-//!
-//! - le normal map vengono caricate con `ModTextures::image_normal_by_key`, che
-//!   decodifica BC7 → Rgba8, gira il canale verde e allinea i pixel alla
-//!   convenzione V dell'albedo (bottom-up);
-//! - se la mod non ha la normal map, si deriva dall'albedo con un Sobel tenue
-//!   (blur 3x3 + strength 1.0), che è meglio di niente;
-//! - se nessuno dei due funziona, il materiale resta senza normal map.
-//!
-//! ## Flip V delle texture dei muri
-//!
-//! Le texture BC7 di DREAM (come i dati raw di Unity/Daggerfall) sono in ordine
-//! "bottom-up" (riga 0 = fondo). Bevy assume V=0 in alto: senza correzione i muri
-//! appaiono capovolti in Y. `material()` applica quindi un `uv_transform` che
-//! gira la V **quando** l'albedo è BC7 (`ModTextures::needs_v_flip`), lo stesso
-//! meccanismo usato dai flat. La normal map caricata da `image_normal_by_key`
-//! è già in fondo-up (allineata all'albedo BC7), quindi condivide lo stesso
-//! `uv_transform`.
-//!
-//! ## Parallax (bump)
-//!
-//! Ogni muro con una texture colore riceve una depth map per il parallax mapping, ricavata
-//! dalla **luminosita' della texture colore originale di Daggerfall** (quella a palette, che
-//! esiste per tutti i muri; non dall'albedo della mod, che manca quasi sempre): le zone scure
-//! sono incavi, quelle chiare sporgenze (`derive_depth_map`). Bevy vuole in `depth_map` un valore
-//! di profondita' (bianco = fondo), quindi la depth e' `1 - luminosita'`.
-//! Come per la normal map derivata, se l'albedo mostrata e' capovolta (`uv_transform`) l'input
-//! viene capovolto uguale, cosi' la depth map condivide lo stesso `uv_transform`.
-//! Il parallax richiede le tangenti sulla mesh (`prepare_mesh`); per i materiali capovolti
-//! con `uv_transform` la B delle tangenti e' invertita e il verde della normal map pure
-//! (`flip_normal_map_y`), cosi' le normali restano invariate e lo spostamento del parallax
-//! va nel verso giusto.
-//!
-//! I flat (decorazioni, NPC) **non** ricevono normal map: sono billboard, il
-//! normal mapping non aggiunge nulla.
 
 use crate::mod_textures::ModTextures;
 use crate::world::GameData;
@@ -62,24 +22,15 @@ pub struct WallTextures {
     flat_frames: HashMap<(u16, u8, u16), Option<(Handle<StandardMaterial>, f32, f32)>>,
     sizes: HashMap<(u16, u8), (f32, f32)>,
     normal_cache: HashMap<(u32, u8), Option<Handle<Image>>>,
-    /// Materiali che richiedono le tangenti sulla mesh (normal map o parallax).
     normal_materials: HashSet<AssetId<StandardMaterial>>,
-    /// Materiali con albedo capovolta via `uv_transform`: le tangenti vanno con la B invertita.
     flipped_materials: HashSet<AssetId<StandardMaterial>>,
     depth_cache: HashMap<(u32, u8), Option<Handle<Image>>>,
 }
 
-// --- Parallax mapping dalla luminosita' della texture colore ---
-/// Spegne il parallax (le normal map restano).
 const USE_PARALLAX: bool = false;
-/// Profondita' dell'effetto in spazio UV: 0.02 sottile, 0.05 marcato.
 const PARALLAX_DEPTH_SCALE: f32 = 0.03;
-/// Passi massimi lungo il raggio visivo (piu' alto = piu' preciso e piu' lento).
 const PARALLAX_MAX_LAYERS: f32 = 16.0;
-/// `true`: parallax "relief" (piu' preciso, piu' costoso); `false`: "occlusion".
 const PARALLAX_RELIEF: bool = true;
-/// `true` inverte la mappa (scuro = sporgenza). Il default segue Bevy: bianco = fondo, quindi
-/// le zone scure diventano incavi. Se l'effetto ti sembra al contrario, cambia questo.
 const PARALLAX_INVERT: bool = true;
 
 fn repeat_sampler() -> ImageSampler {
@@ -92,9 +43,6 @@ fn repeat_sampler() -> ImageSampler {
     })
 }
 
-/// Gira in verticale una matrice RGBA8 in-place (swap delle righe).
-/// Duplicato di `mod_textures::flip_v_in_place`: piccola funzione, non vale
-/// la pena renderla `pub(crate)` solo per questo.
 fn flip_v_rgba8(rgba: &mut [u8], w: usize, h: usize) {
     let row = w * 4;
     for y in 0..h / 2 {
@@ -106,11 +54,6 @@ fn flip_v_rgba8(rgba: &mut [u8], w: usize, h: usize) {
     }
 }
 
-/// Albedo da mod o dal file originale.
-///
-/// Restituisce anche `needs_flip`: true se la texture è in ordine "bottom-up"
-/// e quindi va mostrata con la V capovolta tramite `uv_transform`. È true per
-/// i BC7 di DREAM (vedi `ModTextures::needs_v_flip`).
 fn load_albedo(
     archive: u32,
     record: u8,
@@ -150,13 +93,9 @@ fn load_albedo(
         RenderAssetUsages::default(),
     );
     image.sampler = repeat_sampler();
-    // Vanilla ipotizzata top-down (Bevy-friendly): niente flip. Se anche le
-    // texture originali risultassero capovolte, cambiare `false` in `true`.
     Some((images.add(image), false))
 }
 
-/// Deriva una normal map dall'albedo (blur 3x3 + Sobel, strength bassa).
-/// Solo fallback se la mod non ha la normal map vera.
 fn derive_normal_map(rgba: &[u8], w: usize, h: usize) -> Image {
     debug_assert_eq!(rgba.len(), w * h * 4);
 
@@ -220,18 +159,12 @@ fn derive_normal_map(rgba: &[u8], w: usize, h: usize) -> Image {
     image
 }
 
-/// Depth map per il parallax dalla luminosita' della texture colore: scuro = incavo (profondo),
-/// chiaro = sporgenza. Output `Rgba8Unorm` lineare (Bevy vuole la depth map non sRGB), stesso
-/// ordine di righe dell'input.
 fn derive_depth_map(rgba: &[u8], w: usize, h: usize) -> Image {
-
-    // luminosita' percettiva: i byte della texture sono gia' in sRGB
     let lum: Vec<f32> = rgba
-        .chunks_exact(4)
-        .map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0)
-        .collect();
+    .chunks_exact(4)
+    .map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0)
+    .collect();
 
-    // blur 3x3 "a toro" (le texture dei muri si ripetono): toglie il rumore a pixel singolo
     let mut blurred = vec![0.0f32; w * h];
     for y in 0..h {
         for x in 0..w {
@@ -247,7 +180,6 @@ fn derive_depth_map(rgba: &[u8], w: usize, h: usize) -> Image {
         }
     }
 
-    // sfrutta tutta la gamma: stira fra il 2% e il 98% delle luminosita'
     let mut sorted = blurred.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let last = sorted.len().saturating_sub(1);
@@ -258,7 +190,7 @@ fn derive_depth_map(rgba: &[u8], w: usize, h: usize) -> Image {
     let mut out = vec![255u8; w * h * 4];
     for (i, &v) in blurred.iter().enumerate() {
         let bright = ((v - lo) / range).clamp(0.0, 1.0);
-        let deep = if PARALLAX_INVERT { bright } else { 1.0 - bright }; // scuro -> profondo
+        let deep = if PARALLAX_INVERT { bright } else { 1.0 - bright };
         let depth = (deep * 255.0).round() as u8;
         out[i * 4..i * 4 + 3].fill(depth);
     }
@@ -298,14 +230,6 @@ fn flat_albedo_from_mod(
 }
 
 impl WallTextures {
-    /// Normal map per un muro: prima dalla mod (decodificata + verde girato),
-    /// poi derivata dall'albedo, poi niente.
-    ///
-    /// `albedo_needs_flip`: se true, l'albedo del muro è in ordine bottom-up
-    /// (BC7 mod) e il materiale verrà mostrato con `uv_transform` che gira la V.
-    /// In tal caso, se la normal map viene **derivata** dal file originale,
-    /// gio l'albedo di input al Sobel per farla finire nella stessa convenzione
-    /// bottom-up dell'albedo BC7 (altrimenti la luce risulterebbe invertita).
     fn normal_map(
         &mut self,
         archive: u32,
@@ -319,7 +243,6 @@ impl WallTextures {
             return cached.clone();
         }
 
-        // 1. Normal map dalla mod, corretta (DirectX → OpenGL, V allineato).
         let key = TextureKey {
             archive,
             record: record as u32,
@@ -327,9 +250,6 @@ impl WallTextures {
             kind: MapKind::Normal,
         };
         if let Some(handle) = mods.image_normal_by_key(&key, images) {
-            // Le mura vanno tiled: forziamo il sampler Repeat. Nota che
-            // `image_normal_by_key` crea l'immagine con `RENDER_WORLD`, quindi
-            // dopo il primo upload sulla GPU `get_mut` può restituire `None`.
             if let Some(img) = images.get_mut(&handle) {
                 img.sampler = repeat_sampler();
             }
@@ -338,7 +258,6 @@ impl WallTextures {
             return Some(handle);
         }
 
-        // 2. Deriva dall'albedo originale.
         info!("Normal map {archive}:{record} non in mod, derivo dall'albedo");
         let path = find_file_ci(&data.dir, &archive_file_name(archive))?;
         let file = TextureFile::open(&path).ok()?;
@@ -348,8 +267,6 @@ impl WallTextures {
             return None;
         }
         let mut rgba = frame.to_rgba(&data.palette, None);
-        // Allinea l'input alla convenzione dell'albedo mod (BC7 = bottom-up),
-        // così la normal derivata può condividere lo stesso `uv_transform`.
         if albedo_needs_flip {
             flip_v_rgba8(&mut rgba, frame.width, frame.height);
         }
@@ -359,9 +276,6 @@ impl WallTextures {
         Some(handle)
     }
 
-    /// Depth map del parallax per un muro, dalla luminosita' della texture colore originale
-    /// (palette di Daggerfall). `albedo_needs_flip`: l'albedo mostrata e' capovolta via
-    /// `uv_transform`, quindi l'input viene capovolto uguale.
     fn depth_map(
         &mut self,
         archive: u32,
@@ -420,15 +334,12 @@ impl WallTextures {
         };
 
         let normal = self.normal_map(final_archive, record, needs_flip, data, mods, images);
-        // Bump per il parallax: dalla luminosita' della texture colore (vedi `derive_depth_map`).
         let depth = if USE_PARALLAX && albedo.is_some() {
             self.depth_map(final_archive, archive as u32, record, needs_flip, data, images)
         } else {
             None
         };
 
-        // Flip V per i muri BC7 (bottom-up, convenzione Unity/Daggerfall).
-        // Stesso meccanismo dei flat (vedi `flat_material_frame`).
         let uv_transform = if needs_flip {
             Affine2::from_scale_angle_translation(
                 Vec2::new(1.0, -1.0),
@@ -452,8 +363,6 @@ impl WallTextures {
                     ParallaxMappingMethod::Occlusion
                 },
                 max_parallax_layer_count: PARALLAX_MAX_LAYERS,
-                // con l'albedo capovolta via uv_transform `prepare_mesh` inverte la B delle tangenti:
-                // il verde della normal map si inverte con lei e le normali restano uguali
                 flip_normal_map_y: needs_flip,
                 uv_transform,
                 perceptual_roughness: 0.9,
@@ -480,13 +389,10 @@ impl WallTextures {
         handle
     }
 
-    /// Il materiale usa normal map o parallax: la mesh ha bisogno delle tangenti.
     pub fn has_normal_map(&self, mat: &Handle<StandardMaterial>) -> bool {
         self.normal_materials.contains(&mat.id())
     }
 
-    /// Prepara la mesh per il materiale: tangenti (senza, Bevy ignora normal map e parallax) e,
-    /// se l'albedo e' capovolta via `uv_transform`, B invertita (segno `w` delle tangenti).
     pub fn prepare_mesh(&self, mat: &Handle<StandardMaterial>, mesh: &mut Mesh) {
         if !self.normal_materials.contains(&mat.id()) || mesh.generate_tangents().is_err() {
             return;

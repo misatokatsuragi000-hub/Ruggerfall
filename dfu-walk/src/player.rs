@@ -67,11 +67,35 @@ pub fn grab_cursor(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     equipment: Res<crate::equipment::EquipmentState>,
+    dialog: Res<crate::dialog::DialogState>,
+    mut was_locked: Local<bool>,
 ) {
     if equipment.open {
         return;
     }
     let Ok(mut window) = windows.get_single_mut() else { return };
+    let now_locked = window.cursor_options.grab_mode == CursorGrabMode::Locked;
+
+    // --- Dialogo aperto: cursore libero, non lockato. ---
+    // NON tocchiamo `visible`: ci pensa `custom_cursor` in PostUpdate a
+    // nascondere il cursore di sistema e mostrare quello custom.
+    if dialog.open {
+        if now_locked {
+            *was_locked = true;
+        }
+        window.cursor_options.grab_mode = CursorGrabMode::None;
+        return;
+    }
+
+    // --- Dialogo chiuso: se eravamo Locked prima, ripristina ---
+    if *was_locked {
+        *was_locked = false;
+        window.cursor_options.grab_mode = CursorGrabMode::Locked;
+        window.cursor_options.visible = false;
+        return;
+    }
+
+    // --- Gioco normale: click sinistro = acquisisce, Esc = rilascia ---
     if mouse.just_pressed(MouseButton::Left) {
         window.cursor_options.grab_mode = CursorGrabMode::Locked;
         window.cursor_options.visible = false;

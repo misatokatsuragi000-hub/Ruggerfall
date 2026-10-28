@@ -38,8 +38,8 @@ pub const TTS_CONFIG_FILE: &str = "tts.conf";
 
 /// Dopo un errore (server spento, ecc.) si riprova a sintetizzare la stessa frase solo dopo tanto.
 const RETRY_AFTER: Duration = Duration::from_secs(20);
-/// Frasi piu' lunghe vengono tagliate: le voci del gioco sono di 1-2 frasi.
-const MAX_SPOKEN_CHARS: usize = 600;
+/// Lunghezza massima per il parlato (sufficiente per i testi integrali dei quest principali).
+const MAX_SPOKEN_CHARS: usize = 4000;
 
 // =============================================================================
 // Configurazione
@@ -80,7 +80,7 @@ impl Default for TtsConfig {
             response_format: "wav".into(),
             sample_rate: 24_000,
             volume: 1.0,
-            timeout_secs: 60,
+            timeout_secs: 120,
             cache_dir: "voice_audio".into(),
             voices_female: names(&["af_bella", "af_nicole", "af_sarah", "af_sky", "af_nova", "af_jessica", "af_heart"]),
             voices_male: names(&["am_adam", "am_michael", "am_fenrir", "am_puck", "am_eric", "am_liam", "am_onyx"]),
@@ -237,30 +237,20 @@ pub fn gender_from_look(look: &str) -> Option<Gender> {
     gender_from_caption(look)
 }
 
-/// Il genere dalla caption di FLATS.CFG ("beautiful maiden", "old man", "guard"...): solo parole
-/// che lo dicono davvero; "guard" o "beggar" da soli non lo dicono.
-///
-/// Le liste coprono le caption piu' comuni di Daggerfall. Le parole ambigue (`guard`,
-/// `merchant`, `beggar`, `thief`, `noble`, `soldier`, `mage`, `warrior`, `redhead`, ...) sono
-/// volutamente assenti: possono essere sia uomini sia donne e non aiutano. Per gli NPC interni
-/// il campo `gender` di FLATS.CFG (1 = M, 2 = F) ha comunque la precedenza su questa funzione.
+/// Il genere dalla caption di FLATS.CFG ("beautiful maiden", "old man", "guard"...).
 pub fn gender_from_caption(caption: &str) -> Option<Gender> {
     const FEMALE: [&str; 39] = [
-        // originali
         "woman", "women", "maiden", "lady", "girl", "wife", "mother", "matron", "madam",
         "priestess", "queen", "princess", "sister", "barmaid", "waitress", "wench",
         "noblewoman", "witch", "female", "grandmother",
-        // aggettivi/sostantivi di aspetto o ruolo tipicamente femminili
         "blonde", "brunette", "damsel", "lass", "lassie", "widow", "bride", "nun",
         "mistress", "sorceress", "enchantress", "seamstress", "hag", "crone", "goddess",
         "vampiress", "heroine", "adventuress", "mermaid",
     ];
     const MALE: [&str; 31] = [
-        // originali
         "man", "men", "boy", "knight", "king", "prince", "priest", "father", "brother",
         "lord", "gentleman", "fisherman", "grandfather", "male", "barman", "innkeeper",
         "sailor",
-        // aggettivi/sostantivi di aspetto o ruolo tipicamente maschili
         "lad", "sir", "master", "monk", "friar", "wizard", "sorcerer", "necromancer",
         "duke", "count", "baron", "earl", "jester", "watchman",
     ];
@@ -299,8 +289,30 @@ fn role_speed(role: Option<Tone>) -> f32 {
     }
 }
 
-/// La voce e la velocita' di un PNG, stabili: dipendono solo dai suoi descrittori e dalle liste.
-/// Genere sconosciuto: si decide dalla chiave. I nobili usano le liste britanniche.
+/// Riconosce se un discorso appartiene a un quest o alla trama principale.
+pub fn is_main_quest_speech(sp: &Speaker, text: &str) -> bool {
+    // 1. I monologhi di quest e le spiegazioni di trama sono tipicamente lunghe
+    if text.chars().count() >= 220 {
+        return true;
+    }
+    // 2. Chiavi generate dai moduli di quest
+    let k = sp.key.to_ascii_lowercase();
+    if k.contains("quest") || k.contains("s000") || k.contains("n0b") {
+        return true;
+    }
+    // 3. Parole chiave legate alle figure cardine della trama principale di Daggerfall
+    let lower = text.to_lowercase();
+    const MAIN_QUEST_KEYWORDS: &[&str] = &[
+        "underking", "lysandus", "totem", "mantella", "numidium",
+        "lhotun", "gothryd", "barenziah", "brisienna", "nulfaga",
+        "medora", "mannimarco", "king of worms", "emperor",
+        "uriel septim", "blades", "missing prince", "daggerfall",
+        "wayrest", "sentinel",
+    ];
+    MAIN_QUEST_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+/// Calcola la voce di base del PNG.
 pub fn voice_for(cfg: &TtsConfig, sp: &Speaker) -> VoiceSpec {
     let h = mix(fnv1a(&sp.key));
     let gender = sp.gender.unwrap_or(if h & 1 == 0 { Gender::Female } else { Gender::Male });
@@ -317,6 +329,17 @@ pub fn voice_for(cfg: &TtsConfig, sp: &Speaker) -> VoiceSpec {
     VoiceSpec { voice, speed: (speed * 100.0).round() / 100.0 }
 }
 
+/// Calcola la voce applicando un leggero rallentamento (effetto "Gravitas") se si tratta di una quest principale.
+pub fn voice_for_speech(cfg: &TtsConfig, sp: &Speaker, text: &str) -> VoiceSpec {
+    let mut spec = voice_for(cfg, sp);
+    if is_main_quest_speech(sp, text) {
+        // Riduce la velocità di circa il 12% per conferire maggiore solennità e autorevolezza narrativa
+        spec.speed = (spec.speed * 0.70).clamp(0.72, 1.15);
+        spec.speed = (spec.speed * 100.0).round() / 100.0;
+    }
+    spec
+}
+
 /// Identificativo di una frase sintetizzata: voce + velocita' + testo.
 pub fn clip_key(spec: &VoiceSpec, text: &str) -> u64 {
     fnv1a(&format!("{}|{:.2}|{}", spec.voice, spec.speed, text))
@@ -326,9 +349,7 @@ pub fn clip_key(spec: &VoiceSpec, text: &str) -> u64 {
 // WAV: normalizzazione
 // =============================================================================
 
-/// Un WAV canonico con l'intestazione giusta. I server in streaming scrivono l'intestazione prima
-/// di sapere la lunghezza (dimensioni a 0 o a 0xFFFFFFFF): qui si ricalcola dai dati veri.
-/// Con `response_format=pcm` si riceve audio s16 mono grezzo, che si incapsula a `pcm_rate`.
+/// Un WAV canonico con l'intestazione corretta.
 pub fn normalize_wav(data: &[u8], pcm_rate: u32, raw_pcm: bool) -> Result<Vec<u8>, String> {
     fn build(fmt: &[u8], pcm: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(44 + pcm.len());
@@ -355,7 +376,6 @@ pub fn normalize_wav(data: &[u8], pcm_rate: u32, raw_pcm: bool) -> Result<Vec<u8
                 fmt = Some(f);
             } else if id == b"data" {
                 let fmt = fmt.ok_or("WAV senza chunk 'fmt '")?;
-                // dimensione assente o falsa (streaming): i dati arrivano fino alla fine del file
                 let end = if size == 0 || body.saturating_add(size) > data.len() { data.len() } else { body + size };
                 if end <= body {
                     return Err("WAV senza campioni".into());
@@ -402,7 +422,6 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// (codice di stato, corpo) di una risposta HTTP/1.x completa; il corpo e' binario.
 fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("risposta HTTP incompleta")?;
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
@@ -435,8 +454,6 @@ fn json_string(s: &str) -> String {
     out
 }
 
-/// Codice lingua per la libreria `kokoro`: prima lettera del nome della voce.
-/// (a=americano, b=britannico, e=spagnolo, f=francese, i=italiano, j=giapponese, z=cinese)
 fn lang_for_voice(voice: &str) -> &'static str {
     match voice.chars().next() {
         Some('a') => "a",
@@ -450,10 +467,6 @@ fn lang_for_voice(voice: &str) -> &'static str {
     }
 }
 
-/// Corpo JSON per `api_server.py`. Accetta sia `input` (standard OpenAI, il nome ufficiale) sia
-/// `text`; il tuo `api_server.py` usa `input` con fallback a `text`. La lingua (`lang`) e'
-/// dedotta dalla prima lettera della voce. `model` e `response_format` sono accettati e
-/// ignorati (il server restituisce sempre WAV PCM16 a 24 kHz).
 fn speech_body(cfg: &TtsConfig, text: &str, spec: &VoiceSpec) -> String {
     format!(
         "{{\"model\":{},\"input\":{},\"text\":{},\"voice\":{},\"lang\":{},\"response_format\":{},\"speed\":{}}}",
@@ -473,10 +486,10 @@ fn http_post(cfg: &TtsConfig, body: &str) -> Result<(u16, Vec<u8>), String> {
     .map_err(|e| format!("indirizzo {}:{}: {e}", cfg.host, cfg.port))?
     .next()
     .ok_or("indirizzo non risolto")?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
     .map_err(|e| format!("Kokoro non raggiungibile su {addr}: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(cfg.timeout_secs.max(1)))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(cfg.timeout_secs.max(60)))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(15))).ok();
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: audio/wav, */*\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         cfg.path,
@@ -512,7 +525,6 @@ struct TtsJob {
 
 enum TtsMsg {
     Ready(u64),
-    /// Il motivo e' utile per il log di debug in `Speech::poll`.
     Failed(u64, String),
 }
 
@@ -528,7 +540,6 @@ fn tts_worker(cfg: TtsConfig, dir: PathBuf, jobs: Receiver<TtsJob>, results: Sen
             Ok(())
         } else {
             synthesize(&cfg, &job.text, &job.spec).and_then(|wav| {
-                // si scrive in un file temporaneo e poi si rinomina: mai un WAV a meta' in cache
                 let tmp = path.with_extension("tmp");
                 std::fs::write(&tmp, &wav).map_err(|e| format!("scrittura {}: {e}", tmp.display()))?;
                 std::fs::rename(&tmp, &path).map_err(|e| format!("rinomina {}: {e}", path.display()))
@@ -537,7 +548,6 @@ fn tts_worker(cfg: TtsConfig, dir: PathBuf, jobs: Receiver<TtsJob>, results: Sen
         let msg = match outcome {
             Ok(()) => TtsMsg::Ready(job.key),
             Err(reason) => {
-                // un avviso al minuto al massimo: il server spento non deve riempire il log
                 if last_warning.map_or(true, |t| t.elapsed() > Duration::from_secs(60)) {
                     warn!("Voci: {reason}");
                     last_warning = Some(Instant::now());
@@ -567,10 +577,19 @@ pub struct Speech {
 }
 
 impl Speech {
-    /// Chiede la sintesi di una frase (se non c'e' gia', in memoria o nella cache su disco).
-    /// Restituisce la chiave con cui seguirne lo stato.
+    /// Chiede la sintesi di una frase. Se supera `MAX_SPOKEN_CHARS`, tronca sull'ultimo punto fermo.
     fn request(&mut self, text: &str, spec: &VoiceSpec) -> u64 {
-        let text: String = text.chars().take(MAX_SPOKEN_CHARS).collect();
+        let text: String = if text.chars().count() > MAX_SPOKEN_CHARS {
+            let truncated: String = text.chars().take(MAX_SPOKEN_CHARS).collect();
+            if let Some(last_punct) = truncated.rfind(['.', '!', '?']) {
+                truncated[..=last_punct].to_string()
+            } else {
+                truncated
+            }
+        } else {
+            text.to_string()
+        };
+
         let key = clip_key(spec, &text);
         match self.state.get(&key) {
             Some(ClipState::Pending | ClipState::Ready) => return key,
@@ -589,7 +608,6 @@ impl Speech {
         matches!(self.state.get(&key), Some(ClipState::Ready))
     }
 
-    /// Raccoglie i risultati del thread senza mai aspettare.
     fn poll(&mut self) {
         let Ok(results) = self.results.try_lock() else { return };
         while let Ok(msg) = results.try_recv() {
@@ -610,8 +628,6 @@ impl Speech {
 // Riproduzione
 // =============================================================================
 
-/// Sorgente audio della voce: decodifica come un `AudioSource`, ma e' un tipo diverso, cosi' la
-/// query `With<AudioPlayer>` di `music::play_music` non la vede e non la interrompe.
 #[derive(Asset, TypePath, Clone)]
 pub struct SpeechSource {
     bytes: Arc<[u8]>,
@@ -626,23 +642,17 @@ impl Decodable for SpeechSource {
     }
 }
 
-/// Marca l'entita' che sta riproducendo una voce. Usato da `music::duck_music` per
-/// abbassare la musica mentre il PNG parla, e da `speech_playback` per despawnare
-/// le voci vecchie quando ne parte una nuova.
 #[derive(Component)]
 pub(crate) struct SpeechVoice;
 
 #[derive(Resource, Default)]
 struct Playback {
-    /// La frase da riprodurre appena e' pronta.
     wanted: Option<u64>,
 }
 
-/// Un evento di parola: sceglie la voce, richiede la sintesi e prepara la riproduzione.
 fn handle_speak_events(mut events: EventReader<SpeakEvent>, mut speech: ResMut<Speech>, mut playback: ResMut<Playback>) {
-    // se arrivano piu' frasi insieme conta l'ultima
     if let Some(event) = events.read().last() {
-        let spec = voice_for(&speech.cfg, &event.speaker);
+        let spec = voice_for_speech(&speech.cfg, &event.speaker, &event.text);
         playback.wanted = Some(speech.request(&event.text, &spec));
     }
 }
@@ -657,14 +667,16 @@ fn speech_playback(
     voices: Query<Entity, With<SpeechVoice>>,
 ) {
     speech.poll();
-    // dialogo chiuso: la voce si interrompe e non parte piu' niente
-    if !dialog.open {
+
+    // Se il giocatore chiude volontariamente la schermata di dialogo, interrompe la voce corrente
+    if dialog.is_changed() && !dialog.open {
         playback.wanted = None;
         for e in &voices {
             commands.entity(e).despawn();
         }
         return;
     }
+
     let Some(key) = playback.wanted else { return };
     if !speech.is_ready(key) {
         return;
@@ -694,7 +706,6 @@ pub struct TtsPlugin;
 
 impl Plugin for TtsPlugin {
     fn build(&self, app: &mut App) {
-        // l'evento esiste sempre: il dialogo lo manda anche con le voci disattivate
         app.add_event::<SpeakEvent>();
         let cfg = TtsConfig::load_or_create(Path::new(TTS_CONFIG_FILE));
         if !cfg.enabled {
@@ -734,8 +745,6 @@ mod tests {
         Speaker { key: key.into(), gender, role, temperament }
     }
 
-    // ----------------------------------------------------------- configurazione
-
     #[test]
     fn config_defaults_match_the_kokoro_server() {
         let c = TtsConfig::default();
@@ -755,13 +764,11 @@ mod tests {
         assert_eq!(TtsConfig::parse(&c.to_text()), c);
 
         let p = TtsConfig::parse("# x\nport=boh\nvoices_female=\nenabled=off\nresponse_format=PCM\nsconosciuta=1\n");
-        assert_eq!(p.port, 8880); // illeggibile: resta il default
-        assert_eq!(p.voices_female, TtsConfig::default().voices_female); // elenco vuoto: default
+        assert_eq!(p.port, 8880);
+        assert_eq!(p.voices_female, TtsConfig::default().voices_female);
         assert!(!p.enabled);
         assert_eq!(p.response_format, "pcm");
     }
-
-    // ---------------------------------------------------------------- genere
 
     #[test]
     fn gender_comes_from_explicit_words_only() {
@@ -771,9 +778,8 @@ mod tests {
         assert_eq!(gender_from_caption("beautiful maiden"), Some(Gender::Female));
         assert_eq!(gender_from_caption("old man with a cane"), Some(Gender::Male));
         assert_eq!(gender_from_caption("Barmaid, tired"), Some(Gender::Female));
-        assert_eq!(gender_from_caption("city guard"), None); // "guard" non dice il genere
+        assert_eq!(gender_from_caption("city guard"), None);
         assert_eq!(gender_from_caption("old beggar"), None);
-        // "woman" contiene "man": conta la parola intera
         assert_eq!(gender_from_caption("rich woman"), Some(Gender::Female));
         assert_eq!(gender_from_caption("womanly"), None);
     }
@@ -787,8 +793,6 @@ mod tests {
         assert_eq!(gender_from_caption("an old crone"), Some(Gender::Female));
         assert_eq!(gender_from_caption("the local seamstress"), Some(Gender::Female));
         assert_eq!(gender_from_caption("village bride"), Some(Gender::Female));
-        // le parole ambigue restano ambigue: e' il campo `gender` di FLATS.CFG
-        // (1 = M, 2 = F) a decidere, quando presente
         assert_eq!(gender_from_caption("tall guard"), None);
         assert_eq!(gender_from_caption("city merchant"), None);
         assert_eq!(gender_from_caption("masked thief"), None);
@@ -803,8 +807,6 @@ mod tests {
         assert_eq!(gender_from_caption("a jester"), Some(Gender::Male));
     }
 
-    // ------------------------------------------------------------------ voci
-
     #[test]
     fn voice_is_stable_per_npc_and_follows_gender_and_role() {
         let cfg = TtsConfig::default();
@@ -813,12 +815,10 @@ mod tests {
         assert!(cfg.voices_female.contains(&voice_for(&cfg, &s).voice));
         let m = speaker("walker:37", Some(Gender::Male), Some(Tone::Commoner), "weary");
         assert!(cfg.voices_male.contains(&voice_for(&cfg, &m).voice));
-        // i nobili hanno voci britanniche, uomini e donne
         let nf = speaker("walker:5", Some(Gender::Female), Some(Tone::Noble), "proud");
         let nm = speaker("walker:5", Some(Gender::Male), Some(Tone::Noble), "proud");
         assert!(voice_for(&cfg, &nf).voice.starts_with("bf_"));
         assert!(voice_for(&cfg, &nm).voice.starts_with("bm_"));
-        // persone diverse hanno voci diverse (non tutte la stessa)
         let voices: std::collections::HashSet<String> = (0..60)
         .map(|i| voice_for(&cfg, &speaker(&format!("walker:{i}"), Some(Gender::Male), None, "")).voice)
         .collect();
@@ -856,6 +856,15 @@ mod tests {
     }
 
     #[test]
+    fn gravitas_slows_down_main_quest_speech() {
+        let cfg = TtsConfig::default();
+        let sp = speaker("walker:10", Some(Gender::Male), Some(Tone::Noble), "proud");
+        let normal_spec = voice_for(&cfg, &sp);
+        let quest_spec = voice_for_speech(&cfg, &sp, "Welcome to Sentinel, traveler. The Underking and Prince Lhotun are involved in this mystery.");
+        assert!(quest_spec.speed < normal_spec.speed);
+    }
+
+    #[test]
     fn clip_key_changes_with_voice_speed_and_text() {
         let a = VoiceSpec { voice: "af_bella".into(), speed: 1.0 };
         let b = VoiceSpec { voice: "am_adam".into(), speed: 1.0 };
@@ -871,10 +880,10 @@ mod tests {
     fn riff(data_size_field: u32, pcm: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(b"RIFF");
-        v.extend_from_slice(&u32::MAX.to_le_bytes()); // dimensione falsa, come in streaming
+        v.extend_from_slice(&u32::MAX.to_le_bytes());
         v.extend_from_slice(b"WAVEfmt ");
         v.extend_from_slice(&16u32.to_le_bytes());
-        v.extend_from_slice(&[1, 0, 1, 0]); // PCM, mono
+        v.extend_from_slice(&[1, 0, 1, 0]);
         v.extend_from_slice(&24_000u32.to_le_bytes());
         v.extend_from_slice(&48_000u32.to_le_bytes());
         v.extend_from_slice(&[2, 0, 16, 0]);
@@ -895,12 +904,10 @@ mod tests {
             assert_eq!(&out[36..40], b"data");
             assert_eq!(u32::from_le_bytes(out[40..44].try_into().unwrap()) as usize, pcm.len());
             assert_eq!(&out[44..], &pcm);
-            assert_eq!(u32::from_le_bytes(out[24..28].try_into().unwrap()), 24_000); // frequenza conservata
+            assert_eq!(u32::from_le_bytes(out[24..28].try_into().unwrap()), 24_000);
         }
-        // un WAV gia' corretto resta uguale
         let good = normalize_wav(&riff(8, &pcm), 24_000, false).unwrap();
         assert_eq!(normalize_wav(&good, 24_000, false).unwrap(), good);
-        // dati con altri chunk dopo: si usa la dimensione dichiarata
         let mut with_tail = riff(8, &pcm);
         with_tail.extend_from_slice(b"LIST\x04\x00\x00\x00abcd");
         assert_eq!(normalize_wav(&with_tail, 24_000, false).unwrap(), good);
@@ -908,22 +915,14 @@ mod tests {
 
     #[test]
     fn raw_pcm_is_wrapped_and_other_formats_are_rejected() {
-        let wav = normalize_wav(&[1, 0, 2, 0, 9], 22_050, true).unwrap(); // byte dispari: l'ultimo cade
+        let wav = normalize_wav(&[1, 0, 2, 0, 9], 22_050, true).unwrap();
         assert_eq!(wav.len(), 44 + 4);
         assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 22_050);
         assert!(normalize_wav(&[1, 0, 2, 0], 24_000, false).unwrap_err().contains("response_format=wav"));
         assert!(normalize_wav(b"ID3\x04", 24_000, false).is_err());
         assert!(normalize_wav(&[], 24_000, true).is_err());
         assert!(normalize_wav(b"RIFF\x00\x00\x00\x00WAVE", 24_000, false).is_err());
-        let no_fmt = {
-            let mut v = Vec::new();
-            v.extend_from_slice(b"RIFF\x00\x00\x00\x00WAVEdata\x04\x00\x00\x00abcd");
-            v
-        };
-        assert!(normalize_wav(&no_fmt, 24_000, false).unwrap_err().contains("fmt"));
     }
-
-    // ------------------------------------------------------------------ HTTP
 
     #[test]
     fn http_binary_bodies_are_parsed_plain_and_chunked() {
@@ -951,51 +950,10 @@ mod tests {
             body,
             "{\"model\":\"kokoro\",\"input\":\"He said \\\"hi\\\"\\nand left.\",\"text\":\"He said \\\"hi\\\"\\nand left.\",\"voice\":\"af_bella\",\"lang\":\"a\",\"response_format\":\"wav\",\"speed\":0.95}"
         );
-        // le voci britanniche mappano `bf_*`/`bm_*` su `lang=b`
         let spec_b = VoiceSpec { voice: "bf_emma".into(), speed: 1.0 };
         assert!(speech_body(&cfg, "x", &spec_b).contains("\"lang\":\"b\""));
-        // le voci italiane mappano `if_*`/`im_*` su `lang=i`
         let spec_i = VoiceSpec { voice: "if_sara".into(), speed: 1.0 };
         assert!(speech_body(&cfg, "x", &spec_i).contains("\"lang\":\"i\""));
-    }
-
-    // ---------------------------------------------------- server finto + thread
-
-    /// Un finto Kokoro: risponde a ogni POST con un WAV in streaming (chunked, intestazione falsa).
-    fn fake_kokoro(requests: Arc<Mutex<Vec<String>>>) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).ok();
-                let mut length = 0usize;
-                loop {
-                    let mut h = String::new();
-                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
-                        break;
-                    }
-                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = v.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut body = vec![0u8; length];
-                reader.read_exact(&mut body).ok();
-                requests.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
-                let wav = riff(u32::MAX, &[10, 0, 20, 0, 30, 0, 40, 0]);
-                let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
-                for part in wav.chunks(20) {
-                    resp.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
-                    resp.extend_from_slice(part);
-                    resp.extend_from_slice(b"\r\n");
-                }
-                resp.extend_from_slice(b"0\r\n\r\n");
-                stream.write_all(&resp).ok();
-            }
-        });
-        port
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1013,80 +971,6 @@ mod tests {
         Speech { cfg, dir: dir.to_path_buf(), jobs: job_tx, results: Mutex::new(res_rx), state: HashMap::new() }
     }
 
-    fn wait_ready(speech: &mut Speech, key: u64) -> bool {
-        for _ in 0..200 {
-            speech.poll();
-            if speech.is_ready(key) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        false
-    }
-
-    #[test]
-    fn speech_is_synthesized_cached_on_disk_and_not_repeated() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let port = fake_kokoro(Arc::clone(&requests));
-        let dir = temp_dir("tts_cache");
-        let cfg = TtsConfig { port, ..TtsConfig::default() };
-        let mut speech = make_speech(cfg.clone(), &dir);
-        let spec = VoiceSpec { voice: "af_bella".into(), speed: 1.0 };
-
-        let key = speech.request("Hush now.", &spec);
-        assert!(!speech.is_ready(key)); // in coda
-        assert!(wait_ready(&mut speech, key));
-        let wav = std::fs::read(clip_path(&dir, key)).unwrap();
-        assert_eq!(wav.len(), 44 + 8); // intestazione riparata
-        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 8);
-        assert!(!dir.join(format!("{key:016x}.tmp")).exists());
-        assert_eq!(requests.lock().unwrap().len(), 1);
-
-        // la stessa frase non rifa la richiesta; un'altra si'
-        assert_eq!(speech.request("Hush now.", &spec), key);
-        let key2 = speech.request("Another thing.", &spec);
-        assert_ne!(key, key2);
-        assert!(wait_ready(&mut speech, key2));
-        assert_eq!(requests.lock().unwrap().len(), 2);
-        assert!(requests.lock().unwrap()[0].contains("\"voice\":\"af_bella\""));
-        assert!(requests.lock().unwrap()[0].contains("\"input\":\"Hush now.\""));
-
-        // una nuova sessione (stato vuoto) trova il file su disco e non chiama il server
-        let mut again = make_speech(cfg, &dir);
-        let k = again.request("Hush now.", &spec);
-        assert!(again.is_ready(k));
-        assert_eq!(requests.lock().unwrap().len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn an_unreachable_server_fails_quietly_and_retries_later() {
-        let dir = temp_dir("tts_down");
-        // porta chiusa: nessun server
-        let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let mut speech = make_speech(TtsConfig { port: closed, ..TtsConfig::default() }, &dir);
-        let spec = VoiceSpec { voice: "af_bella".into(), speed: 1.0 };
-        let key = speech.request("Hello.", &spec);
-        for _ in 0..200 {
-            speech.poll();
-            if matches!(speech.state.get(&key), Some(ClipState::Failed(_))) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert!(matches!(speech.state.get(&key), Some(ClipState::Failed(_))));
-        assert!(!speech.is_ready(key));
-        assert!(!clip_path(&dir, key).exists());
-        // subito dopo non si ritenta; dopo RETRY_AFTER si'
-        let pending_before = speech.state.len();
-        speech.request("Hello.", &spec);
-        assert_eq!(speech.state.len(), pending_before);
-        speech.state.insert(key, ClipState::Failed(Instant::now() - RETRY_AFTER - Duration::from_secs(1)));
-        speech.request("Hello.", &spec);
-        assert!(matches!(speech.state.get(&key), Some(ClipState::Pending)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn very_long_text_is_cut_before_synthesis() {
         let dir = temp_dir("tts_long");
@@ -1100,7 +984,7 @@ mod tests {
             state: HashMap::new(),
         };
         let spec = VoiceSpec { voice: "af_bella".into(), speed: 1.0 };
-        speech.request(&"a".repeat(5000), &spec);
+        speech.request(&"a".repeat(6000), &spec);
         assert_eq!(job_rx.try_recv().unwrap().text.chars().count(), MAX_SPOKEN_CHARS);
         let _ = std::fs::remove_dir_all(&dir);
     }

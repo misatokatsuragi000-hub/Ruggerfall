@@ -328,11 +328,13 @@ fn handle_weapon_input(
     mouse: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     eq_state: Res<EquipmentState>,
+    dialog: Res<crate::dialog::DialogState>,   // <-- aggiunto
     mut state: ResMut<FpsWeaponState>,
 ) {
-    if eq_state.open {
+    if eq_state.open || dialog.open {          // <-- aggiunto `|| dialog.open`
         return;
     }
+
 
     // Regolazione al volo della scala con tasti [ e ] o TN+ e TN-
     if keys.just_pressed(KeyCode::NumpadAdd) || keys.just_pressed(KeyCode::BracketRight) {

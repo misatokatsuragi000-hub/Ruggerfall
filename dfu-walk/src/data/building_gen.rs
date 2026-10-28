@@ -845,9 +845,9 @@ impl CityBuilder {
                 let raw_uv2 = face.uvs.get(k + 1).copied().unwrap_or([0.0, 1.0]);
 
                 // Normalizzazione UV su 64 pixel (ripetizione texture 1:1)
-                let uv0 = [raw_uv0[0] / 64.0, raw_uv0[1] / 64.0];
-                let uv1 = [raw_uv1[0] / 64.0, raw_uv1[1] / 64.0];
-                let uv2 = [raw_uv2[0] / 64.0, raw_uv2[1] / 64.0];
+                let uv0 = [raw_uv0[0] / 128.0, raw_uv0[1] / 128.0];
+                let uv1 = [raw_uv1[0] / 128.0, raw_uv1[1] / 128.0];
+                let uv2 = [raw_uv2[0] / 128.0, raw_uv2[1] / 128.0];
 
                 let base = dst.positions.len() as u32;
 

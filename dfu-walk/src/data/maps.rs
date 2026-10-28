@@ -4,8 +4,8 @@ const RMB_PREFIXES: [&str; 45] = [
     "TVRN", "GENR", "RESI", "WEAP", "ARMR", "ALCH", "BANK", "BOOK", "CLOT", "FURN",
 "GEMS", "LIBR", "PAWN", "TEMP", "TEMP", "PALA", "FARM", "DUNG", "CAST", "MANR",
 "SHRI", "RUIN", "SHCK", "GRVE", "FILL", "KRAV", "KDRA", "KOWL", "KMOO", "KCAN",
-"KPAS", "KROS", "KNOT", "WARP", "MONU", "DRAG", "CUST", "MAGE", "THIE", "FIGH",
-"TEMP", "WALL", "MARK", "SHIP", "WITC"
+"KFLA", "KHOR", "KROS", "KWHE", "KSCA", "KHAW", "MAGE", "THIE", "DARK", "FIGH",
+"CUST", "WALL", "MARK", "SHIP", "WITC",
 ];
 
 const LETTER2_ARRAY: [char; 4] = ['A', 'L', 'M', 'S'];

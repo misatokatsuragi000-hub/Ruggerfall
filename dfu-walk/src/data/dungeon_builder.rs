@@ -15,15 +15,33 @@
 //! il verso va invertito. `compute_open_angle` guarda il baricentro del modello
 //! rispetto alla cerniera e restituisce `-90°` o `+90°` di conseguenza.
 //!
-//! ## Nemici
+//! ## Nemici (porting fedele di `RDBLayout.AddFixedEnemies` / `AddRandomEnemies`)
 //!
-//! I nemici nei dungeon non sono "oggetti" del blocco: sono i flat dell'archivio
-//! 199 (editor marker) con `FactionID != 0`. Il byte basso del faction id è il
-//! `MobileID` del mostro (0..=42 per i mostri, 128..=146 per gli umanoidi). Il
-//! parser estrae questi flat in `BuiltDungeon::enemies`, senza scartarli.
+//! Negli RDB i veri nemici usano i record 15 (mostro casuale) e 16 (mostro fisso)
+//! dell'archivio 199. Ecco cosa fa DFU **esattamente** per ognuno:
+//!
+//! **Record 16 — nemico fisso** (`AddFixedRDBEnemy`):
+//!  - `typeValue = FactionOrMobileId & 0xFF`;
+//!  - se `typeValue == 99` → **ignorato** (DFU commenta: "ignore known invalid types");
+//!  - altrimenti → cast diretto `(MobileTypes)typeValue`. I byte alti sono
+//!    "garbage data" per i marker RDB (commento esplicito in DFU), quindi
+//!    **non** si filtra per `faction < 256`: si prende sempre `& 0xFF`.
+//!
+//! **Record 15 — nemico casuale** (`AddRandomRDBEnemyClassic`):
+//!  - `slot = Flags`; se `slot == 0` DFU randomizza 1..6;
+//!  - il tipo viene scelto da una tabella precalcolata (256 nemici per il
+//!    dungeon) usando `slot` come indice;
+//!  - il nemico appare **nella posizione del marker**, non altrove.
+//!
+//! **Nessun filtro per "prima stanza"** esiste in DFU. La sala del trono del
+//! Palazzo Reale è pulita perché il suo RDB non contiene marker `record 15`
+//! o `record 16` con MobileID valido: se il tuo port ne spawna, sono marker
+//! che DFU scarterebbe (MobileID = 99 o specie inesistente), oppure il RDB
+//! della sala del trono non ha proprio marker di spawn.
 
 use std::collections::HashMap;
-use bevy::prelude::{Quat, Vec3};
+use std::sync::Arc;
+use bevy::prelude::{info, Quat, Vec3};
 use super::arch3d::Arch3dModel;
 use super::bsa::BsaArchive;
 use super::dungeon_layout::DungeonData;
@@ -40,6 +58,10 @@ const RED_BRICK_DOOR_MODEL_ID: u32 = 72100;
 /// Tenere allineato a `STEP_UP` in `dungeon.rs`.
 pub const STEP_HEIGHT: f32 = 0.8;
 
+/// Valore di `FactionOrMobileId & 0xFF` che DFU ignora esplicitamente
+/// (`AddFixedRDBEnemy`: "ignore known invalid types").
+const INVALID_FIXED_MOBILE_ID: u8 = 99;
+
 /// Riconosce una porta in stile DFU: descrizione del ModelReferenceList.
 fn is_dungeon_door(desc: &str, model_id: u32) -> bool {
     if model_id == RED_BRICK_DOOR_MODEL_ID {
@@ -49,10 +71,7 @@ fn is_dungeon_door(desc: &str, model_id: u32) -> bool {
 }
 
 /// Calcola l'angolo di apertura in base a dove si trova il pannello rispetto
-/// alla cerniera (= origine del modello). Se il pannello si estende in +X
-/// (baricentro X > 0), il default `-90°` di DFU lo fa aprire in un verso;
-/// se si estende in -X, il verso va invertito (`+90°`). Stessa logica per Z
-/// per le porte "lunghe in Z".
+/// alla cerniera (= origine del modello).
 fn compute_open_angle(m: &Arch3dModel) -> f32 {
     if m.vertices.is_empty() {
         return -90.0;
@@ -113,21 +132,23 @@ pub struct DungeonDoor {
     pub open_angle_deg: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnemySpawnKind {
+    Random,
+    Fixed(Option<u8>),
+}
+
 /// Nemico da generare a runtime: posizione locale del dungeon + MobileID del
 /// mostro. La posizione è nello stesso sistema delle città: `x` est, `y` su,
 /// `z` = -nord (come tutto il resto del progetto).
 #[derive(Debug, Clone)]
 pub struct DungeonEnemySpawn {
     pub pos: [f32; 3],
+    pub kind: EnemySpawnKind,
     pub mobile_id: u8,
 }
 
 /// Mappa MobileID → (archivio, record) della texture del mostro.
-///
-/// ATTENZIONE: questa è una tabella "best effort" basata sugli archivi che il
-/// progetto già usa in `tiles.rs::ENEMY_SPECIES`. I valori esatti DFU stanno in
-/// `EnemyBasics.cs::GetMobileTextureArchive`. Se vedi un topo al posto di uno
-/// scheletro (o viceversa), correggi il valore qui.
 fn mobile_texture(mobile_id: u8) -> Option<(u16, u8)> {
     let entry = match mobile_id {
         // Mostri comuni (0..=42)
@@ -171,6 +192,96 @@ pub fn mobile_texture_public(mobile_id: u8) -> Option<(u16, u8)> {
     mobile_texture(mobile_id)
 }
 
+// -----------------------------------------------------------------------------
+// Struttura collisioni condivisa tra Dungeon e IA Nemici
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+pub struct DungeonCollision {
+    pub floors: Vec<Tri>,
+    pub walls: Vec<Tri>,
+    pub closed_doors: Vec<[f32; 3]>,
+}
+
+impl DungeonCollision {
+    pub fn floor_at(&self, x: f32, z: f32, ref_y: f32, step: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for t in &self.floors {
+            if let Some(y) = plane_y(t, x, z) {
+                if y <= ref_y + step && best.map_or(true, |b| y > b) {
+                    best = Some(y);
+                }
+            }
+        }
+        best
+    }
+
+    pub fn blocked(&self, x: f32, z: f32, feet_y: f32, radius: f32) -> bool {
+        let (lo, hi) = (feet_y + 0.45, feet_y + 1.8);
+        for t in &self.walls {
+            let ymin = t[0][1].min(t[1][1]).min(t[2][1]);
+            let ymax = t[0][1].max(t[1][1]).max(t[2][1]);
+            if ymax <= feet_y + STEP_HEIGHT { continue; }
+            if ymax < lo || ymin > hi { continue; }
+            for k in 0..3 {
+                if dist_segment_xz(x, z, t[k], t[(k + 1) % 3]) < radius {
+                    return true;
+                }
+            }
+        }
+        for center in &self.closed_doors {
+            if (center[1] - feet_y).abs() > 2.2 { continue; }
+            let dist_xz = (center[0] - x).hypot(center[2] - z);
+            if dist_xz < radius + 0.45 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Controlla se la linea di vista è libera da muri/ostacoli per l'IA nemica.
+    pub fn line_clear(&self, from: [f32; 3], to: [f32; 3], _radius: f32) -> bool {
+        let p = Vec3::from(from);
+        let q = Vec3::from(to);
+        let dir = q - p;
+        let len = dir.length();
+        if len < 1e-4 {
+            return true;
+        }
+        let ray_dir = dir / len;
+
+        for t in &self.walls {
+            let v0 = Vec3::from(t[0]);
+            let v1 = Vec3::from(t[1]);
+            let v2 = Vec3::from(t[2]);
+
+            let e1 = v1 - v0;
+            let e2 = v2 - v0;
+            let h = ray_dir.cross(e2);
+            let a = e1.dot(h);
+            if a.abs() < 1e-7 {
+                continue;
+            }
+            let f = 1.0 / a;
+            let s = p - v0;
+            let u = f * s.dot(h);
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            let q_vec = s.cross(e1);
+            let v = f * ray_dir.dot(q_vec);
+            if v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            let dist = f * e2.dot(q_vec);
+            if dist > 0.1 && dist < len - 0.1 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 pub struct BuiltDungeon {
     pub mesh: WorldMesh,
     pub spawn_pos: [f32; 3],
@@ -183,8 +294,12 @@ pub struct BuiltDungeon {
     pub walls: Vec<Tri>,
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
-    /// Nemici individuati dai flat editor 199 con FactionID != 0.
+    /// Nemici individuati dai flat editor 199 record 15 e 16. Nessun filtro
+    /// per "prima stanza" (DFU non ce l'ha): solo il filtro `MobileID == 99`
+    /// di `AddFixedRDBEnemy`.
     pub enemies: Vec<DungeonEnemySpawn>,
+    /// Alias identico ad enemies per compatibilità con dungeon_enemies.rs.
+    pub enemy_spawns: Vec<DungeonEnemySpawn>,
 }
 
 fn plane_y(t: &Tri, x: f32, z: f32) -> Option<f32> {
@@ -209,6 +324,20 @@ fn dist_segment_xz(x: f32, z: f32, a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 impl BuiltDungeon {
+    pub fn collision(&self) -> Arc<DungeonCollision> {
+        let closed_doors = self.doors
+        .iter()
+        .zip(&self.door_open)
+        .filter(|(_, &open)| !open)
+        .map(|(d, _)| d.center)
+        .collect();
+        Arc::new(DungeonCollision {
+            floors: self.floors.clone(),
+                 walls: self.walls.clone(),
+                 closed_doors,
+        })
+    }
+
     pub fn floor_at(&self, x: f32, z: f32, ref_y: f32, step: f32) -> Option<f32> {
         let mut best: Option<f32> = None;
         for t in &self.floors {
@@ -283,6 +412,11 @@ pub fn build_dungeon(
 
     let mut desc_counts: HashMap<String, (usize, u32)> = HashMap::new();
 
+    // Contatori diagnostici (per log finale).
+    let mut flat199_fixed_ok: usize = 0;
+    let mut flat199_fixed_invalid: usize = 0;
+    let mut flat199_random: usize = 0;
+
     for b_info in &dungeon.blocks {
         let Some(raw_rdb) = blocks_bsa.get_by_name(&b_info.block_name) else { continue };
         let Ok(rdb) = RdbBlock::parse(&b_info.block_name, raw_rdb) else { continue };
@@ -333,16 +467,6 @@ pub fn build_dungeon(
                         let mut door_mesh = WorldMesh::new();
                         door_mesh.add_instance(m, 0.0, 0.0, 0.0, 0.0);
 
-                        let mut sum = Vec3::ZERO;
-                        for v in &m.vertices { sum += Vec3::from(*v); }
-                        let centroid = sum / m.vertices.len().max(1) as f32;
-
-                        println!(
-                            "Porta: desc={:?} id={} pos={:?} closed_yaw={:.1} open_angle={:.1} baricentro_locale=({:.2},{:.2},{:.2})",
-                                 desc, model_id, [ox, oy, oz], m_res.y_rot_deg, open_angle,
-                                 centroid.x, centroid.y, centroid.z,
-                        );
-
                         doors.push(DungeonDoor {
                             model_id,
                             mesh: door_mesh,
@@ -357,18 +481,52 @@ pub fn build_dungeon(
                 }
                 RdbResource::Flat(f_res) => {
                     if f_res.archive == 199 {
-                        // Editor markers: ingressi, uscite e spawn point dei nemici.
+                        // Marker Enter (8) e Start (10) nella stanza iniziale.
                         if (f_res.record == 8 || f_res.record == 10) && b_info.is_starting_block {
                             if enter_marker.is_none() || f_res.record == 8 {
                                 enter_marker = Some([ox, oy, oz]);
                             }
-                        } else if f_res.faction_or_mobile_id != 0 {
-                            // Marker di spawn nemico: il byte basso del faction id
-                            // è il MobileID del mostro.
+                        }
+
+                        // Nemici: parità esatta con `RDBLayout` di DFU.
+                        //
+                        // Record 16 (`AddFixedRDBEnemy`):
+                        //  - `typeValue = FactionOrMobileId & 0xFF` (i byte alti
+                        //    sono "garbage data" secondo il commento in DFU);
+                        //  - se `typeValue == 99` → ignorato (invalid enum);
+                        //  - altrimenti il marker è un nemico fisso con quel
+                        //    MobileID. Nessun filtro di posizione/stanza.
+                        //
+                        // Record 15 (`AddRandomRDBEnemyClassic`):
+                        //  - il marker è solo un "punto di spawn";
+                        //  - `slot = Flags`, se 0 → random 1..6;
+                        //  - il tipo è scelto a runtime dalla tabella; il
+                        //    nemico appare comunque nella posizione del marker.
+                        //
+                        // Nessun filtro per "prima stanza" esiste in DFU.
+                        if f_res.record == 16 {
                             let mobile_id = (f_res.faction_or_mobile_id & 0xFF) as u8;
+                            if mobile_id == INVALID_FIXED_MOBILE_ID {
+                                flat199_fixed_invalid += 1;
+                            } else {
+                                flat199_fixed_ok += 1;
+                                enemies.push(DungeonEnemySpawn {
+                                    pos: [ox, oy, oz],
+                                    kind: EnemySpawnKind::Fixed(Some(mobile_id)),
+                                             mobile_id,
+                                });
+                            }
+                        } else if f_res.record == 15 {
+                            // Il byte basso di `faction_or_mobile_id` in DFU
+                            // non è usato per i random: viene scelto a runtime
+                            // dalla tabella in base a `Flags`. Il tuo
+                            // `dungeon_enemies.rs` fa già la scelta. Passiamo
+                            // `mobile_id = 0` per indicare "random".
+                            flat199_random += 1;
                             enemies.push(DungeonEnemySpawn {
                                 pos: [ox, oy, oz],
-                                mobile_id,
+                                kind: EnemySpawnKind::Random,
+                                mobile_id: 0,
                             });
                         }
                     } else {
@@ -384,21 +542,19 @@ pub fn build_dungeon(
         }
     }
 
+    if !enemies.is_empty() || flat199_fixed_invalid > 0 {
+        info!(
+            "Dungeon: {} nemici fissi validi, {} fissi con MobileID=99 (ignorati), {} random; {} spawn totali",
+              flat199_fixed_ok,
+              flat199_fixed_invalid,
+              flat199_random,
+              enemies.len()
+        );
+    }
+
     if mesh.vertices.is_empty() && doors.is_empty() {
         return None;
     }
-
-    if !desc_counts.is_empty() {
-        println!("Dungeon: descrizioni modello viste (desc: usi, id esempio):");
-        let mut all: Vec<_> = desc_counts.into_iter().collect();
-        all.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
-        for (desc, (count, example_id)) in &all {
-            let marker = if is_dungeon_door(desc, *example_id) { "  <-- PORTA" } else { "" };
-            println!("    desc={desc:?} usi={count} id_esempio={example_id}{marker}");
-        }
-    }
-    println!("Porte riconosciute: {}", doors.len());
-    println!("Nemici trovati: {}", enemies.len());
 
     let mut mn = [f32::MAX; 3];
     let mut mx = [f32::MIN; 3];
@@ -436,14 +592,11 @@ pub fn build_dungeon(
         }
     }
 
-    // Rimuove dalla collisione i triangoli dei muri che ostruiscono il passaggio
-    // attraverso una porta.
     if !doors.is_empty() {
         const DOOR_CLEAR_RADIUS: f32 = 1.2;
         const DOOR_CLEAR_DOWN: f32 = 0.7;
         const DOOR_CLEAR_UP: f32 = 0.6;
 
-        let before = walls.len();
         walls.retain(|t| {
             let e1 = [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]];
             let e2 = [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]];
@@ -471,13 +624,6 @@ pub fn build_dungeon(
             }
             true
         });
-        let removed = before - walls.len();
-        if removed > 0 {
-            println!(
-                "Rimossi {} triangoli muri che ostruivano il passaggio delle porte",
-                removed
-            );
-        }
     }
 
     let spawn_pos = enter_marker.unwrap_or([
@@ -486,8 +632,17 @@ pub fn build_dungeon(
                                            (mn[2] + mx[2]) * 0.5,
     ]);
 
+    // **Nessun filtro finale**: DFU non ha filtri per "prima stanza", "blocco
+    // di spawn" o distanza. Tutti i nemici trovati sono validi e vengono
+    // restituiti al chiamante. Se nella sala del trono non vuoi nemici, la
+    // causa è che il RDB del palazzo non ne contiene: se il tuo port ne
+    // spawna, sono marker che DFU scarterebbe (MobileID=99 o specie
+    // inesistente) — gestito qui sopra con `INVALID_FIXED_MOBILE_ID` e, a
+    // valle, in `dungeon_enemies.rs` con `species_index()`.
+
     let exit_pos = exit_marker.unwrap_or(spawn_pos);
     let door_count = doors.len();
+    let enemy_spawns = enemies.clone();
 
     Some(BuiltDungeon {
         mesh,
@@ -502,6 +657,7 @@ pub fn build_dungeon(
          bounds_min: mn,
          bounds_max: mx,
          enemies,
+         enemy_spawns,
     })
 }
 

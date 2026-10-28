@@ -1,78 +1,65 @@
-//! Strumento di debug: elenca i record di un archivio TEXTURE.nnn, ne stampa un
-//! CRC32 degli indici (da confrontare con DFU) e, a richiesta, salva i PNG.
+//! Esporta i record di un archivio TEXTURE.nnn come PNG.
 //!
-//! Uso: dump_texture <cartella ARENA2> <archivio> [--record N] [--frame N]
-//!                   [--out cartella] [--alpha0]
+//! Uso:
+//!   dump_texture <ARENA2> <archive>              # tutti i record
+//!   dump_texture <ARENA2> <archive> <record>     # un solo record
+//!
+//! Esempio:  cargo run --bin dump_texture -- /percorso/ARENA2 201
+//! Produce i file in ./dumped_textures/201_<record>-<frame>.png
 
-use daggerfall_data::{archive_file_name, find_file_ci, png, Palette, TextureFile};
+use daggerfall_data::{archive_file_name, find_file_ci, Palette, TextureFile};
 use std::path::PathBuf;
-use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("errore: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().ok_or("manca la cartella ARENA2")?;
-    let archive: u32 = args.next().ok_or("manca il numero di archivio")?.parse()?;
+    let dir = PathBuf::from(
+        args.next()
+            .ok_or("uso: dump_texture <ARENA2> <archive> [record]")?,
+    );
+    let archive: u32 = args.next().ok_or("manca <archive>")?.parse()?;
+    let only_record: Option<usize> = args.next().map(|s| s.parse()).transpose()?;
 
-    let (mut only_record, mut only_frame) = (None, None);
-    let mut out_dir: Option<PathBuf> = None;
-    let mut alpha0 = false;
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--record" => only_record = Some(args.next().ok_or("--record vuole un valore")?.parse::<usize>()?),
-            "--frame" => only_frame = Some(args.next().ok_or("--frame vuole un valore")?.parse::<usize>()?),
-            "--out" => out_dir = Some(PathBuf::from(args.next().ok_or("--out vuole un valore")?)),
-            "--alpha0" => alpha0 = true,
-            other => return Err(format!("opzione sconosciuta: {other}").into()),
-        }
-    }
+    let tex_name = archive_file_name(archive);
+    let tex_path = find_file_ci(&dir, &tex_name)
+        .ok_or_else(|| format!("{tex_name} non trovato in {}", dir.display()))?;
+    let tex = TextureFile::open(&tex_path)?;
 
-    let name = archive_file_name(archive);
-    let path = find_file_ci(&dir, &name).ok_or_else(|| format!("{name} non trovato in {dir}"))?;
-    let pal_path = find_file_ci(&dir, "ART_PAL.COL").ok_or("ART_PAL.COL non trovato")?;
-    let tex = TextureFile::open(&path)?;
+    let pal_path = find_file_ci(&dir, "ART_PAL.COL")
+        .ok_or("ART_PAL.COL non trovato in ARENA2")?;
     let palette = Palette::open(&pal_path)?;
 
-    if let Some(d) = &out_dir {
-        std::fs::create_dir_all(d)?;
-    }
+    let out_dir = PathBuf::from("dumped_textures");
+    std::fs::create_dir_all(&out_dir)?;
 
-    for record in 0..tex.record_count() {
-        if only_record.is_some_and(|r| r != record) {
-            continue;
+    let n = tex.record_count();
+    println!("{tex_name}: {n} record, {} frame", 
+        (0..n).map(|r| tex.frame_count(r).unwrap_or(0)).sum::<usize>());
+
+    let mut written = 0usize;
+    for r in 0..n {
+        if let Some(only) = only_record {
+            if r != only { continue; }
         }
-        let rec = tex.record(record).unwrap();
-        let frames = tex.frame_count(record).unwrap_or(0);
-        println!(
-            "record {record}: {}x{} frame={frames} compressione={:?} scala=({},{}) offset=({},{})",
-            rec.width, rec.height, rec.compression, rec.scale_x, rec.scale_y, rec.offset_x, rec.offset_y
-        );
-        for frame in 0..frames {
-            if only_frame.map_or(frame != 0, |f| f != frame) {
-                continue;
-            }
-            match tex.frame(record, frame) {
-                Ok(img) => {
-                    println!("  frame {frame}: crc32(indici)={:08x}", png::crc32(&img.indices));
-                    if let Some(d) = &out_dir {
-                        let rgba = img.to_rgba(&palette, alpha0.then_some(0));
-                        let bytes = png::encode_rgba(img.width as u32, img.height as u32, &rgba);
-                        let file = d.join(format!("{name}_{record:03}_{frame}.png"));
-                        std::fs::write(file, bytes)?;
-                    }
-                }
-                Err(e) => println!("  frame {frame}: ERRORE {e}"),
-            }
+        let frames = tex.frame_count(r).unwrap_or(0);
+        for f in 0..frames {
+            let img = match tex.frame(r, f) {
+                Ok(i) => i,
+                Err(e) => { eprintln!("record {r} frame {f}: {e}"); continue; }
+            };
+            if img.width == 0 || img.height == 0 { continue; }
+            let rgba = img.to_rgba(&palette, Some(0));
+            let name = out_dir.join(format!("{archive:03}_{r}-{f}.png"));
+            image::save_buffer(
+                &name,
+                &rgba,
+                img.width as u32,
+                img.height as u32,
+                image::ColorType::Rgba8,
+            )?;
+            println!("  {} ({}x{})", name.display(), img.width, img.height);
+            written += 1;
         }
     }
+    println!("Scritti {written} PNG in {}", out_dir.display());
     Ok(())
 }

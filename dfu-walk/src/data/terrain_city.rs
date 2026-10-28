@@ -22,20 +22,24 @@ pub fn assemble_city_tilemap(
 ) -> (Vec<u8>, CityTileRect) {
     let mut preset = vec![0u8; 128 * 128];
 
-    let start_block_x = (8 - location.width.min(8)) / 2;
-    let start_block_y = (8 - location.height.min(8)) / 2;
+    let bw = location.width.min(8);
+    let bh = location.height.min(8);
+    let start_block_x = (8 - bw) / 2;
+    let start_block_y = (8 - bh) / 2;
 
     let rect = CityTileRect {
         min_x: start_block_x * 16,
         min_y: start_block_y * 16,
-        max_x: (start_block_x + location.width.min(8)) * 16,
-        max_y: (start_block_y + location.height.min(8)) * 16,
+        max_x: (start_block_x + bw) * 16,
+        max_y: (start_block_y + bh) * 16,
     };
 
-    for by in 0..location.height.min(8) {
-        for bx in 0..location.width.min(8) {
+    for by in 0..bh {
+        for bx in 0..bw {
             let block_idx = by * location.width + bx;
-            if block_idx >= location.block_names.len() { continue; }
+            if block_idx >= location.block_names.len() {
+                continue;
+            }
             let block_name = &location.block_names[block_idx];
 
             if let Some(rmb_raw) = blocks_bsa.get_by_name(block_name) {
@@ -43,7 +47,19 @@ pub fn assemble_city_tilemap(
                     for ty in 0..16 {
                         for tx in 0..16 {
                             let gx = (start_block_x + bx) * 16 + tx;
-                            let gy = (start_block_y + by) * 16 + ty;
+
+                            // Inversione NORD-SUD tra blocchi: in Daggerfall
+                            // `by = 0` è il blocco più a nord, ma la mesh del
+                            // terreno ha `gy = 0` a sud (perché `z = -gy * CELL`
+                            // e in Bevy `-z` è nord). Invertendo `by`, il blocco
+                            // nord finisce a `gy` alto (= nord della mesh).
+                            //
+                            // `ty` invece resta com'è: dentro il blocco,
+                            // `ty = 0` è la riga sud (coerente con `gy` basso
+                            // = sud). Invertirlo causerebbe una seconda
+                            // inversione indesiderata.
+                            let gy = (start_block_y + (bh - 1 - by)) * 16 + ty;
+
                             if gx < 128 && gy < 128 {
                                 preset[gy * 128 + gx] = rmb.ground_tiles[ty * 16 + tx];
                             }
@@ -96,8 +112,20 @@ pub fn flatten_terrain_heights(
 
     for x in 0..dim {
         for y in 0..dim {
-            let dx = if x < x0 { x0 - x } else if x > x1 { x - x1 } else { 0 } as f32;
-            let dy = if y < y0 { y0 - y } else if y > y1 { y - y1 } else { 0 } as f32;
+            let dx = if x < x0 {
+                x0 - x
+            } else if x > x1 {
+                x - x1
+            } else {
+                0
+            } as f32;
+            let dy = if y < y0 {
+                y0 - y
+            } else if y > y1 {
+                y - y1
+            } else {
+                0
+            } as f32;
             let dist = (dx * dx + dy * dy).sqrt();
             let w_city = 1.0 - smoothstep01(dist / blend);
             if w_city <= 0.0 {
@@ -133,7 +161,10 @@ mod tests {
         // lontano dal rettangolo e sui bordi: invariato
         assert_eq!(h[0], original[0]);
         assert_eq!(h[10 + 10 * dim], original[10 + 10 * dim]);
-        assert_eq!(h[(dim - 1) + (dim - 1) * dim], original[(dim - 1) + (dim - 1) * dim]);
+        assert_eq!(
+            h[(dim - 1) + (dim - 1) * dim],
+            original[(dim - 1) + (dim - 1) * dim]
+        );
     }
 
     #[test]

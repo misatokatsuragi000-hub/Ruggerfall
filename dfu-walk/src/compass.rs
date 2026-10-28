@@ -1,6 +1,25 @@
 //! Bussola HUD di Daggerfall in basso a destra.
 //! Include uno sfondo ellittico in pergamena antica con cornice in ottone
 //! e 32 tacche radiali per le direzioni, su cui ruotano i 32 frame di `cmpa00i0.bss`.
+//!
+//! ## Etichetta "N" rossa con snap ai 32 frame, sotto il disco
+//!
+//! La N è disegnata con il font **Sherwood** (`fonts/Sherwood.ttf`) come
+//! componente `Text`, montata su un pivot 0×0 al centro del compasso
+//! (`NorthLabelPivot`).
+//!
+//! L'ago della bussola cambia immagine in 32 posizioni discrete (una per
+//! ogni frame `cmpa00i0.bss`). Anche la N usa lo **stesso `frame_idx`**:
+//! l'angolo di rotazione è `frame_idx * (TAU / 32)` + offset di calibrazione.
+//! Così la N scatta insieme all'ago e resta sempre allineata.
+//!
+//! **Z-order**: la N è spawnata *prima* del disco nel setup, quindi sta
+//! **sotto** l'ago (in Bevy UI l'ultimo figlio spawnato sta sopra). Così
+//! l'ago copre la N con il suo disegno, e la N resta visibile solo nelle
+//! zone dove il disco è trasparente (o semitrasparente).
+//!
+//! `NORTH_ANGLE_OFFSET_DEG` compensa un disallineamento del disegno originale
+//! del disco. Un valore negativo ruota la N in senso antiorario.
 
 use crate::interior::InteriorState;
 use crate::mod_textures::ModTextures;
@@ -10,16 +29,34 @@ use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use std::f32::consts::{FRAC_PI_2, TAU};
 
-// Dimensioni scalate all'80% rispetto ai 396x216 originali
-const COMPASS_WIDTH: f32 = 110.0 ;
-const COMPASS_HEIGHT: f32 = 110.0 ;
-const TOTAL_FRAMES: usize = 32; // 32 direzioni da 11.25° ciascuna
+const COMPASS_WIDTH: f32 = 110.0;
+const COMPASS_HEIGHT: f32 = 110.0;
+const TOTAL_FRAMES: usize = 32;
+
+// --- Parametri dell'etichetta "N" ---
+/// Raggio dell'orbita: distanza in pixel del centro della N dal centro del compasso.
+const N_ORBIT_RADIUS: f32 = 38.0;
+/// Semi-larghezza del box che contiene la N (24 px di larghezza).
+const N_LABEL_HALF_WIDTH: f32 = 12.0;
+/// Altezza del box della N.
+const N_LABEL_HEIGHT: f32 = 26.0;
+/// Dimensione del carattere Sherwood.
+const N_FONT_SIZE: f32 = 24.0;
+/// Colore rosso scuro della N.
+const N_COLOR: Color = Color::srgb(0.78, 0.05, 0.05);
+/// Offset angolare in gradi. Negativo = antiorario.
+const NORTH_ANGLE_OFFSET_DEG: f32 = -2.0;
 
 #[derive(Component)]
 pub struct CompassRoot;
 
 #[derive(Component)]
 pub struct CompassUi;
+
+/// Pivot 0×0 al centro del compasso. Ruota col `frame_idx` corrente:
+/// la N, sua figlia, orbita e si orienta a scatti con l'ago.
+#[derive(Component)]
+pub struct NorthLabelPivot;
 
 #[derive(Resource, Default)]
 pub struct CompassFrames {
@@ -43,7 +80,8 @@ impl Plugin for CompassPlugin {
     }
 }
 
-/// Genera proceduralmente la texture ellittica in pergamena con bordo in ottone e 32 tacche.
+/// Genera la texture ellittica in pergamena con bordo in ottone e 32 tacche.
+/// La N **non** è qui: è un `Text` con font Sherwood, montato su un pivot che ruota.
 fn generate_parchment_dial_texture() -> Image {
     let width = 792;
     let height = 432;
@@ -54,7 +92,6 @@ fn generate_parchment_dial_texture() -> Image {
     let rx = cx - 6.0;
     let ry = cy - 6.0;
 
-    // Pre-calcola i segmenti delle 32 tacche radiali
     struct TickSegment {
         p_start: Vec2,
         p_end: Vec2,
@@ -64,18 +101,14 @@ fn generate_parchment_dial_texture() -> Image {
 
     let mut ticks = Vec::with_capacity(32);
     for k in 0..32 {
-        // Angolo orario: k = 0 è Nord (verso l'alto: -FRAC_PI_2)
         let angle = -FRAC_PI_2 + (k as f32 / 32.0) * TAU;
         let (sin_a, cos_a) = angle.sin_cos();
 
         let (r_min, r_max, thickness) = if k % 8 == 0 {
-            // Punti cardinali N, E, S, W
             (0.64, 0.86, 3.4)
         } else if k % 4 == 0 {
-            // Punti intermedi NE, SE, SW, NW
             (0.72, 0.86, 2.4)
         } else {
-            // Tacche ordinarie
             (0.79, 0.86, 1.5)
         };
 
@@ -99,10 +132,9 @@ fn generate_parchment_dial_texture() -> Image {
             let dist = dist_sq.sqrt();
 
             if dist > 1.01 {
-                continue; // Trasparente all'esterno dell'ellisse
+                continue;
             }
 
-            // Anti-aliasing del bordo esterno dell'ellisse
             let alpha = if dist > 0.98 {
                 ((1.0 - dist) / 0.02).clamp(0.0, 1.0)
             } else {
@@ -110,7 +142,6 @@ fn generate_parchment_dial_texture() -> Image {
             };
 
             let mut color = if dist >= 0.905 {
-                // Cornice esterna metallica in ottone/bronzo antico
                 let t = (dist - 0.905) / 0.08;
                 let shine = 1.0 - (t - 0.5).abs() * 1.6;
                 [
@@ -119,16 +150,12 @@ fn generate_parchment_dial_texture() -> Image {
                     (40.0 + shine * 25.0).clamp(0.0, 255.0),
                 ]
             } else if dist >= 0.865 {
-                // Scanalatura incassata scura
                 [65.0, 48.0, 26.0]
             } else {
-                // Pergamena ambrata / vellum caldo
                 let v = (dist / 0.865).powi(2);
                 let base_r = 215.0 * (1.0 - v * 0.30);
                 let base_g = 180.0 * (1.0 - v * 0.35);
                 let base_b = 105.0 * (1.0 - v * 0.45);
-
-                // Grana naturale della carta
                 let grain = ((x * 37 + y * 61) % 19) as f32 - 9.0;
                 [
                     (base_r + grain).clamp(0.0, 255.0),
@@ -137,7 +164,6 @@ fn generate_parchment_dial_texture() -> Image {
                 ]
             };
 
-            // Disegno delle 32 tacche nell'anello della pergamena
             if dist >= 0.60 && dist <= 0.88 {
                 let p = Vec2::new(px, py);
                 let mut min_d_sq = f32::MAX;
@@ -160,9 +186,9 @@ fn generate_parchment_dial_texture() -> Image {
                 if min_d_sq < tick_thick_sq {
                     let factor = (1.0 - (min_d_sq / tick_thick_sq).sqrt()).clamp(0.0, 1.0);
                     let tick_col = if is_cardinal {
-                        [60.0, 25.0, 15.0] // Cardinali scuri con sfumatura ruggine
+                        [60.0, 25.0, 15.0]
                     } else {
-                        [52.0, 38.0, 20.0] // Inchiostro antico bruno
+                        [52.0, 38.0, 20.0]
                     };
                     color[0] = color[0] * (1.0 - factor) + tick_col[0] * factor;
                     color[1] = color[1] * (1.0 - factor) + tick_col[1] * factor;
@@ -191,8 +217,13 @@ fn generate_parchment_dial_texture() -> Image {
     )
 }
 
-fn setup_compass_ui(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+fn setup_compass_ui(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    assets: Res<AssetServer>,
+) {
     let parchment_texture = images.add(generate_parchment_dial_texture());
+    let sherwood: Handle<Font> = assets.load("fonts/Sherwood.ttf");
 
     commands
     .spawn((
@@ -210,7 +241,7 @@ fn setup_compass_ui(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
             GlobalZIndex(2),
     ))
     .with_children(|parent| {
-        // 1. Sfondo pergamena ellittico con le tacche (strato inferiore)
+        // 1. Sfondo pergamena ellittico con le tacche (strato inferiore, statico)
         parent.spawn((
             Name::new("Compass Parchment Dial"),
                       ImageNode::new(parchment_texture),
@@ -222,7 +253,57 @@ fn setup_compass_ui(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
                       },
         ));
 
-        // 2. Compasso rotante animato originale (strato superiore)
+        // 2. Pivot 0×0 al centro del compasso, con la N come figlia.
+        //    Spawnato PRIMA del disco: in Bevy UI, l'ultimo figlio sta sopra.
+        //    Così la N sta SOTTO l'ago `cmpa00i0.bss`.
+        parent
+        .spawn((
+            Name::new("Compass North Pivot"),
+                NorthLabelPivot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(COMPASS_WIDTH * 0.5),
+                top: Val::Px(COMPASS_HEIGHT * 0.5),
+                width: Val::Px(0.0),
+                height: Val::Px(0.0),
+                ..default()
+                },
+                Transform::IDENTITY,
+                Visibility::Visible,
+        ))
+        .with_children(|pivot| {
+            // Container della N: centrato sul pivot e spostato in alto
+            // a distanza `N_ORBIT_RADIUS`.
+            pivot
+            .spawn((
+                Name::new("Compass North Label Box"),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(-N_LABEL_HALF_WIDTH),
+                    top: Val::Px(-N_ORBIT_RADIUS - N_LABEL_HEIGHT * 0.5),
+                    width: Val::Px(N_LABEL_HALF_WIDTH * 2.0),
+                    height: Val::Px(N_LABEL_HEIGHT),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                    },
+            ))
+            .with_children(|text_parent| {
+                text_parent.spawn((
+                    Name::new("Compass North Label"),
+                                   Text::new("N"),
+                                   TextFont {
+                                       font: sherwood.clone(),
+                                   font_size: N_FONT_SIZE,
+                                   ..default()
+                                   },
+                                   TextColor(N_COLOR),
+                ));
+            });
+        });
+
+        // 3. Disco rotante originale `cmpa00i0.bss` (frame swapping, non Transform).
+        //    Spawnato DOPO la N: sta sopra la N.
         parent.spawn((
             Name::new("Compass Needle/Disc"),
                       CompassUi,
@@ -244,6 +325,7 @@ fn update_compass(
     mut images: ResMut<Assets<Image>>,
     player_query: Query<&Player>,
     mut compass_ui: Query<(&mut ImageNode, &mut Visibility), With<CompassUi>>,
+                  mut pivot: Query<&mut Transform, With<NorthLabelPivot>>,
 ) {
     if !compass_cache.initialized {
         compass_cache.frames = Vec::with_capacity(TOTAL_FRAMES);
@@ -271,8 +353,10 @@ fn update_compass(
     let Ok((mut img_node, mut vis)) = compass_ui.get_single_mut() else { return };
 
     let normalized_yaw = player.yaw.rem_euclid(TAU);
-    let frame_idx = ((normalized_yaw / TAU) * TOTAL_FRAMES as f32).floor() as usize % TOTAL_FRAMES;
+    let frame_idx =
+    ((normalized_yaw / TAU) * TOTAL_FRAMES as f32).floor() as usize % TOTAL_FRAMES;
 
+    // --- 1. Cambia il frame del disco (rotazione a scatti). ---
     if let Some(Some((handle, flip_y))) = compass_cache.frames.get(frame_idx) {
         img_node.image = handle.clone();
         img_node.flip_y = *flip_y;
@@ -281,6 +365,14 @@ fn update_compass(
         img_node.image = handle.clone();
         img_node.flip_y = *flip_y;
         *vis = Visibility::Visible;
+    }
+
+    // --- 2. Snap della N allo STESSO frame_idx. ---
+    let snap_angle = (frame_idx as f32 / TOTAL_FRAMES as f32) * TAU;
+    let offset_rad = NORTH_ANGLE_OFFSET_DEG.to_radians();
+    let final_angle = snap_angle + offset_rad;
+    for mut tf in &mut pivot {
+        tf.rotation = Quat::from_rotation_z(final_angle);
     }
 }
 

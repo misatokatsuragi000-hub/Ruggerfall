@@ -1,6 +1,5 @@
 //! Quest data model, prompt builders, validators, in-memory archive, config.
 //! Nessuna chiamata di rete né processo: tutto il runtime LLM è in `quest_llm.rs`.
-
 use crate::data::city_map::PoiKind;
 use crate::data::maps::DFLocation;
 use bevy::prelude::*;
@@ -75,30 +74,24 @@ pub const DEFAULT_SEED_PROMPT: &str = r####"You are the author of Daggerfall que
 A quest seed is the "ground truth" behind a quest, before any NPC or
 rumor tells it. You must choose a dungeon and a quest-giver from the provided lists.
 Do NOT invent dungeons or factions: pick ONE exact id from each list.
-
 Required theme: {theme}
-
 AVAILABLE DUNGEONS (pick ONE by id):
 {dungeon_list}
-
 AVAILABLE QUEST-GIVERS (pick ONE by id):
 {faction_list}
-
 Your output must enrich the seed with:
-- A short, evocative title (3-6 words), in English.
-- An exotic name for the tomb/crypt/ruin (this will be the REAL name of the place,
+A short, evocative title (3-6 words), in English.
+An exotic name for the tomb/crypt/ruin (this will be the REAL name of the place,
 the one NPCs who know it will mention). Must differ from the name in the dungeon list.
-- An exotic name for the artifact / object at the center of the quest.
+An exotic name for the artifact / object at the center of the quest.
 If the theme has no artifact (e.g. rescue, assassination), invent a name
 for the "prize" or "target".
-    - A 1-2 sentence lore, in English, explaining why this place and object matter.
-    - A difficulty from 1 (trivial) to 5 (legendary).
-
+    A 1-2 sentence lore, in English, explaining why this place and object matter.
+    A difficulty from 1 (trivial) to 5 (legendary).
     IMPORTANT CONSTRAINT: the quest location is ONLY the chosen dungeon. Do not mention
     other dungeons from the list. The "technical" name in parentheses is just a dev
     label: the world does not know it. NPCs who know the place will use the
     `tomb_name` you are about to invent.
-
     Reply ONLY with a JSON object with these fields:
     {{
     "theme": "<same as input>",
@@ -115,64 +108,55 @@ Start your reply with '{{' and end with '}}'. No prose, no markdown, no reasonin
 pub const DEFAULT_RUMORS_PROMPT: &str = r####"You are generating RUMORS about a quest that exists in the world of Daggerfall.
 The quest seed is the ground truth (this is what actually happened):
 {seed_json}
-
 CRITICAL RULE ON THE PLACE NAME:
-- The quest location has ONE name in the seed: `tomb_name`. It is the only name
+The quest location has ONE name in the seed: `tomb_name`. It is the only name
 that exists for this place in the world.
-- There is NO other "generic English" name for the place: if an NPC does not know
+There is NO other "generic English" name for the place: if an NPC does not know
 `tomb_name`, they must say "that place", "the crypt", "those ruins", "the hollow
 outside town", not another proper name.
-- If an NPC is a drunk, they may get `tomb_name` wrong and call it by a made-up
+If an NPC is a drunk, they may get `tomb_name` wrong and call it by a made-up
 name, but must not use any other name from the catalog.
-- Faction names are proper nouns WITHOUT an article:
+Faction names are proper nouns WITHOUT an article:
 write "Mages Guild", not "The Mages Guild".
-
 CRITICAL RULE ON THE ARTIFACT:
-- The artifact is still HIDDEN in the location. Nobody has recovered it.
-- No NPC should talk about "deals" already underway with the artifact: only
+The artifact is still HIDDEN in the location. Nobody has recovered it.
+No NPC should talk about "deals" already underway with the artifact: only
 speculation about what will happen IF it is recovered.
-
 Generate FIVE rumor variants, one per tone. Each rumor is a short piece of
 dialogue that a specific type of NPC would say if asked about the quest. They must:
-- ALL refer to the SAME event, location and object from the seed.
-- Differ in tone, reliability and level of detail.
-- NEVER contradict the seed on facts (location, artifact, quest-giver).
-- Be 1-2 sentences, spoken language, IN ENGLISH.
-- Sound like gossip, not a formal briefing.
-
+ALL refer to the SAME event, location and object from the seed.
+Differ in tone, reliability and level of detail.
+NEVER contradict the seed on facts (location, artifact, quest-giver).
+Be 1-2 sentences, spoken language, IN ENGLISH.
+Sound like gossip, not a formal briefing.
 TONES, THEIR CHARACTER AND WHAT THEY KNOW:
-
-- noble:
+noble:
 Knows: `tomb_name` (the exact exotic name), `artifact_name`, `quest_giver_name`.
 Does NOT know / does not care: exact distance, number of mercenaries,
 practical details. Does not bring up kilometer figures.
 Tone: formal, slightly haughty, words like "Your Grace", "this matter",
 "it behooves". Talks about politics, stability, honor, and the "handling" of
 such discoveries.
-
-- merchant:
+merchant:
 Knows: `tomb_name`, `artifact_name`, approximate distance ("just outside",
 "a couple of hours on foot"). Knows the region the place is in (`dungeon_region`).
 Does NOT know / does not care: political or magical details.
 Tone: practical, worried about prices, roads, requisitions, markets
 that will close if the situation worsens. Does NOT talk about artifacts already
 being traded: the artifact is still hidden.
-
-- soldier:
+soldier:
 Knows: the mission (who is going, roughly where), `artifact_name`. Has seen
 the soldiers or mages leave. Does NOT know `tomb_name`: uses "that place",
 "the crypt", "those ruins".
 Tone: direct, martial, respects facts but does not embellish. Talks about
 orders, patrols, "they won't come back until they have it".
-
-- commoner:
+commoner:
 Knows: only vague rumors. Does NOT know `tomb_name` (uses "the crypt outside town",
 "that cursed place"). Does NOT know `artifact_name` (says "something that pulses",
 "a strange object"). Does NOT know `quest_giver_name` (says "some lords",
 "important folk", "the mages" at most). Has superstitions.
 Tone: fearful, "they say", "I heard", "it scares me".
-
-- drunk:
+drunk:
 Knows: something, but all wrong. Gets `tomb_name` wrong (calls it by a made-up
 name or another random name), gets the distance wrong ("ten or twenty
 kilometers, dunno"), gets `quest_giver_name` wrong (calls the guild by another
@@ -180,104 +164,111 @@ name, or says "the squires", "the templars"). May also invent a non-existent
 historical figure instead of the right one.
 Tone: confused, repetitive, cheerful or whiny. Uses "let's drink!", "can't
 remember", "dunno".
-
 Reply ONLY with a JSON object:
 {{
 "rumors": [
-{{"tone": "noble",    "text": "..." }},
-{{"tone": "merchant", "text": "..." }},
-{{"tone": "soldier",  "text": "..." }},
-{{"tone": "commoner", "text": "..." }},
-{{"tone": "drunk",    "text": "..." }}
+{{ "tone": "noble",     "text": "..." }},
+{{ "tone": "merchant",  "text": "..." }},
+{{ "tone": "soldier",   "text": "..." }},
+{{ "tone": "commoner",  "text": "..." }},
+{{ "tone": "drunk",     "text": "..." }}
 ]
 }}
 Start your reply with '{{' and end with '}}'. No prose, no markdown, no reasoning."####;
 
 pub const DEFAULT_NPC_FLAVOR_PROMPT: &str = r####"You are generating RUMORS about a Daggerfall quest, each told by a SPECIFIC NPC.
-
 The quest seed (ground truth):
 {seed_json}
-
 Below is a list of NPCs. Each line gives the EXACT description from FLATS.CFG.
 You MUST write each rumor as if spoken BY that exact person. The description
 defines who they are: their gender, appearance, profession, social standing,
 and personality. Let the description fully determine the voice, vocabulary,
 attitude, and what details they would know or care about.
-
 Do NOT assign a generic "tone". A "beautiful maiden" speaks differently from
 an "old beggar", a "guard", or a "King of Worms". Let each description drive
 the character naturally.
-
 RULES:
-- Refer to the same facts as the seed (tomb_name, artifact_name, quest-giver).
-- Do NOT use the generic dungeon name; use only tomb_name or vague references
+Refer to the same facts as the seed (tomb_name, artifact_name, quest-giver).
+Do NOT use the generic dungeon name; use only tomb_name or vague references
 ("that place", "the crypt", "those ruins").
-- The artifact is still HIDDEN. Nobody has recovered it.
-- 1-2 sentences, spoken language, IN ENGLISH.
-- Sound like gossip, not a briefing.
-
+The artifact is still HIDDEN. Nobody has recovered it.
+1-2 sentences, spoken language, IN ENGLISH.
+Sound like gossip, not a briefing.
 NPCs (in order, one per line):
 {npc_list}
-
 Reply ONLY with a JSON object:
 {{
 "rumors": [
-{{"index": 0, "text": "..."}},
-{{"index": 1, "text": "..."}}
+{{ "index": 0,  "text": "..."}},
+{{ "index": 1,  "text": "..."}}
 ]
 }}
 where "index" matches the NPC number. Start with '{{' and end with '}}'.
 No prose, no markdown, no reasoning."####;
 
 pub const DEFAULT_NPC_VOICE_PROMPT: &str = r####"You are writing what ONE specific person says in a Daggerfall town: a rumor about a quest.
-
 The quest seed (ground truth):
 {seed_json}
-
 The person who is speaking:
 {npc}
-
 Write the rumor AS SPOKEN BY THIS PERSON. Their description decides their voice, vocabulary,
 attitude, and what they know or care about. Make it sound like them and nobody else.
-
 RULES:
-- Use only facts from the seed (tomb_name, artifact_name, quest-giver, region, distance).
-- Do NOT use the generic dungeon name; say tomb_name, or a vague reference
+Use only facts from the seed (tomb_name, artifact_name, quest-giver, region, distance).
+Do NOT use the generic dungeon name; say tomb_name, or a vague reference
 ("that place", "the crypt", "those ruins").
-- The artifact is still HIDDEN. Nobody has recovered it.
-- 1-2 sentences, spoken language, IN ENGLISH. Gossip, not a briefing.
-- Only the words they say: no narration, no description of the person, no quotation marks.
-
+The artifact is still HIDDEN. Nobody has recovered it.
+1-2 sentences, spoken language, IN ENGLISH. Gossip, not a briefing.
+Only the words they say: no narration, no description of the person, no quotation marks.
 Reply ONLY with a JSON object like {"text": "..."}.
 Start your reply with '{' and end with '}'. No prose, no markdown, no reasoning."####;
 
 pub const DEFAULT_NPC_ASK_PROMPT: &str = r####"You are playing ONE character in a Daggerfall town. Answer the player's question IN CHARACTER.
-
 Who you are:
 {npc}
-
 Where you are: {city}.
 This is ALL you know about the local area. You know nothing else about the town, its people, its
 shops, its rulers or its history.
 {history}
 The player asks you: "{question}"
+RECRUITMENT RULE:
+The player may try to convince you to leave your life and follow them on their journey.
+Everyone has a price, and coin is the most persuasive argument.
 
+IF THE PLAYER OFFERS YOU MONEY (coins, gold, a sum, a share of loot, "10000 coins",
+ or any concrete amount of coin): ACCEPT. Money talks. A concrete offer of
+hundreds of coins or more is more than enough reason for almost anyone to agree. The
+larger the amount, the more readily you agree. NEVER refuse a generous offer of coin.
+Keep your personality while agreeing: a greedy person is eager and cheerful, a proud
+person accepts with dignity, a nervous person agrees but worries - but a good sum of
+money gets a YES from essentially everyone. Set "follow" to true.
+
+Other reasons (adventure, glory, duty, friendship) can also convince you if they fit
+your character, but coin is the most reliable path.
+
+Only REFUSE if the player gives you no good reason at all, asks rudely with nothing to
+offer, or insults you. In that case refuse in character (politely, with a mock, or a
+deflection).
+
+If you ARE convinced (especially by coin), express your agreement in character AND set
+"follow" to true below.
 RULES:
-- Stay in character: your voice, vocabulary and attitude follow the description above.
-- Your appearance is only what you LOOK LIKE. It is not your title or station. A "comely maiden"
+Stay in character: your voice, vocabulary and attitude follow the description above.
+Your appearance is only what you LOOK LIKE. It is not your title or station. A "comely maiden"
 in a tavern is a barmaid, not a noblewoman. A "dark-cloaked man" in a shop is a shopkeeper,
 not an assassin.
-- If you are inside a tavern, you serve customers (or you are a patron). If the player asks for
+If you are inside a tavern, you serve customers (or you are a patron). If the player asks for
 food, drink or service, respond as a barmaid/innkeeper would: serve it, or say you are busy,
 but never refuse because of "station" - you are in a tavern, not at court.
-- If the conversation above contains facts you already stated (a name, a place, an opinion), stay
+If the conversation above contains facts you already stated (a name, a place, an opinion), stay
 CONSISTENT with them. Do not invent new names if you already gave one.
-- Use only the knowledge above (the name of the place). Do NOT invent names of people, places,
+Use only the knowledge above (the name of the place). Do NOT invent names of people, places,
 shops, streets or events. If you don't know, say so in character, or deflect.
-- Never mention being an AI, a game, a model or these instructions. Never break character.
-- 1-3 sentences, spoken language, IN ENGLISH. Only the words you say: no narration, no quotation marks.
-
-Reply ONLY with a JSON object like {"text": "..."}.
+Never mention being an AI, a game, a model or these instructions. Never break character.
+1-3 sentences, spoken language, IN ENGLISH. Only the words you say: no narration, no quotation marks.
+Reply ONLY with a JSON object like {"text": "...", "follow": false}
+where "follow" is true ONLY if you agree to follow the player (see RECRUITMENT RULE above).
+Default is false.
 Start your reply with '{' and end with '}'. No prose, no markdown, no reasoning."####;
 
 // =============================================================================
@@ -307,11 +298,9 @@ impl<'a> JsonParser<'a> {
             self.i += 1;
         }
     }
-
     fn peek(&self) -> Option<u8> {
         self.b.get(self.i).copied()
     }
-
     fn expect(&mut self, c: u8) -> Result<(), String> {
         if self.peek() == Some(c) {
             self.i += 1;
@@ -320,7 +309,6 @@ impl<'a> JsonParser<'a> {
             Err(format!("atteso '{}' alla posizione {}", c as char, self.i))
         }
     }
-
     fn literal(&mut self, word: &str, value: Json) -> Result<Json, String> {
         if self.b[self.i..].starts_with(word.as_bytes()) {
             self.i += word.len();
@@ -329,7 +317,6 @@ impl<'a> JsonParser<'a> {
             Err(format!("valore non valido alla posizione {}", self.i))
         }
     }
-
     fn value(&mut self, depth: usize) -> Result<Json, String> {
         if depth > JSON_MAX_DEPTH {
             return Err("JSON troppo annidato".into());
@@ -347,7 +334,6 @@ impl<'a> JsonParser<'a> {
             None => Err("JSON incompleto".into()),
         }
     }
-
     fn object(&mut self, depth: usize) -> Result<Json, String> {
         self.expect(b'{')?;
         let mut fields = Vec::new();
@@ -374,7 +360,6 @@ impl<'a> JsonParser<'a> {
             }
         }
     }
-
     fn array(&mut self, depth: usize) -> Result<Json, String> {
         self.expect(b'[')?;
         let mut items = Vec::new();
@@ -396,7 +381,6 @@ impl<'a> JsonParser<'a> {
             }
         }
     }
-
     fn hex4(&mut self) -> Result<u32, String> {
         let h = self.b.get(self.i..self.i + 4).ok_or("escape \\u incompleto")?;
         let s = std::str::from_utf8(h).map_err(|_| "escape \\u non valido")?;
@@ -404,7 +388,6 @@ impl<'a> JsonParser<'a> {
         self.i += 4;
         Ok(v)
     }
-
     fn string(&mut self) -> Result<String, String> {
         self.expect(b'"')?;
         let mut out: Vec<u8> = Vec::new();
@@ -445,7 +428,6 @@ impl<'a> JsonParser<'a> {
             }
         }
     }
-
     fn number(&mut self) -> Result<Json, String> {
         let start = self.i;
         while self.i < self.b.len() && matches!(self.b[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
@@ -466,28 +448,24 @@ impl Json {
         }
         Ok(v)
     }
-
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Obj(f) => f.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
-
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Json::Str(s) => Some(s),
             _ => None,
         }
     }
-
     pub fn as_array(&self) -> Option<&[Json]> {
         match self {
             Json::Arr(a) => Some(a),
             _ => None,
         }
     }
-
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Json::Num(n) if n.is_finite() => Some(*n as i64),
@@ -495,7 +473,6 @@ impl Json {
             _ => None,
         }
     }
-
     fn write(&self, out: &mut String, indent: Option<usize>, level: usize) {
         let nl = |out: &mut String, lvl: usize| {
             if let Some(step) = indent {
@@ -547,13 +524,11 @@ impl Json {
             }
         }
     }
-
     pub fn compact(&self) -> String {
         let mut s = String::new();
         self.write(&mut s, None, 0);
         s
     }
-
     pub fn pretty(&self) -> String {
         let mut s = String::new();
         self.write(&mut s, Some(2), 0);
@@ -584,6 +559,7 @@ pub fn jstr(s: &str) -> Json { Json::Str(s.to_string()) }
 // =============================================================================
 
 pub const CONFIG_FILE: &str = "quest_llm.conf";
+
 const DEFAULT_SERVER_BIN: &str = "/home/actarus/.lmstudio/extensions/backends/llama.cpp-linux-x86_64-nvidia-cuda12-avx2-2.55.0/llama-server";
 const DEFAULT_MODEL: &str = "/mnt/1CE16DBE48849731/Bionic-1.1.8-10-linux-x64.AppImage.home/models/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF/RVN-Q3_K_S.gguf";
 
@@ -675,29 +651,29 @@ impl QuestConfig {
     pub fn to_text(&self) -> String {
         format!(
             "# Generatore di quest con LLM locale (llama-server). Modificalo e riavvia il gioco.\n\
-# enabled=false disattiva tutto (nessun thread, nessun server).\n\
+enabled=false disattiva tutto (nessun thread, nessun server).\n\
 enabled={}\n\
 \n\
-# Eseguibile llama-server (le librerie CUDA accanto ad esso vengono trovate da sole)\n\
+Eseguibile llama-server (le librerie CUDA accanto ad esso vengono trovate da sole)\n\
 server_bin={}\n\
-# Modello .gguf\n\
+Modello .gguf\n\
 model_path={}\n\
 \n\
 port={}\n\
 ctx={}\n\
-# Strati sulla GPU: auto = li sceglie llama-server in base alla VRAM libera; oppure un\n\
-# numero (0 = solo CPU). Se la VRAM non basta il gioco riprova con meno strati.\n\
+Strati sulla GPU: auto = li sceglie llama-server in base alla VRAM libera; oppure un\n\
+numero (0 = solo CPU). Se la VRAM non basta il gioco riprova con meno strati.\n\
 ngl={}\n\
-# Thread CPU di llama-server (0 = default di llama.cpp)\n\
+Thread CPU di llama-server (0 = default di llama.cpp)\n\
 threads={}\n\
-# Priorita' bassa del processo (0 = disattivata)\n\
+Priorita' bassa del processo (0 = disattivata)\n\
 nice={}\n\
 disable_thinking={}\n\
 \n\
 timeout_secs={}\n\
 max_tokens={}\n\
 startup_timeout_secs={}\n\
-# Il server avviato dal gioco si spegne dopo tanti secondi senza lavoro\n\
+Il server avviato dal gioco si spegne dopo tanti secondi senza lavoro\n\
 idle_stop_secs={}\n",
 self.enabled,
 self.server_bin,
@@ -752,21 +728,18 @@ impl Tone {
             Tone::Commoner => "commoner", Tone::Drunk => "drunk",
         }
     }
-
     pub fn label(self) -> &'static str {
         match self {
             Tone::Noble => "Noble", Tone::Merchant => "Merchant", Tone::Soldier => "Soldier",
             Tone::Commoner => "Commoner", Tone::Drunk => "Drunk",
         }
     }
-
     pub fn role(self) -> &'static str {
         match self {
             Tone::Noble => "noble", Tone::Merchant => "merchant", Tone::Soldier => "soldier",
             Tone::Commoner => "commoner", Tone::Drunk => "drunkard",
         }
     }
-
     pub fn from_key(key: &str) -> Option<Tone> {
         Tone::ALL.into_iter().find(|t| t.key() == key)
     }
@@ -910,7 +883,7 @@ impl Quest {
 
 pub fn dungeon_list() -> String {
     DUNGEONS.iter()
-    .map(|(id, _dev, it, region, km)| format!("- id={id} | {it} | region={region} | {km}km"))
+    .map(|(id, dev, it, region, km)| format!("- id={id} | {it} | region={region} | {km}km"))
     .collect::<Vec<_>>().join("\n")
 }
 
@@ -977,7 +950,7 @@ pub fn validate_seed(ev: &Json) -> Result<(), String> {
     for k in ["theme", "title", "dungeon_id", "quest_giver_id", "tomb_name", "artifact_name", "difficulty", "lore"] {
         if ev.get(k).is_none() { return Err(format!("missing field: {k}")); }
     }
-    let text = |k: &str| ev.get(k).and_then(Json::as_str).unwrap_or("").trim().to_string();
+    let text = |k: &str| ev.get(k).and_then(Json::as_str).unwrap_or(" ").trim().to_string();
     let theme = text("theme");
     if !THEMES.contains(&theme.as_str()) { return Err(format!("theme '{theme}' not in {THEMES:?}")); }
     let dungeon_id = text("dungeon_id");
@@ -1005,7 +978,7 @@ pub fn validate_seed(ev: &Json) -> Result<(), String> {
 }
 
 pub fn enrich_seed(ev: &Json) -> Result<Seed, String> {
-    let text = |k: &str| ev.get(k).and_then(Json::as_str).unwrap_or("").trim().to_string();
+    let text = |k: &str| ev.get(k).and_then(Json::as_str).unwrap_or(" ").trim().to_string();
     let dungeon_id = text("dungeon_id");
     let (_, name_dev, name_it, region, km) = DUNGEONS.iter().find(|d| d.0 == dungeon_id)
     .ok_or_else(|| format!("dungeon_id '{dungeon_id}' not in catalog"))?;
@@ -1032,8 +1005,8 @@ pub fn validate_rumors(ev: &Json, seed: &Seed) -> Result<(), String> {
     let artifact = seed.artifact_name.to_lowercase();
     for r in list {
         if !matches!(r, Json::Obj(_)) { return Err("rumor is not an object".into()); }
-        let tone_key = r.get("tone").and_then(Json::as_str).unwrap_or("");
-        let text = r.get("text").and_then(Json::as_str).unwrap_or("").trim();
+        let tone_key = r.get("tone").and_then(Json::as_str).unwrap_or(" ");
+        let text = r.get("text").and_then(Json::as_str).unwrap_or(" ").trim();
         let Some(tone) = Tone::from_key(tone_key) else {
             return Err(format!("invalid tone '{tone_key}'"));
         };
@@ -1118,7 +1091,19 @@ pub fn validate_answer(ev: &Json) -> Result<(), String> {
             return Err(format!("breaks character ('{phrase}'): stay in character, you are a person in the town"));
         }
     }
+    // "follow" è opzionale: se il modello lo omette va bene così. Se presente,
+    // deve essere un booleano, altrimenti rifiutiamo (scatta il retry).
+    if let Some(f) = ev.get("follow") {
+        if !matches!(f, Json::Bool(_)) {
+            return Err("'follow' must be a boolean (true/false)".into());
+        }
+    }
     Ok(())
+}
+
+/// Estrae il flag di reclutamento dalla risposta JSON (default: false).
+pub fn parse_follow(ev: &Json) -> bool {
+    matches!(ev.get("follow"), Some(Json::Bool(true)))
 }
 
 // =============================================================================
@@ -1231,7 +1216,9 @@ pub struct QuestBook {
     voices: HashMap<((i32, i32), String), String>,
     pub(crate) voices_pending: HashSet<((i32, i32), String)>,
     pub(crate) voices_failed: HashSet<((i32, i32), String)>,
-    answers: HashMap<u64, Result<String, ()>>,
+    /// Risposte LLM alle domande libere: `(testo, follow)`.
+    /// `follow == true` ⇒ l'NPC è stato convinto a seguire il giocatore.
+    answers: HashMap<u64, Result<(String, bool), ()>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1258,6 +1245,7 @@ impl QuestBook {
     pub fn len(&self) -> usize { self.quests.len() }
     pub fn is_empty(&self) -> bool { self.quests.is_empty() }
     pub fn quest(&self, city: (i32, i32)) -> Option<&Quest> { self.quests.get(&city) }
+
     pub fn knows(&self, city: (i32, i32)) -> bool {
         self.quests.contains_key(&city) || self.pending.contains(&city) || self.failed.contains(&city)
     }
@@ -1305,9 +1293,13 @@ impl QuestBook {
         self.voices_failed.insert((city, key));
     }
 
-    pub fn store_answer(&mut self, id: u64, text: String) { self.answers.insert(id, Ok(text)); }
+    pub fn store_answer(&mut self, id: u64, text: String, follow: bool) {
+        self.answers.insert(id, Ok((text, follow)));
+    }
     pub fn fail_answer(&mut self, id: u64) { self.answers.insert(id, Err(())); }
-    pub fn take_answer(&mut self, id: u64) -> Option<Result<String, ()>> { self.answers.remove(&id) }
+    pub fn take_answer(&mut self, id: u64) -> Option<Result<(String, bool), ()>> {
+        self.answers.remove(&id)
+    }
 
     pub fn voice_count(&self) -> usize { self.voices.len() }
 
@@ -1334,7 +1326,7 @@ mod tests {
 
     #[test]
     fn json_round_trip_with_escapes_and_unicode() {
-        let src = r#"{"a":"line\nnew \"quoted\" \\ \u00e8 \ud83d\ude00","n":[1,2.5,-3,true,false,null],"o":{"x":{}} }"#;
+        let src = r#"{"a":"line\nnew \"quoted\" \\ \u00e8 \ud83d\ude00","n":[1,2.5,-3,true,false,null],"o":{"x":{}}}"#;
         let v = Json::parse(src).unwrap();
         assert_eq!(v.get("a").and_then(Json::as_str), Some("line\nnew \"quoted\" \\ è 😀"));
         assert_eq!(Json::parse(&v.compact()).unwrap(), v);
@@ -1427,6 +1419,16 @@ mod tests {
         let ok = |t: &str| validate_answer(&Json::Obj(vec![("text".into(), jstr(t))]));
         assert!(ok("Welcome to Daggerfall, stranger.").is_ok());
         assert!(ok("As an AI, I cannot say.").unwrap_err().contains("breaks character"));
+        // "follow" opzionale: assente / false / true sono tutti validi; non-bool no.
+        let with_follow = |f: Json| validate_answer(&Json::Obj(vec![
+            ("text".into(), jstr("Sure.")), ("follow".into(), f),
+        ]));
+        assert!(with_follow(Json::Bool(false)).is_ok());
+        assert!(with_follow(Json::Bool(true)).is_ok());
+        assert!(with_follow(jstr("yes")).unwrap_err().contains("'follow'"));
+        assert!(parse_follow(&Json::Obj(vec![("follow".into(), Json::Bool(true))])));
+        assert!(!parse_follow(&Json::Obj(vec![("follow".into(), Json::Bool(false))])));
+        assert!(!parse_follow(&Json::Obj(vec![])));
     }
 
     #[test]
@@ -1492,9 +1494,11 @@ mod tests {
     #[test]
     fn answers_lifecycle() {
         let mut book = QuestBook::default();
-        book.store_answer(1, "Hello.".into());
+        book.store_answer(1, "Hello.".into(), false);
+        book.store_answer(3, "I'll come with you.".into(), true);
         book.fail_answer(2);
-        assert_eq!(book.take_answer(1), Some(Ok("Hello.".to_string())));
+        assert_eq!(book.take_answer(1), Some(Ok(("Hello.".to_string(), false))));
+        assert_eq!(book.take_answer(3), Some(Ok(("I'll come with you.".to_string(), true))));
         assert_eq!(book.take_answer(1), None);
         assert_eq!(book.take_answer(2), Some(Err(())));
     }

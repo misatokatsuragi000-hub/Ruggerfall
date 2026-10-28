@@ -16,13 +16,11 @@
 //!   C = equipaggiamento
 //!   Z = sguaina/rinfodera arma
 //!   X = intensità torcia
-
 mod torch;
 mod data;
 mod equipment;
 mod grass;
 mod fps_weapon;
-mod relief_post;
 mod dungeon_enemies;
 mod interior;
 mod local_map;
@@ -34,7 +32,7 @@ mod music_zones;
 mod player;
 mod quests;
 mod quest_llm;
-mod dfquest;         // ← sostituisce quest_script
+mod dfquest; // ← sostituisce quest_script
 mod sky;
 mod terrain_material;
 mod tiles;
@@ -67,10 +65,6 @@ use world::*;
 
 // =============================================================================
 // Bridge Bevy ↔ dfquest
-//
-// `dfquest` è puro std per scelta (nessuna dipendenza da Bevy). Questi due
-// wrapper sono il ponte minimo: permettono di registrarne le strutture come
-// risorse ECS senza contaminare il modulo puro.
 // =============================================================================
 
 /// Wrapper `Resource` attorno a `dfquest::Library`.
@@ -133,7 +127,6 @@ fn next_value<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>, what:
 fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     let dir = it.next().unwrap_or_else(|| fail(USAGE));
-
     let default_dream_mods = PathBuf::from(
         "/mnt/1CE16DBE48849731/Daggerfall/DaggerfallUnity_Data/StreamingAssets/Mods",
     );
@@ -142,7 +135,6 @@ fn parse_args() -> Args {
     } else {
         PathBuf::from("mods")
     };
-
     let default_dream_textures = PathBuf::from(
         "/mnt/1CE16DBE48849731/Daggerfall/DaggerfallUnity_Data/StreamingAssets/Textures",
     );
@@ -151,7 +143,6 @@ fn parse_args() -> Args {
     } else {
         PathBuf::from("textures")
     };
-
     let mut args = Args {
         dir: PathBuf::from(dir),
         mods_dir: default_mods,
@@ -163,7 +154,6 @@ fn parse_args() -> Args {
         day_minutes: 24.0,
         start_dungeon: true,
     };
-
     while let Some(a) = it.next() {
         match a.as_str() {
             "--outside" => args.start_dungeon = false,
@@ -237,18 +227,9 @@ fn load_data(args: &Args) -> GameData {
         "Caricate {} località (città, villaggi, dungeon) dalla mappa.",
              locations.len()
     );
-
-    // Il decodificatore MAPPITEM produce nomi di blocco le cui lettere
-    // (letter1/letter2) a volte non corrispondono a quelli reali in BLOCKS.BSA.
-    // DFU risolve con `BlocksFile.SearchAlternateRMBName`: prefix di 4
-    // caratteri, suffix di 6 caratteri (`"00.RMB"`), e prende L'ULTIMO match.
-    // Aggiungiamo un Tentativo 2 che ignora le lettere ma mantiene il numero,
-    // e tra i candidati preferisce il blocco che contiene un modello grande
-    // (ID >= 40000 = edificio vero) e poi quello con `building_type = 11`.
     if let Ok(blocks_bsa_for_fix) = BsaArchive::parse(&blocks_buf) {
         fix_missing_block_names(&mut locations, &blocks_bsa_for_fix);
     }
-
     GameData {
         dir: args.dir.clone(),
         woods: Arc::new(WoodsFile::open(open("WOODS.WLD")).unwrap_or_else(|e| fail(e))),
@@ -263,24 +244,6 @@ fn load_data(args: &Args) -> GameData {
 }
 
 /// Corregge i nomi di blocco che non esistono in BLOCKS.BSA.
-///
-/// **Tentativo 1 (DFU esatto)**: prefix 4 + suffix 6, prende l'ultimo match
-/// (come `BlocksFile.SearchAlternateRMBName`). Funziona quando il MAPPITEM
-/// decodifica le lettere giuste ma il nome completo non esiste.
-///
-/// **Tentativo 2 (ignora lettere, mantiene numero)**: cerca `MAGE??00.RMB`
-/// per `MAGEAL00.RMB`. Tra i candidati sceglie in ordine di priorità:
-///   1. quello che contiene un modello con ID >= 40000 (edificio vero);
-///   2. quello che contiene `building_type = 11` (gilda etichettata);
-///   3. il primo alfabetico.
-/// Così, se `MAGEAA00` è solo arredi ma `MAGEBA00` contiene il modello 43001
-/// della gilda, viene scelto `MAGEBA00`.
-///
-/// **Nessun match**: il blocco resta con il nome originale e viene scartato
-/// dal rendering (con un `warn!` in stderr).
-///
-/// Usiamo `eprintln!` perché siamo prima di `App::new()`, quando il logger
-/// di Bevy non è ancora installato.
 fn fix_missing_block_names(
     locations: &mut HashMap<(i32, i32), DFLocation>,
                            blocks_bsa: &BsaArchive,
@@ -291,8 +254,6 @@ fn fix_missing_block_names(
     };
     let mut sorted: Vec<&str> = all_names.iter().copied().collect();
     sorted.sort();
-
-    // Prefisso → building_type atteso (per il Tentativo 2 priorità 2).
     let expected_type = |prefix: &str| -> Option<u8> {
         match prefix {
             "MAGE" | "FIGH" | "THIE" | "DARK" | "GUIL" => Some(11),
@@ -301,7 +262,6 @@ fn fix_missing_block_names(
             _ => None,
         }
     };
-
     let mut fixed = 0usize;
     let mut unfixed = 0usize;
     for loc in locations.values_mut() {
@@ -314,15 +274,14 @@ fn fix_missing_block_names(
                 continue;
             }
             let prefix = &name[..4];
-            let suffix6 = &name[name.len() - 6..]; // "L00.RMB" per MAGEAL00.RMB
-            let stem = &name[..name.len() - 4]; // "MAGEAL00"
-            let number = &stem[stem.len() - 2..]; // "00"
-
+            let suffix6 = &name[name.len() - 6..];
+            let stem = &name[..name.len() - 4];
+            let number = &stem[stem.len() - 2..];
             // --- Tentativo 1: DFU esatto (prefix + suffix6) ---
             let mut found = String::new();
             for real in &sorted {
                 if real.starts_with(prefix) && real.ends_with(suffix6) {
-                    found = real.to_string(); // L'ULTIMO match (come DFU)
+                    found = real.to_string();
                 }
             }
             if !found.is_empty() {
@@ -331,14 +290,12 @@ fn fix_missing_block_names(
                 fixed += 1;
                 continue;
             }
-
             // --- Tentativo 2: prefix + ?? + numero + ".RMB" ---
-            // Es. MAGEAL00 → MAGE??00.RMB (qualsiasi lettera, stesso numero).
-            let number_suffix = format!("{number}.RMB"); // "00.RMB"
+            let number_suffix = format!("{number}.RMB");
             let candidates: Vec<&str> = sorted
             .iter()
             .filter(|n| {
-                n.len() == prefix.len() + 8 // prefix + 2 lettere + 2 numero + ".RMB"
+                n.len() == prefix.len() + 8
                 && n.starts_with(prefix)
                 && n.ends_with(&number_suffix)
                 && n.chars()
@@ -348,16 +305,12 @@ fn fix_missing_block_names(
             })
             .copied()
             .collect();
-
-            // Priorità 1: contiene un modello con ID >= 40000 (edificio vero).
             let with_big_model = candidates.iter().find(|&&n| {
                 blocks_bsa
                 .get_by_name(n)
                 .and_then(|raw| RmbBlock::parse(raw).ok())
                 .map_or(false, |rmb| rmb.objects_3d.iter().any(|o| o.model_id >= 40000))
             });
-
-            // Priorità 2: contiene un `building_type` atteso (11 per gilda, ecc.).
             let preferred_type = expected_type(prefix);
             let with_expected_type = preferred_type.and_then(|t| {
                 candidates.iter().find(|&&n| {
@@ -367,12 +320,10 @@ fn fix_missing_block_names(
                     .map_or(false, |rmb| rmb.buildings.iter().any(|b| b.building_type == t))
                 })
             });
-
             let best = with_big_model
             .copied()
             .or_else(|| with_expected_type.copied())
             .or_else(|| candidates.first().copied());
-
             if let Some(real) = best {
                 eprintln!(
                     "fixup blocco [{}]: {} -> {} (numero, big_model={}, type={:?})",
@@ -386,8 +337,6 @@ fn fix_missing_block_names(
                 fixed += 1;
                 continue;
             }
-
-            // --- Nessun match ---
             eprintln!(
                 "fixup blocco [{}]: {} NON correggibile (prefisso {}, numero {})",
                       loc.name, name, prefix, number
@@ -395,7 +344,7 @@ fn fix_missing_block_names(
             unfixed += 1;
         }
     }
-    eprintln!("fixup blocchi: {} corretti, {} non correggibili", fixed, unfixed);
+    eprintln!("fixup blocchi: {fixed} corretti, {unfixed} non correggibili");
 }
 
 // =============================================================================
@@ -430,13 +379,11 @@ fn find_start(data: &GameData) -> (i32, i32) {
 fn main() {
     let args = parse_args();
     let data = load_data(&args);
-
     let privateer_loc = data
     .locations
     .values()
     .find(|l| l.name.to_ascii_uppercase().contains("PRIVATEER"))
     .cloned();
-
     let (mx, my) = args.pixel.unwrap_or_else(|| {
         if let Some(ref ph) = privateer_loc {
             let ph_mx = (ph.world_x / 32768) as i32;
@@ -448,13 +395,11 @@ fn main() {
             find_start(&data)
         }
     });
-
     if !in_map(mx, my) {
         fail(format!(
             "il map pixel ({mx}, {my}) è fuori dalla mappa (0..999, 0..499)"
         ));
     }
-
     println!("Partenza dal map pixel ({mx}, {my}), raggio {}.", args.radius);
     println!("Cartella mod: {}", args.mods_dir.display());
     println!("Cartella texture sciolte: {}", args.textures_dir.display());
@@ -468,9 +413,6 @@ fn main() {
     println!("         C = equipaggiamento, Z = arma, X = torcia.");
 
     // ── dfquest: libreria + stato delle quest ─────────────────────────────
-    // NB: qui siamo PRIMA di App::new(), quindi il logger di Bevy (LogPlugin
-    // dentro DefaultPlugins) non è ancora installato. `info!` e `warn!` non
-    // stamperebbero nulla: usiamo `println!` / `eprintln!` dello std.
     let (quest_lib, quest_warnings) = dfquest::Library::load_dir(
         std::path::Path::new(dfquest::DEFAULT_QUESTS_DIR),
     );
@@ -482,12 +424,9 @@ fn main() {
              quest_lib.len(),
              quest_warnings.len()
     );
-
     let mut quest_states = std::fs::read_to_string("quest_states.txt")
     .map(|t| dfquest::QuestStates::from_text(&t))
     .unwrap_or_default();
-
-    // Abilita automaticamente i topic del blocco di startup per le quest attive.
     for script in quest_lib.scripts() {
         if quest_states.phase(&script.id) == dfquest::QuestPhase::Active {
             for t in script.startup_topics() {
@@ -495,8 +434,6 @@ fn main() {
             }
         }
     }
-
-    // Debug di verifica (rimuovere dopo aver controllato che tutto funzioni).
     println!(
         "dfquest: S0000001 phase = {:?}, N0B00Y16 caricata: {}",
         quest_states.phase("S0000001"),
@@ -519,7 +456,6 @@ fn main() {
     .add_plugins(quest_llm::QuestPlugin)
     .add_plugins(tts::TtsPlugin)
     .add_plugins(fps_weapon::FpsWeaponPlugin)
-    .add_plugins(relief_post::FakeReliefPlugin)
     .add_plugins(compass::CompassPlugin)
     .add_plugins(vitals::VitalsPlugin)
     .add_plugins(dungeon_enemies::DungeonEnemyPlugin)
@@ -574,6 +510,7 @@ fn main() {
         )
         .chain(),
     )
+    // ── Gruppo A: simulazione (13 sistemi, sotto il limite di 16) ─────
     .add_systems(
         Update,
         (
@@ -583,13 +520,20 @@ fn main() {
          interior::interior_move,
          interior::face_flats,
          tiles::update_npcs,
+         tiles::update_followers,  // ← aggiunto
          tiles::update_enemies,
          player::player_move,
          rebase_origin,
          stream_tiles,
          collect_tiles,
          sky::update_sky.run_if(interior::outside),
-         map::toggle_map,
+        )
+        .chain(),
+    )
+    .add_systems(
+        Update,
+        (
+            map::toggle_map,
          map::update_map_marker,
          local_map::toggle_local_map,
          local_map::update_local_map,
@@ -598,11 +542,6 @@ fn main() {
          music::duck_music,
          update_title,
         )
-        .chain(),
-    )
-    .add_systems(
-        Update,
-        (grass::grass_toggle, grass::update_grass.run_if(interior::outside))
         .chain()
         .after(collect_tiles),
     )
@@ -660,6 +599,7 @@ fn setup(
 // Titolo della finestra
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn update_title(
     time: Res<Time>,
     origin: Res<Origin>,

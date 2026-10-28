@@ -23,7 +23,13 @@
 //! Quando il dialogo si apre su un PNG, viene calcolato un `knowledge_block` con le
 //! informazioni che quel PNG "ha sentito in giro" sulle quest principali attive.
 //! Il blocco viene iniettato nel prompt LLM, così il PNG risponde coerentemente.
-
+//!
+//! ## Reclutamento follower via LLM
+//!
+//! Il giocatore può convincere un NPC a seguirlo tramite la conversazione libera.
+//! L'LLM decide se l'NPC è stato persuaso a sufficienza e risponde con
+//! `{"text": "...", "follow": true}`. Il gioco intercetta il flag e converte
+//! l'NPC in un `Follower` che segue il giocatore.
 use crate::data::city_map::PoiKind;
 use crate::data::flats::FlatCatalog;
 use crate::data::{find_file_ci, Palette};
@@ -36,11 +42,11 @@ use crate::quests::{
     clean_question, describe_npc, face_key, flat_key, temperament_for, tone_for_npc, walker_key,
     walker_look, Hint, QuestBook, Tone, VoiceState, QUESTION_MAX_CHARS,
 };
-use crate::tiles::NpcWalker;
+use crate::tiles::{Follower, NpcWalker};
 use crate::tts::{gender_from_caption, gender_from_look, Gender, SpeakEvent, Speaker};
 use crate::world::{map_pixel_of, GameData, Origin};
 use crate::{QuestLibRes, QuestStatesRes};
-use bevy::ecs::query::QueryFilter;
+
 use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::mouse::MouseWheel;
@@ -50,6 +56,7 @@ use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::ui::{ComputedNode, ScrollPosition};
 use std::collections::HashMap;
+use bevy::ecs::query::{QueryEntityError, QueryFilter};
 
 const DIALOG_FONT: &str = "fonts/Sherwood.ttf";
 const DIALOG_TEXT: &str = "Hello!";
@@ -67,9 +74,7 @@ const PORTRAIT_CROP: f32 = 0.45;
 
 // Menu e campo di testo
 const DIALOG_TEXT_MAX_WIDTH: f32 = 760.0;
-/// Altezza minima del box di testo per mostrare almeno 8-9 righe contemporaneamente.
 const DIALOG_TEXT_MIN_HEIGHT: f32 = 280.0;
-/// Altezza massima visibile del testo prima di richiedere lo scroll.
 const DIALOG_TEXT_MAX_HEIGHT: f32 = 360.0;
 const MENU_TEXT: &str = "[1] Ascolta rumori      [E] Congeda";
 const OFFER_MENU: &str = "[A] Accetta      [R] Rifiuta";
@@ -90,6 +95,20 @@ const SCROLLBAR_WIDTH: f32 = 8.0;
 const SCROLLBAR_MIN_HANDLE: f32 = 30.0;
 
 const SCRIPTED_QUEST_ID: &str = "N0B00Y16";
+
+// =============================================================================
+// Evento di reclutamento
+// =============================================================================
+
+/// Evento emesso quando l'LLM decide che l'NPC segue il giocatore.
+#[derive(Event)]
+pub struct RecruitFollowerEvent {
+    pub entity: Entity,
+}
+
+// =============================================================================
+// Risorse e tipi
+// =============================================================================
 
 /// Bundle `SystemParam` per raggruppare le due risorse `dfquest` (con wrapper):
 /// riduce il numero di parametri di `update_dialog` sotto il limite di 16 di Bevy.
@@ -190,6 +209,10 @@ impl FacePortraits {
     }
 }
 
+// =============================================================================
+// Componenti UI
+// =============================================================================
+
 #[derive(Component)]
 pub struct DialogRoot;
 
@@ -213,6 +236,13 @@ struct DialogScroll;
 #[derive(Component)]
 struct DialogScrollBar;
 
+#[derive(Component)]
+pub(crate) struct DialogPortrait;
+
+// =============================================================================
+// Offerte scriptate
+// =============================================================================
+
 #[derive(Clone)]
 pub struct ScriptedOffer {
     pub quest_id: String,
@@ -226,6 +256,10 @@ pub enum ScriptedQuestState {
     None,
     Offering,
 }
+
+// =============================================================================
+// Contesto del dialogo
+// =============================================================================
 
 #[derive(Resource, Default)]
 pub struct DialogContext {
@@ -245,6 +279,8 @@ pub struct DialogContext {
     pub scripted_offer: Option<ScriptedOffer>,
     pub scripted_state: ScriptedQuestState,
     scripted_response: Option<String>,
+    /// Entità dell'NPC con cui si sta parlando (per il reclutamento).
+    npc_entity: Option<Entity>,
 }
 
 #[derive(Clone, Default)]
@@ -306,6 +342,7 @@ impl DialogContext {
             scripted_offer: None,
             scripted_state: ScriptedQuestState::None,
             scripted_response: None,
+            npc_entity: None,
         }
     }
 
@@ -318,6 +355,10 @@ impl DialogContext {
         h
     }
 }
+
+// =============================================================================
+// Utility testo
+// =============================================================================
 
 fn ascii_punctuation(text: &str) -> String {
     text.chars()
@@ -406,8 +447,19 @@ fn hint_message(book: &QuestBook, city: Option<(i32, i32)>, tone: Tone) -> Strin
     }
 }
 
-#[derive(Component)]
-pub(crate) struct DialogPortrait;
+/// Formatta la risposta LLM per la visualizzazione.
+/// Il risultato è `(testo, follow)`: il flag follow viene ignorato qui
+/// (è gestito separatamente in `dialog_menu`).
+fn answer_message(label: &str, result: &Result<(String, bool), ()>) -> String {
+    match result {
+        Ok((text, _)) => format!("{}: \"{}\"", label, ascii_punctuation(text)),
+        Err(()) => format!("{label} says nothing."),
+    }
+}
+
+// =============================================================================
+// Plugin
+// =============================================================================
 
 pub struct DialogPlugin;
 
@@ -416,6 +468,7 @@ impl Plugin for DialogPlugin {
         app.init_resource::<DialogState>()
         .init_resource::<FacePortraits>()
         .init_resource::<DialogContext>()
+        .add_event::<RecruitFollowerEvent>()
         .add_systems(Startup, setup_dialog_ui)
         .add_systems(
             PreUpdate,
@@ -431,10 +484,15 @@ impl Plugin for DialogPlugin {
              dialog_scroll_keys,
              dialog_scroll_reset_on_text_change,
              dialog_scroll_bar_update,
+             apply_recruit,
             ),
         );
     }
 }
+
+// =============================================================================
+// Setup UI
+// =============================================================================
 
 fn setup_dialog_ui(mut commands: Commands, assets: Res<AssetServer>) {
     let font: Handle<Font> = assets.load(DIALOG_FONT);
@@ -501,7 +559,6 @@ fn setup_dialog_ui(mut commands: Commands, assets: Res<AssetServer>) {
                               TextLayout::default(),
                               DialogLine,
                 ));
-                // Maniglia della barra (visibile solo quando il testo supera la visuale).
                 scroll.spawn((
                     Node {
                         position_type: PositionType::Absolute,
@@ -551,6 +608,10 @@ fn setup_dialog_ui(mut commands: Commands, assets: Res<AssetServer>) {
     });
 }
 
+// =============================================================================
+// Chiusura dialogo
+// =============================================================================
+
 fn close_dialog(state: &mut DialogState, root: &mut Query<&mut Visibility, With<DialogRoot>>) {
     state.open = false;
     for mut visibility in root.iter_mut() {
@@ -558,7 +619,10 @@ fn close_dialog(state: &mut DialogState, root: &mut Query<&mut Visibility, With<
     }
 }
 
-/// Rotella del mouse: scorre il testo quando il dialogo è aperto.
+// =============================================================================
+// Scroll
+// =============================================================================
+
 fn dialog_scroll_wheel(
     state: Res<DialogState>,
     mut wheel: EventReader<MouseWheel>,
@@ -577,7 +641,6 @@ fn dialog_scroll_wheel(
     }
 }
 
-/// Tasti per scorrere: PageUp/PageDown/Home/End. Utile quando la rotella non c'è.
 fn dialog_scroll_keys(
     state: Res<DialogState>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -610,7 +673,6 @@ fn dialog_scroll_keys(
     }
 }
 
-/// Quando il testo mostrato cambia, riporta lo scroll in cima.
 fn dialog_scroll_reset_on_text_change(
     mut scroll: Query<&mut ScrollPosition, With<DialogScroll>>,
     line_changed: Query<&Text, (Changed<Text>, With<DialogLine>)>,
@@ -623,7 +685,6 @@ fn dialog_scroll_reset_on_text_change(
     }
 }
 
-/// Aggiorna altezza e posizione della maniglia in base al rapporto contenuto/visibile.
 fn dialog_scroll_bar_update(
     scroll: Query<(&ScrollPosition, &ComputedNode), With<DialogScroll>>,
                             content: Query<&ComputedNode, (With<DialogLine>, Without<DialogScroll>, Without<DialogScrollBar>)>,
@@ -632,26 +693,26 @@ fn dialog_scroll_bar_update(
     let Ok((sp, view_node)) = scroll.get_single() else { return };
     let Ok(content_node) = content.get_single() else { return };
     let Ok((mut bar_node, mut bar_bg)) = bar.get_single_mut() else { return };
-
     let view_h = view_node.size().y;
     let content_h = content_node.size().y;
-
     if content_h <= view_h + 1.0 || view_h <= 0.0 {
         bar_node.height = Val::Px(0.0);
         *bar_bg = BackgroundColor(Color::NONE);
         return;
     }
-
     let ratio = view_h / content_h;
     let handle_h = (view_h * ratio).max(SCROLLBAR_MIN_HANDLE);
     let max_offset = (content_h - view_h).max(1.0);
     let scroll_ratio = (sp.offset_y / max_offset).clamp(0.0, 1.0);
     let top = (view_h - handle_h) * scroll_ratio;
-
     bar_node.height = Val::Px(handle_h);
     bar_node.top = Val::Px(top);
     *bar_bg = BackgroundColor(Color::srgba(0.85, 0.8, 0.55, 0.7));
 }
+
+// =============================================================================
+// Offerte scriptate
+// =============================================================================
 
 #[allow(dead_code)]
 fn player_race_label(race: u8) -> &'static str {
@@ -695,6 +756,10 @@ fn find_quest_offer(
     })
 }
 
+// =============================================================================
+// Apertura dialogo (E)
+// =============================================================================
+
 #[allow(clippy::too_many_arguments)]
 pub fn update_dialog(
     mut keys: ResMut<ButtonInput<KeyCode>>,
@@ -708,8 +773,8 @@ pub fn update_dialog(
     quests: QuestResources,
     mut ctx: ResMut<DialogContext>,
     player: Query<&Transform, With<Player>>,
-    exterior_npcs: Query<(&NpcWalker, &GlobalTransform)>,
-                     interior_npcs: Query<(&InteriorNpc, &GlobalTransform)>,
+    exterior_npcs: Query<(Entity, &NpcWalker, &GlobalTransform)>,
+                     interior_npcs: Query<(Entity, &InteriorNpc, &GlobalTransform)>,
                      mut root: Query<&mut Visibility, With<DialogRoot>>,
                      mut portrait: Query<(&mut ImageNode, &mut Node), With<DialogPortrait>>,
                      mut flats_catalog: Local<Option<FlatCatalog>>,
@@ -733,19 +798,20 @@ pub fn update_dialog(
     let Ok(player_tf) = player.get_single() else { return };
     let player_pos = player_tf.translation;
 
+    // --- NPC interni ---
     if interior.is_inside() {
-        let mut nearest_int: Option<(f32, &InteriorNpc)> = None;
-        for (npc, gtf) in &interior_npcs {
+        let mut nearest_int: Option<(f32, Entity, &InteriorNpc)> = None;
+        for (entity, npc, gtf) in &interior_npcs {
             let pos = gtf.translation();
             if (pos.y - player_pos.y).abs() > 4.0 {
                 continue;
             }
             let distance = Vec2::new(pos.x - player_pos.x, pos.z - player_pos.z).length();
-            if distance <= DIALOG_DISTANCE && nearest_int.map_or(true, |(d, _)| distance < d) {
-                nearest_int = Some((distance, npc));
+            if distance <= DIALOG_DISTANCE && nearest_int.map_or(true, |(d, _, _)| distance < d) {
+                nearest_int = Some((distance, entity, npc));
             }
         }
-        if let Some((_, npc)) = nearest_int {
+        if let Some((_, npc_entity, npc)) = nearest_int {
             if let Some((face, is_hd)) = faces.get(npc.face_record, &data, &mut mods, &mut images) {
                 let npc_flat = Some((npc.flat_archive, npc.flat_record));
                 let catalog = flats_catalog.get_or_insert_with(|| FlatCatalog::load(&data.dir));
@@ -768,7 +834,6 @@ pub fn update_dialog(
                           _ => None,
                 })
                 .or_else(|| npc_caption.as_deref().and_then(gender_from_caption));
-
                 let knowledge = knowledge_block(
                     &quests.lib.0,
                     &quests.states.0,
@@ -776,13 +841,12 @@ pub fn update_dialog(
                     &key,
                     &KnowledgeOptions::default(),
                 );
-
                 *ctx = DialogContext::new(npc.face_record as u64, city, place, npc_flat, npc_caption)
                 .with_voice(key, who, description)
                 .with_speaker(gender, role.map(|_| tone), temperament)
                 .with_city_name(city_name)
                 .with_knowledge(knowledge);
-
+                ctx.npc_entity = Some(npc_entity);
                 if let Some(offer) = find_quest_offer(&quests.lib.0, &quests.states.0, &*interior, &*data, player_pos, &ctx) {
                     ctx.scripted_offer = Some(offer);
                     ctx.scripted_state = ScriptedQuestState::Offering;
@@ -804,18 +868,19 @@ pub fn update_dialog(
         return;
     }
 
-    let mut nearest_ext: Option<(f32, &NpcWalker)> = None;
-    for (npc, gtf) in &exterior_npcs {
+    // --- NPC esterni ---
+    let mut nearest_ext: Option<(f32, Entity, &NpcWalker)> = None;
+    for (entity, npc, gtf) in &exterior_npcs {
         let pos = gtf.translation();
         if (pos.y - player_pos.y).abs() > 4.0 {
             continue;
         }
         let distance = Vec2::new(pos.x - player_pos.x, pos.z - player_pos.z).length();
-        if distance <= DIALOG_DISTANCE && nearest_ext.map_or(true, |(d, _)| distance < d) {
-            nearest_ext = Some((distance, npc));
+        if distance <= DIALOG_DISTANCE && nearest_ext.map_or(true, |(d, _, _)| distance < d) {
+            nearest_ext = Some((distance, entity, npc));
         }
     }
-    let Some((_, npc)) = nearest_ext else { return };
+    let Some((_, npc_entity, npc)) = nearest_ext else { return };
     let city = map_pixel_of(&origin, player_pos);
     let city_name = data.locations.get(&city).map(|l| l.name.clone()).unwrap_or_default();
     let face = npc.face_record().unwrap_or(0);
@@ -824,7 +889,6 @@ pub fn update_dialog(
     let key = walker_key(face);
     let temperament = temperament_for(&key, city);
     let description = describe_npc(look, Some(tone.role()), None, temperament);
-
     let knowledge = knowledge_block(
         &quests.lib.0,
         &quests.states.0,
@@ -832,12 +896,12 @@ pub fn update_dialog(
         &key,
         &KnowledgeOptions::default(),
     );
-
     *ctx = DialogContext::new(face as u64, city, None, None, None)
     .with_voice(key, format!("{look} ({})", tone.role()), description)
     .with_speaker(gender_from_look(look), Some(tone), temperament)
     .with_city_name(city_name)
     .with_knowledge(knowledge);
+    ctx.npc_entity = Some(npc_entity);
 
     let (image, crop, width, height, is_hd) =
     match npc.face_record().and_then(|r| faces.get(r, &data, &mut mods, &mut images)) {
@@ -874,16 +938,13 @@ fn reset_keys_when_dialog_open(state: Res<DialogState>, mut keys: ResMut<ButtonI
     }
 }
 
+// =============================================================================
+// Input testo
+// =============================================================================
+
 fn push_typed(buffer: &mut String, c: char) {
     if !c.is_control() && buffer.chars().count() < QUESTION_MAX_CHARS {
         buffer.push(c);
-    }
-}
-
-fn answer_message(label: &str, result: &Result<String, ()>) -> String {
-    match result {
-        Ok(text) => format!("{label}: \"{}\"", ascii_punctuation(text)),
-        Err(()) => format!("{label} says nothing."),
     }
 }
 
@@ -908,6 +969,10 @@ fn set_input_text<F: QueryFilter>(texts: &mut Query<&mut Text, F>, s: String) {
         text.0 = s.clone();
     }
 }
+
+// =============================================================================
+// Offerta scriptata (A/R)
+// =============================================================================
 
 fn handle_scripted_offer(
     keys: &ButtonInput<KeyCode>,
@@ -955,6 +1020,10 @@ fn handle_scripted_offer(
     true
 }
 
+// =============================================================================
+// Menu dialogo principale
+// =============================================================================
+
 #[allow(clippy::too_many_arguments)]
 fn dialog_menu(
     keys: Res<ButtonInput<KeyCode>>,
@@ -966,6 +1035,7 @@ fn dialog_menu(
     quests: QuestResources,
     mut speak: EventWriter<SpeakEvent>,
     mut typed: EventReader<KeyboardInput>,
+    mut recruit_events: EventWriter<RecruitFollowerEvent>,
     assets: Res<AssetServer>,
     mut line: Query<(&mut Text, &mut TextFont), (With<DialogLine>, Without<DialogOptions>, Without<DialogInputText>)>,
                mut options: Query<&mut Text, (With<DialogOptions>, Without<DialogLine>, Without<DialogInputText>)>,
@@ -1055,7 +1125,6 @@ fn dialog_menu(
                     let description = ctx.voice.as_ref().map(|v| v.description.clone()).unwrap_or_default();
                     let key = ctx.voice.as_ref().map(|v| v.key.clone()).unwrap_or_default();
                     ctx.knowledge = knowledge_block(&quests.lib.0, &quests.states.0, &question, &key, &KnowledgeOptions::default());
-
                     ctx.conversation.push(("player".to_string(), question.clone()));
                     let asked = worker
                     .as_deref()
@@ -1110,11 +1179,22 @@ fn dialog_menu(
                 shown = Some(message);
             }
         }
+
+        // --- Risposta LLM (con eventuale reclutamento) ---
         if let Some(id) = ctx.asking {
             if let Some(result) = book.take_answer(id) {
                 ctx.asking = None;
-                if let Ok(text) = &result {
-                    ctx.conversation.push(("npc".to_string(), text.clone()));
+                match &result {
+                    Ok((text, follow)) => {
+                        ctx.conversation.push(("npc".to_string(), text.clone()));
+                        // ★ L'LLM ha deciso che l'NPC segue il giocatore.
+                        if *follow {
+                            if let Some(entity) = ctx.npc_entity {
+                                recruit_events.send(RecruitFollowerEvent { entity });
+                            }
+                        }
+                    }
+                    Err(()) => {}
                 }
                 shown = Some(answer_message(&label, &result));
             }
@@ -1140,6 +1220,46 @@ fn dialog_menu(
         }
     }
 }
+
+// =============================================================================
+// Conversione NPC → Follower
+// =============================================================================
+
+/// Sistema che applica il reclutamento: rimuove `NpcWalker`, inserisce
+/// `Follower`, reparenta l'entità a root (così sopravvive allo scarico dei
+/// tile) e imposta il Transform in coordinate mondo.
+fn apply_recruit(
+    mut commands: Commands,
+    mut events: EventReader<RecruitFollowerEvent>,
+    walkers: Query<(&NpcWalker, &Transform, &GlobalTransform)>,
+) {
+    for ev in events.read() {
+        info!("RECRUIT: ricevuto evento {:?}", ev.entity);
+        match walkers.get(ev.entity) {
+            Ok((walker, local_tf, gtf)) => {
+                let follower = Follower::from_walker(walker);
+                let world_pos = gtf.translation();
+                let scale = local_tf.scale;
+                commands.entity(ev.entity)
+                .remove::<NpcWalker>()
+                .insert(follower)
+                .insert(Transform::from_translation(world_pos).with_scale(scale))
+                .remove_parent();
+                info!("RECRUIT: convertito {:?} in follower a {:?}", ev.entity, world_pos);
+            }
+            Err(QueryEntityError::NoSuchEntity(_)) => {
+                warn!("RECRUIT: entità {:?} NON ESISTE più → despawnata (tile streaming durante l'attesa LLM?)", ev.entity);
+            }
+            Err(other) => {
+                warn!("RECRUIT: entità {:?} esiste ma non ha NpcWalker+Transform+GlobalTransform → {}", ev.entity, other);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Test
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1194,12 +1314,18 @@ mod tests {
 
     #[test]
     fn answer_message_is_spoken_only_when_there_is_an_answer() {
-        let ok = answer_message("old beggar", &Ok("Daggerfall, friend.".to_string()));
+        let ok = answer_message("old beggar", &Ok(("Daggerfall, friend.".to_string(), false)));
         assert_eq!(ok, "old beggar: \"Daggerfall, friend.\"");
         assert_eq!(spoken_part(&ok).as_deref(), Some("Daggerfall, friend."));
         let fail = answer_message("old beggar", &Err(()));
         assert_eq!(fail, "old beggar says nothing.");
         assert_eq!(spoken_part(&fail), None);
+    }
+
+    #[test]
+    fn answer_message_with_follow_true() {
+        let ok = answer_message("barmaid", &Ok(("I'll follow you!".to_string(), true)));
+        assert_eq!(ok, "barmaid: \"I'll follow you!\"");
     }
 
     #[test]
@@ -1248,6 +1374,7 @@ mod tests {
     fn conversation_starts_empty_on_new_context() {
         let ctx = DialogContext::new(1, (207, 213), None, None, None);
         assert!(ctx.conversation.is_empty());
+        assert!(ctx.npc_entity.is_none());
     }
 
     #[test]

@@ -29,6 +29,7 @@ use dfmod::{MapKind, TextureKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+
 const MAX_PENDING: usize = 4;
 const MAX_SPAWNS_PER_FRAME: usize = 2;
 const DEFAULT_CLIMATE: i32 = 231;
@@ -54,6 +55,7 @@ const PERSON_FACE_BASE: [(u16, usize); 24] = [
     (395, 144), (396, 144), (397, 120), (398, 96),
     (453, 72), (454, 72), (455, 24), (456, 72),
 ];
+
 const FACE_VARIANTS: usize = 24;
 
 fn person_face_record(archive: u16, variant: usize) -> Option<usize> {
@@ -63,21 +65,28 @@ fn person_face_record(archive: u16, variant: usize) -> Option<usize> {
     .map(|(_, base)| base + variant % FACE_VARIANTS)
 }
 
+
 pub(crate) const ORIENTATIONS: [(usize, bool); 8] = [
     (0, false), (1, false), (2, false), (3, false),
     (4, false), (3, true), (2, true), (1, true),
 ];
+
 const IDLE_RECORD: u8 = 5;
 const NPC_MAX_FRAMES: usize = 32;
-
 const NPC_FRAME_SECONDS: f32 = 0.25;
 const NPC_SPEED: f32 = 1.3;
 const NPC_STEP: f32 = 4.0;
 const NPC_IDLE_DISTANCE: f32 = 2.5;
 const NPC_RANDOM_TURN_CHANCE: f32 = 0.025;
 const NPC_RADIUS: f32 = 0.35;
-
 const CARDINALS: [Vec2; 4] = [Vec2::X, Vec2::NEG_X, Vec2::Y, Vec2::NEG_Y];
+
+// --- Follower: costanti di inseguimento ---
+const FOLLOW_STOP: f32 = 1.6;
+const FOLLOW_SPEED: f32 = 3.5;
+const FOLLOW_CATCHUP_DIST: f32 = 7.0;
+const FOLLOW_CATCHUP_SPEED: f32 = 6.5;
+
 
 pub struct NpcSpriteSet {
     walk: [Vec<Handle<StandardMaterial>>; 5],
@@ -102,7 +111,6 @@ fn load_record(
     let (sx, sy) = (rec.scale_x as f32 / 256.0, rec.scale_y as f32 / 256.0);
     let mut handles = Vec::new();
     let mut size = Vec2::ONE;
-
     for frame in 0..frame_count {
         let Ok(img) = file.frame(record, frame) else { break };
         if img.width == 0 || img.height == 0 {
@@ -114,14 +122,12 @@ fn load_record(
                              img.height as f32 * (1.0 + sy),
             ) * DF_UNIT;
         }
-
         let key = TextureKey {
             archive: archive as u32,
             record: record as u32,
             frame: frame as u32,
             kind: MapKind::Albedo,
         };
-
         let (image_handle, is_hd) = if let Some(hd_handle) = mods.image_by_key(&key, images) {
             (hd_handle, true)
         } else {
@@ -139,7 +145,6 @@ fn load_record(
             image.sampler = bevy::image::ImageSampler::nearest();
             (images.add(image), false)
         };
-
         let uv_transform = if is_hd && mods.needs_v_flip(&image_handle) {
             Affine2::from_scale_angle_translation(
                 Vec2::new(1.0, -1.0),
@@ -149,7 +154,6 @@ fn load_record(
         } else {
             Affine2::IDENTITY
         };
-
         handles.push(materials.add(StandardMaterial {
             base_color_texture: Some(image_handle),
                                    alpha_mode: AlphaMode::Mask(0.5),
@@ -307,7 +311,6 @@ impl Colliders {
         let mut segments: Vec<WallSegment> = Vec::new();
         let mut surfaces: Vec<SurfaceTri> = Vec::new();
         let q = |v: f32| (v * 20.0).round() as i32;
-
         for (part, as_walls, surface_mode) in parts {
             for tri in part.indices.chunks_exact(3) {
                 let v = |i: u32| Vec3::from(part.positions[i as usize]);
@@ -364,7 +367,6 @@ impl Colliders {
                 }
             }
         }
-
         let cell = 128.0 * CELL_SIZE / COLLISION_GRID as f32;
         let mut grid: Vec<Vec<u32>> = vec![Vec::new(); COLLISION_GRID * COLLISION_GRID];
         let to_cell =
@@ -384,7 +386,6 @@ impl Colliders {
                 }
             }
         }
-
         let mut surf_grid: Vec<Vec<u32>> = vec![Vec::new(); COLLISION_GRID * COLLISION_GRID];
         for (i, t) in surfaces.iter().enumerate() {
             let xs = t.v.map(|v| v.x);
@@ -577,6 +578,10 @@ pub fn probe_world<'a>(
     best
 }
 
+// ---------------------------------------------------------------------------
+// NPC Walker
+// ---------------------------------------------------------------------------
+
 #[derive(Component)]
 pub struct NpcWalker {
     sprites: Arc<NpcSpriteSet>,
@@ -598,6 +603,36 @@ impl NpcWalker {
     }
     pub fn portrait(&self) -> (Handle<Image>, Vec2) {
         (self.sprites.portrait.clone(), self.sprites.portrait_size)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Follower (NPC reclutato che segue il giocatore)
+// ---------------------------------------------------------------------------
+
+/// Un NPC reclutato che segue il giocatore. Riusa gli sprite di `NpcWalker`.
+/// Vive come entità root (non figlia del chunk) così sopravvive allo scarico
+/// dei tile. Per il momento si limita a seguire il giocatore senza fare altro.
+#[derive(Component)]
+pub struct Follower {
+    sprites: Arc<NpcSpriteSet>,
+    frame: usize,
+    frame_timer: f32,
+    shown: Option<(usize, bool, usize)>,
+    face_record: Option<usize>,
+}
+
+impl Follower {
+    /// Crea un follower da un `NpcWalker`, copiandone gli sprite.
+    /// `face_record` viene conservato per eventuali dialoghi futuri.
+    pub fn from_walker(walker: &NpcWalker) -> Self {
+        Follower {
+            sprites: Arc::clone(&walker.sprites),
+            frame: 0,
+            frame_timer: 0.0,
+            shown: None,
+            face_record: walker.face_record,
+        }
     }
 }
 
@@ -841,7 +876,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
     let mut tile_preset = None;
     let mut exterior_flats: Vec<(f32, f32, u16, u8)> = Vec::new();
     let mut exterior_npcs: Vec<(f32, f32, u16, (Vec2, Vec2))> = Vec::new();
-
     if let Some(loc) = data.locations.get(&(mx, my)) {
         let blocks_bsa = BsaArchive::parse(&data.blocks_buf).ok()?;
         let arch3d_bsa = BsaArchive::parse(&data.arch3d_buf).ok()?;
@@ -849,7 +883,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
         city_rect_opt = Some(city_rect);
         tile_preset = Some(preset);
         flatten_terrain_heights(&mut samples.data, samples.dim, &city_rect, 12.0);
-
         let ground = |x: f32, z: f32| terrain_height(&samples, x / CELL_SIZE, -z / CELL_SIZE);
         let (builder, stats) = build_city_buildings(loc, &blocks_bsa, &arch3d_bsa, &ground);
         info!(
@@ -881,21 +914,17 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
             city_parts = Some(parts);
             city_textured = textured;
         }
-
         let bw = loc.width.min(8);
         let bh = loc.height.min(8);
         let start_bx = (8 - bw) / 2;
         let start_by = (8 - bh) / 2;
-
         for by in 0..bh {
             for bx in 0..bw {
                 let Some(name) = loc.block_names.get(by * loc.width + bx) else { continue };
                 let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
                 let Ok(rmb) = RmbBlock::parse(raw) else { continue };
-
                 let bx0 = (start_bx + bx) as f32 * BLOCK_SIZE_M;
                 let bz0 = (start_by + by) as f32 * BLOCK_SIZE_M;
-
                 for flat in &rmb.flats {
                     if flat.block.is_some() {
                         continue;
@@ -909,7 +938,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                 }
             }
         }
-
         if let Some(rect) = city_rect_opt.as_ref() {
             let bounds = (
                 Vec2::new(
@@ -925,7 +953,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
             if seed == 0 {
                 seed = 0x9E37_79B9_7F4A_7C15;
             }
-
             let npc_count = 50 + bw as usize * bh as usize * 5;
             let mut attempts = 0;
             while exterior_npcs.len() < npc_count && attempts < npc_count * 6 {
@@ -940,13 +967,11 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-
                 let archive =
                 PERSON_ARCHIVES[((seed & 0xFFFFFF) as usize) % PERSON_ARCHIVES.len()];
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-
                 if let Some(c) = city_colliders.as_deref() {
                     let p = Vec2::new(x, z);
                     let g = terrain_height(&samples, x / CELL_SIZE, -z / CELL_SIZE);
@@ -964,14 +989,12 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
             );
         }
     }
-
     let tilemap = generate_default_tilemap(&samples, mx, my, tile_preset.as_deref()).ok()?;
     let encoded = encode_for_shader(&tilemap, true);
     let mesh = build_terrain_mesh(&samples, &encoded, tile_px);
     let archive = ground_archive(climate_of(data, mx, my), data.winter);
     let grass_mask = crate::grass::grass_mask(data, archive);
     let grass_tilemap = Arc::new(encoded.clone());
-
     let water: Vec<bool> = tilemap.iter().map(|&t| t == 0xFF || (t & 0x3F) == 0).collect();
     let mut exterior_enemies: Vec<(f32, f32, usize)> = Vec::new();
     {
@@ -1002,7 +1025,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
             }
         }
     }
-
     Some(TileResult {
         archive,
          mesh,
@@ -1056,7 +1078,6 @@ pub fn stream_tiles(
     let r = streaming.radius;
     let keep = r + 1;
     let near = |(mx, my): (i32, i32), d: i32| (mx - pmx).abs() <= d && (my - pmy).abs() <= d;
-
     let far: Vec<_> = streaming
     .loaded
     .keys()
@@ -1070,7 +1091,6 @@ pub fn stream_tiles(
         field.tiles.remove(&key);
     }
     streaming.pending.retain(|k, _| near(*k, keep));
-
     let mut wanted = Vec::new();
     for dy in -r..=r {
         for dx in -r..=r {
@@ -1084,7 +1104,6 @@ pub fn stream_tiles(
         }
     }
     wanted.sort_by_key(|(mx, my)| (mx - pmx).pow(2) + (my - pmy).pow(2));
-
     let pool = AsyncComputeTaskPool::get();
     for key in wanted {
         if streaming.pending.len() >= MAX_PENDING {
@@ -1119,11 +1138,9 @@ pub fn collect_tiles(
     .filter_map(|(key, task)| block_on(future::poll_once(task)).map(|result| (*key, result)))
     .take(MAX_SPAWNS_PER_FRAME)
     .collect();
-
     for (key, result) in finished {
         streaming.pending.remove(&key);
         let Some(tile) = result else { continue };
-
         let tile_array_handle = match mods.terrain_texture_array(tile.archive as u32, &mut images) {
             Some(h) => h,
             None => {
@@ -1155,7 +1172,6 @@ pub fn collect_tiles(
                 tilemap: tilemap_handle,
             },
         });
-
         let chunk_entity = commands
         .spawn((
             Mesh3d(meshes.add(to_bevy_mesh(tile.mesh))),
@@ -1164,13 +1180,11 @@ pub fn collect_tiles(
                 TerrainTile { mx: key.0, my: key.1 },
         ))
         .id();
-
         if let Some(c) = &tile.colliders {
             commands
             .entity(chunk_entity)
             .insert(TileCollision(Arc::clone(c)));
         }
-
         if let Some(mask) = tile.grass_mask.clone() {
             commands.entity(chunk_entity).insert(crate::grass::GrassSource::new(
                 key.0,
@@ -1181,7 +1195,6 @@ pub fn collect_tiles(
                                                                                 tile.city_rect,
             ));
         }
-
         if let Some(parts) = tile.city_parts {
             commands.entity(chunk_entity).with_children(|parent| {
                 for (kind, part) in MaterialKind::ALL.iter().zip(parts) {
@@ -1197,7 +1210,6 @@ pub fn collect_tiles(
                 }
             });
         }
-
         let textured: Vec<_> = tile
         .city_textured
         .into_iter()
@@ -1227,16 +1239,9 @@ pub fn collect_tiles(
                 }
             });
         }
-
         // --- Flat esterni (decorazioni + alberi) ---
-        //
-        // La maggior parte dei flat sono rettangoli 2D che si girano verso la
-        // camera. Ma alcuni ID, che nel DFU originale sono alberi, vengono
-        // decodificati come "lampioni" e vanno sostituiti con la texture di un
-        // albero dell'archivio natura per il clima corrente (cross-billboard 3D).
         let climate = climate_of(&data, key.0, key.1);
         let tree_archive = crate::trees::nature_archive_for_climate(climate, data.winter);
-
         nature_pool.get_or_load(
             tree_archive,
             &data,
@@ -1247,19 +1252,14 @@ pub fn collect_tiles(
         );
         let tree_template: Option<crate::trees::TreeType> =
         (0..64u32).find_map(|r| nature_pool.tree_for_flat(tree_archive, r));
-
-        // Niente mesh unitaria: ogni albero usa `tree.mesh`, che ha le UV già
-        // coerenti con `needs_v_flip` della sua texture (fix "testa in giù").
         let mut trees_to_spawn: Vec<(Handle<Mesh>, Handle<StandardMaterial>, Vec3, Vec3)> = Vec::new();
         let mut rects_to_spawn: Vec<(Handle<Mesh>, Handle<StandardMaterial>, Vec3)> = Vec::new();
         let mut total_nature = 0usize;
         let mut total_decor = 0usize;
-
         for (fx, fz, archive, record) in &tile.exterior_flats {
             let gx = (fx / CELL_SIZE).clamp(0.0, 128.0);
             let gy = (-fz / CELL_SIZE).clamp(0.0, 128.0);
             let y = terrain_height(&tile.samples, gx, gy);
-
             let Some((mat_orig, w_px, h_px)) = wall_textures.flat_material(
                 *archive,
                 *record,
@@ -1270,16 +1270,11 @@ pub fn collect_tiles(
             ) else {
                 continue;
             };
-
             if FLAT_IDS_AS_TREES.contains(&(*archive, *record)) {
-                // Questo specifico flat è in realtà un albero nel gioco originale.
                 let Some(tree) = tree_template.as_ref() else {
                     continue;
                 };
-                // Alberi più grandi (era 3.2×6.5): 6×12 m, altezza di un albero vero.
                 let (w_tree, h_tree) = (6.0_f32, 12.0_f32);
-                // Scala uguale su X e Z: i due piani del cross billboard restano
-                // simmetrici. Con Z=1 il piano B resterebbe 1 m → sembra piatto.
                 let scale_xz = w_tree / tree.w_meters.max(1e-3);
                 let scale_y = h_tree / tree.h_meters.max(1e-3);
                 total_nature += 1;
@@ -1290,7 +1285,6 @@ pub fn collect_tiles(
                                      Vec3::new(scale_xz, scale_y, scale_xz),
                 ));
             } else {
-                // Decorazione normale: rettangolo 2D con billboard.
                 let (w, h) = (w_px * DF_UNIT, h_px * DF_UNIT);
                 info!(
                     "FLAT pos=({:.1},{:.1}) archive={} record={} size_px={}x{}",
@@ -1301,14 +1295,12 @@ pub fn collect_tiles(
                 total_decor += 1;
             }
         }
-
         if total_nature + total_decor > 0 {
             info!(
                 "Tile ({},{}): {} alberi 3D, {} decorazioni 2D",
                   key.0, key.1, total_nature, total_decor
             );
         }
-
         commands.entity(chunk_entity).with_children(|parent| {
             for (mesh, mat, pos, scale) in trees_to_spawn {
                 parent.spawn((
@@ -1345,7 +1337,6 @@ pub fn collect_tiles(
                 s
             };
             let Some(sprites) = sprites else { continue };
-
             let mut rng =
             ((fx.to_bits() as u64) << 32) ^ (fz.to_bits() as u64) ^ 0x9E37_79B9_7F4A_7C15;
             let mut heading = CARDINALS[(next_rand(&mut rng) * 4.0) as usize % 4];
@@ -1360,12 +1351,10 @@ pub fn collect_tiles(
             );
             let frame_timer = next_rand(&mut rng) * NPC_FRAME_SECONDS;
             let frame = (next_rand(&mut rng) * sprites.walk[0].len() as f32) as usize;
-
             let size = sprites.walk_size[0];
             let gx = (fx / CELL_SIZE).clamp(0.0, 128.0);
             let gy = (-fz / CELL_SIZE).clamp(0.0, 128.0);
             let y = terrain_height(&tile.samples, gx, gy);
-
             let mut face_rng =
             ((fx.to_bits() as u64) << 32) ^ (fz.to_bits() as u64) ^ 0xFACE_0000_0000_F00D;
             let face_variant = (next_rand(&mut face_rng) * FACE_VARIANTS as f32) as usize;
@@ -1382,7 +1371,6 @@ pub fn collect_tiles(
                 samples: Arc::clone(&tile.samples),
                 colliders: tile.colliders.clone(),
             };
-
             commands.entity(chunk_entity).with_children(|parent| {
                 parent.spawn((
                     Mesh3d(npc_quad.clone()),
@@ -1398,7 +1386,6 @@ pub fn collect_tiles(
         if spawned > 0 {
             debug!("  {} NPC animati nel tile ({},{})", spawned, key.0, key.1);
         }
-
         // --- Nemici selvatici ---
         let mut enemies_spawned = 0usize;
         for (fx, fz, species) in &tile.exterior_enemies {
@@ -1419,20 +1406,17 @@ pub fn collect_tiles(
                 s
             };
             let Some(sprites) = sprites else { continue };
-
             let mut rng =
             ((fx.to_bits() as u64) << 32) ^ (fz.to_bits() as u64) ^ 0x5DEE_CE66_D1CE_4E5B;
             let angle = next_rand(&mut rng) * std::f32::consts::TAU;
             let heading = Vec2::new(angle.sin(), angle.cos());
             let timer = 1.0 + next_rand(&mut rng) * 4.0;
             let frame = (next_rand(&mut rng) * sprites.walk.0[0].len() as f32) as usize;
-
             let size = sprites.walk.1[0];
             let gx = (fx / CELL_SIZE).clamp(0.0, 128.0);
             let gy = (-fz / CELL_SIZE).clamp(0.0, 128.0);
             let y = terrain_height(&tile.samples, gx, gy)
             + if sp.flying { ENEMY_HOVER } else { 0.0 };
-
             let enemy = Enemy {
                 sprites: Arc::clone(&sprites),
                 species: *species,
@@ -1451,7 +1435,6 @@ pub fn collect_tiles(
                 samples: Arc::clone(&tile.samples),
                 water: Arc::clone(&tile_water),
             };
-
             commands.entity(chunk_entity).with_children(|parent| {
                 parent.spawn((
                     Mesh3d(npc_quad.clone()),
@@ -1466,7 +1449,6 @@ pub fn collect_tiles(
         if enemies_spawned > 0 {
             debug!("  {} nemici nel tile ({},{})", enemies_spawned, key.0, key.1);
         }
-
         spawn_trees_for_chunk(
             &mut commands,
             chunk_entity,
@@ -1483,7 +1465,6 @@ pub fn collect_tiles(
                               &mut standard_materials,
                               tile.city_rect,
         );
-
         streaming.loaded.insert(key, chunk_entity);
         field.tiles.insert(key, tile.samples);
     }
@@ -1501,13 +1482,13 @@ pub(crate) fn orientation_index(heading: Vec2, to_camera: Vec2) -> usize {
 
 pub fn update_npcs(
     time: Res<Time>,
-    player: Query<&Transform, (With<Player>, Without<NpcWalker>)>,
+    player: Query<&Transform, (With<Player>, Without<NpcWalker>, Without<Follower>)>,
                    mut npcs: Query<(
                        &mut NpcWalker,
                        &mut Transform,
                        &GlobalTransform,
                        &mut MeshMaterial3d<StandardMaterial>,
-                   )>,
+                   ), Without<Follower>>,  // ← AGGIUNGI QUESTO
                    mut last_player_pos: Local<Option<Vec3>>,
 ) {
     let real_dt = time.delta_secs();
@@ -1517,17 +1498,14 @@ pub fn update_npcs(
     let player_still =
     last_player_pos.is_some_and(|p| p.distance(player_pos) < 0.1 * real_dt.max(1e-4));
     *last_player_pos = Some(player_pos);
-
     let cam_forward = player_tf.forward();
     let cam_forward_xz = Vec2::new(cam_forward.x, cam_forward.z).normalize_or_zero();
     let yaw = (cam_forward_xz != Vec2::ZERO).then(|| (-cam_forward_xz.x).atan2(-cam_forward_xz.y));
-
     for (mut npc, mut tf, gtf, mut material) in &mut npcs {
         let npc = &mut *npc;
         let world = gtf.translation();
         let to_player = Vec2::new(player_pos.x - world.x, player_pos.z - world.z);
         let idle = player_still && to_player.length() < NPC_IDLE_DISTANCE;
-
         if !idle {
             let pos = tf.translation.xz();
             let to_target = npc.target - pos;
@@ -1537,7 +1515,6 @@ pub fn update_npcs(
             } else {
                 npc.target
             };
-
             let mut hit = false;
             if let Some(c) = npc.colliders.as_deref() {
                 let feet =
@@ -1559,14 +1536,12 @@ pub fn update_npcs(
                     &blocked,
                 );
             }
-
             npc.frame_timer += dt;
             if npc.frame_timer >= NPC_FRAME_SECONDS {
                 npc.frame_timer -= NPC_FRAME_SECONDS;
                 npc.frame = (npc.frame + 1) % npc.sprites.walk[0].len();
             }
         }
-
         let (record, flip, frame, handle, size) = if idle {
             (5, false, 0, &npc.sprites.idle[0], npc.sprites.idle_size)
         } else {
@@ -1579,11 +1554,89 @@ pub fn update_npcs(
             *material = MeshMaterial3d(handle.clone());
             npc.shown = Some((record, flip, frame));
         }
-
         tf.scale = Vec3::new(if flip { -size.x } else { size.x }, size.y, 1.0);
         let gx = (tf.translation.x / CELL_SIZE).clamp(0.0, 128.0);
         let gy = (-tf.translation.z / CELL_SIZE).clamp(0.0, 128.0);
         tf.translation.y = terrain_height(&npc.samples, gx, gy) + size.y * 0.5;
+        if let Some(yaw) = yaw {
+            tf.rotation = Quat::from_rotation_y(yaw);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Follower: insegue il giocatore
+// ---------------------------------------------------------------------------
+
+pub fn update_followers(
+    time: Res<Time>,
+    origin: Res<Origin>,
+    field: Res<HeightField>,
+    player: Query<&Transform, (With<Player>, Without<Follower>, Without<NpcWalker>)>,
+                        mut followers: Query<(
+                            &mut Follower,
+                            &mut Transform,
+                            &mut MeshMaterial3d<StandardMaterial>,
+                        ), Without<NpcWalker>>,  // ← AGGIUNGI QUESTO
+) {
+    let dt = time.delta_secs().min(0.1);
+    let Ok(player_tf) = player.get_single() else { return };
+    let player_pos = player_tf.translation;
+
+    let cam_forward = player_tf.forward();
+    let cam_forward_xz = Vec2::new(cam_forward.x, cam_forward.z).normalize_or_zero();
+    let yaw = (cam_forward_xz != Vec2::ZERO).then(|| (-cam_forward_xz.x).atan2(-cam_forward_xz.y));
+
+    for (mut fol, mut tf, mut material) in &mut followers {
+        let fol = &mut *fol;
+        // Il follower è un'entità root: tf.translation è in coordinate mondo.
+        let pos = Vec2::new(tf.translation.x, tf.translation.z);
+        let to_player = Vec2::new(player_pos.x - pos.x, player_pos.z - pos.y);
+        let dist = to_player.length();
+
+        // Si muove solo se è più lontano della distanza di sosta.
+        let moving = dist > FOLLOW_STOP;
+        if moving {
+            let dir = to_player / dist.max(0.01);
+            let speed = if dist > FOLLOW_CATCHUP_DIST { FOLLOW_CATCHUP_SPEED } else { FOLLOW_SPEED };
+            // Non oltrepassare il player: al massimo fino a FOLLOW_STOP.
+            let move_dist = (dist - FOLLOW_STOP).min(speed * dt).max(0.0);
+            tf.translation.x += dir.x * move_dist;
+            tf.translation.z += dir.y * move_dist;
+
+            fol.frame_timer += dt;
+            if fol.frame_timer >= NPC_FRAME_SECONDS {
+                fol.frame_timer -= NPC_FRAME_SECONDS;
+                fol.frame = (fol.frame + 1) % fol.sprites.walk[0].len();
+            }
+        }
+
+        let heading = if dist > 0.01 { to_player / dist } else { Vec2::X };
+        let (record, flip, frame, handle, size) = if moving {
+            let (record, flip) = ORIENTATIONS[orientation_index(heading, to_player)];
+            let frames = &fol.sprites.walk[record];
+            let frame = fol.frame % frames.len();
+            (record, flip, frame, &frames[frame], fol.sprites.walk_size[record])
+        } else {
+            (5, false, 0, &fol.sprites.idle[0], fol.sprites.idle_size)
+        };
+
+        if fol.shown != Some((record, flip, frame)) {
+            *material = MeshMaterial3d(handle.clone());
+            fol.shown = Some((record, flip, frame));
+        }
+
+        tf.scale = Vec3::new(if flip { -size.x } else { size.x }, size.y, 1.0);
+
+        // Altezza dal tile CORRENTE (HeightField), non dai campioni originali:
+        // il follower attraversa i tile seguendo il giocatore.
+        let (mx, my) = map_pixel_of(&origin, tf.translation);
+        if let Some(samples) = field.tiles.get(&(mx, my)) {
+            let tile_org = tile_translation(&origin, mx, my);
+            let gx = ((tf.translation.x - tile_org.x) / CELL_SIZE).clamp(0.0, 128.0);
+            let gy = (-(tf.translation.z - tile_org.z) / CELL_SIZE).clamp(0.0, 128.0);
+            tf.translation.y = terrain_height(samples, gx, gy) + size.y * 0.5;
+        }
 
         if let Some(yaw) = yaw {
             tf.rotation = Quat::from_rotation_y(yaw);
@@ -1604,19 +1657,15 @@ pub fn update_enemies(
     let dt = time.delta_secs().min(0.1);
     let Ok(player_tf) = player.get_single() else { return };
     let player_pos = player_tf.translation;
-
     let cam_forward = player_tf.forward();
     let cam_forward_xz = Vec2::new(cam_forward.x, cam_forward.z).normalize_or_zero();
     let yaw = (cam_forward_xz != Vec2::ZERO).then(|| (-cam_forward_xz.x).atan2(-cam_forward_xz.y));
-
     for (mut enemy, mut tf, gtf, mut material) in &mut enemies {
         let e = &mut *enemy;
         let sp = &ENEMY_SPECIES[e.species];
-
         let world = gtf.translation();
         let to_player = Vec2::new(player_pos.x - world.x, player_pos.z - world.z);
         let dist = to_player.length();
-
         let engaged = matches!(e.mode, EnemyMode::Chase | EnemyMode::Attack);
         let aware = dist < ENEMY_NOTICE_DISTANCE || (engaged && dist < ENEMY_LOSE_DISTANCE);
         let new_mode = if aware {
@@ -1636,7 +1685,6 @@ pub fn update_enemies(
             }
             e.mode = new_mode;
         }
-
         match e.mode {
             EnemyMode::Chase | EnemyMode::Attack => {
                 if dist > 0.01 {
@@ -1658,7 +1706,6 @@ pub fn update_enemies(
                 }
             }
         }
-
         let speed = match e.mode {
             EnemyMode::Chase => sp.chase_speed,
             EnemyMode::Walk => sp.wander_speed,
@@ -1677,7 +1724,6 @@ pub fn update_enemies(
                 e.timer = e.timer.min(1.0);
             }
         }
-
         let has_idle_anim = e.sprites.idle.is_some();
         let (kind, fps) = match e.mode {
             EnemyMode::Attack => (1u8, ENEMY_ATTACK_FPS),
@@ -1701,7 +1747,6 @@ pub fn update_enemies(
                 e.frame = (e.frame + 1) % 4096;
             }
         }
-
         let (offset, flip) = ORIENTATIONS[orientation_index(e.heading, to_player)];
         let set: &RecordSet = match kind {
             1 => &e.sprites.attack,
@@ -1715,13 +1760,11 @@ pub fn update_enemies(
             *material = MeshMaterial3d(frames[frame].clone());
             e.shown = Some((kind, offset, flip, frame));
         }
-
         tf.scale = Vec3::new(if flip { -size.x } else { size.x }, size.y, 1.0);
         let gx = (tf.translation.x / CELL_SIZE).clamp(0.0, 128.0);
         let gy = (-tf.translation.z / CELL_SIZE).clamp(0.0, 128.0);
         let hover = if sp.flying { ENEMY_HOVER } else { 0.0 };
         tf.translation.y = terrain_height(&e.samples, gx, gy) + size.y * 0.5 + hover;
-
         if let Some(yaw) = yaw {
             tf.rotation = Quat::from_rotation_y(yaw);
         }

@@ -75,6 +75,8 @@ pub struct InteriorDoor {
 #[derive(Debug, Clone)]
 pub struct InteriorPerson {
     pub position: [f32; 3],
+    /// orientamento in gradi (0 = verso -Z locale, come i modelli ARCH3D)
+    pub direction_deg: f32,
     pub texture_archive: u16,
     pub texture_record: u8,
 }
@@ -109,15 +111,6 @@ impl InteriorMesh {
         self.spawn_position
     }
 
-    fn textured_part(&mut self, key: (u16, u8)) -> &mut MeshPart {
-        if let Some(i) = self.textured.iter().position(|(k, _)| *k == key) {
-            return &mut self.textured[i].1;
-        }
-        self.textured.push((key, MeshPart::default()));
-        &mut self.textured.last_mut().unwrap().1
-    }
-}
-
 /// Vertici del modello nello spazio locale della stanza (flip 180° + rotazione
 /// oggetto + traslazione locale). Calcolarli prima di toccare la cache evita
 /// problemi di borrow.
@@ -129,7 +122,7 @@ fn transformed_vertices(model: &Arch3dModel, o: &RmbObject3D) -> Vec<[f32; 3]> {
         .vertices
         .iter()
         .map(|v| {
-            let mut p = [*v, 0.0];
+            let mut p = [v[0], v[1], v[2]];
             p[0] = v[0] * c + v[2] * s;
             p[2] = -v[0] * s + v[2] * c;
             p[1] = v[1];
@@ -150,7 +143,7 @@ pub fn build_interior(interior: &InteriorBlock, _block: &RmbBlock, bsa: &BsaArch
     let mut cache: HashMap<u32, Option<Arch3dModel>> = HashMap::new();
 
     // ---- modelli 3D (pareti, soffitto, pavimento, arredi) -----------------------
-    for o in &interior.objects_3d {
+    for o in &interior.data.objects_3d {
         let id = o.model_id;
         let entry = cache.entry(id).or_insert_with(|| {
             bsa.get_by_id(id).and_then(|raw| Arch3dModel::parse(id, raw).ok())
@@ -169,8 +162,8 @@ pub fn build_interior(interior: &InteriorBlock, _block: &RmbBlock, bsa: &BsaArch
     // Le flats interne non hanno rotazione nel record: il quad viene rivolto verso
     // il centro della stanza (stimato dalla media dei modelli), cosi' quadri e
     // segnali risultano comunque visibili da chi entra.
-    let (ccx, ccz) = centroid_xz(&interior.objects_3d);
-    for f in &interior.flats {
+    let (ccx, ccz) = centroid_xz(&interior.data.objects_3d);
+    for f in &interior.data.flats {
         let cx = f.x as f32 * DF_UNIT;
         let cz = f.z as f32 * DF_UNIT;
         let cy = -f.y as f32 * DF_UNIT;
@@ -245,6 +238,7 @@ pub fn build_interior(interior: &InteriorBlock, _block: &RmbBlock, bsa: &BsaArch
                 -p.y as f32 * DF_UNIT,
                 p.z as f32 * DF_UNIT,
             ],
+            direction_deg: p.direction_deg,
             texture_archive: p.texture_archive,
             texture_record: p.texture_record,
         });

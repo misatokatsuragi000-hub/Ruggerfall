@@ -115,6 +115,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
     let mut city_textured = Vec::new();
     let mut city_rect_opt = None;
     let mut tile_preset = None;
+    let mut local_doors = Vec::new();
 
     if let Some(loc) = data.locations.get(&(mx, my)) {
         // i BSA si parsano solo per i pixel che contengono una località
@@ -165,6 +166,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
          city_parts,
          city_textured,
          city_rect: city_rect_opt,
+         doors: local_doors,
     })
 }
 
@@ -222,6 +224,7 @@ pub fn stream_tiles(
     mut commands: Commands,
     mut streaming: ResMut<Streaming>,
     mut field: ResMut<HeightField>,
+    mut doors: ResMut<CityDoors>,
     data: Res<GameData>,
     origin: Res<Origin>,
     player: Query<&Transform, With<Player>>,
@@ -238,6 +241,8 @@ pub fn stream_tiles(
             commands.entity(e).despawn_recursive();
         }
         field.tiles.remove(&key);
+        // scaricando il tile spariscono anche le sue porte: escludi l'ingresso
+        doors.remove_tile(key);
     }
     streaming.pending.retain(|k, _| near(*k, keep));
 
@@ -267,6 +272,7 @@ pub fn collect_tiles(
     mut commands: Commands,
     mut streaming: ResMut<Streaming>,
     mut field: ResMut<HeightField>,
+    mut doors: ResMut<CityDoors>,
     data: Res<GameData>,
     origin: Res<Origin>,
     mut mods: ResMut<ModTextures>,
@@ -392,6 +398,11 @@ pub fn collect_tiles(
                               &mut standard_materials,
                               tile.city_rect,
         );
+
+        // registra le porte del tile: servono a interior_enter per l'ingresso
+        if !tile.doors.is_empty() {
+            doors.insert_tile(key, tile.doors);
+        }
 
         streaming.loaded.insert(key, chunk_entity);
         field.tiles.insert(key, tile.samples);

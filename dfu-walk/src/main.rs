@@ -1,9 +1,12 @@
 //! Terreno percorribile di Daggerfall con supporto per shader WGSL,
 //! mod HD di D.R.E.A.M., mappa interattiva (tasto M), vegetazione 3D e città/villaggi.
 mod wall_textures;
+mod interior_enter;
+mod interior_render;
 mod local_map;
 mod map;
 mod mod_textures;
+mod npc_home;
 mod player;
 mod sky;
 mod terrain_material;
@@ -205,6 +208,9 @@ fn main() {
         dir: args.mods_dir.clone(),
                  nearest_filter: false,
     })
+    .add_plugins(interior_render::InteriorRenderPlugin)
+    .add_plugins(interior_enter::InteriorEnterPlugin)
+    .add_plugins(npc_home::NpcHomePlugin)
     .insert_resource(ClearColor(SKY))
     .insert_resource(AmbientLight {
         color: Color::srgb(0.85, 0.9, 1.0),
@@ -230,6 +236,8 @@ fn main() {
          rebase_origin,
          stream_tiles,
          collect_tiles,
+         interior_render::spawn_interior,
+         interior_render::despawn_interior,
          sky::update_sky,
          map::toggle_map,
          map::update_map_marker,

@@ -5,7 +5,23 @@
 //   fragment_blur_h  blur gaussiano orizzontale di A          -> texture B
 //   fragment_blur_v  blur gaussiano verticale di B (mean)     -> texture Mean
 //   fragment_height  mappa bump (solo modo 1 o debug 5)       -> texture Height
-//   fragment_relief  rilievo finale                           -> schermo
+//   fragment_relief  rilievo finale + color grading           -> schermo
+//
+// ## Color grading e adaptive contrast
+//
+// Dopo il rilievo si applicano saturazione, luminosita' e contrasto in spazio
+// gamma (e' li' che i controlli utente sono intuitivi). Il contrasto ha due
+// modalita':
+//   - `color_adaptive_contrast == 1`: il pivot e' la luminanza media locale
+//     del pixel (`mean_tex`). Alzare il contrasto non sposta la luminosita'
+//     media della zona, quindi interni scuri restano scuri, esterni chiari
+//     restano chiari.
+//   - `color_adaptive_contrast == 0`: pivot fisso (`color_contrast_pivot`),
+//     default 0.5 (grigio medio). Comportamento classico.
+//
+// Il grading viene applicato anche agli early return (rilievo spento, cielo,
+// pelle, distanza) tramite `final_out`, cosi' funziona pure con l'effetto
+// disattivato (F8).
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
@@ -41,6 +57,14 @@ struct Settings {
     near: f32,
     tan_half_fov: f32,
     mean_div: f32,
+    // Colore (scheda "Colore" del menu F1)
+    color_enabled: u32,
+    color_saturation: f32,
+    color_brightness: f32,
+    color_contrast: f32,
+    // Adaptive contrast (opzionale: pivot = luminanza media locale)
+    color_adaptive_contrast: u32,
+    color_contrast_pivot: f32,
 }
 
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
@@ -67,6 +91,10 @@ fn out_g(c: vec3<f32>) -> vec4<f32> {
 }
 
 fn sat(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
+
+fn saturate_vec3(c: vec3<f32>) -> vec3<f32> {
+    return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
 
 fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -164,6 +192,40 @@ fn multi_grad_height(uv: vec2<f32>, d: vec2<f32>) -> vec2<f32> {
     return g;
 }
 
+// ------------------------------------------------------------- Color grading
+// Media locale della luminanza attorno al pixel, dalla `mean_tex` (che e' gia'
+// 1/4 di risoluzione con blur). 0..1. Se l'adaptive contrast e' disattivato,
+// si usa `color_contrast_pivot` (default 0.5).
+fn compute_pivot(uv: vec2<f32>) -> f32 {
+    if S.color_adaptive_contrast == 0u {
+        return S.color_contrast_pivot;
+    }
+    return mean_tap(uv);
+}
+
+// Saturazione -> luminosita' -> contrasto attorno a `pivot` -> clamp.
+// Lavora in spazio gamma. Con pivot adattivo il contrasto non sposta la
+// luminosita' media della zona: interni restano scuri, esterni chiari.
+fn apply_color_grade(c: vec3<f32>, pivot: f32) -> vec3<f32> {
+    if S.color_enabled == 0u {
+        return c;
+    }
+    // 1. Luminosita' (moltiplicatore attorno a 1.0)
+    var r = c * S.color_brightness;
+    // 2. Contrasto attorno al pivot (0.5 fisso oppure media locale)
+    r = (r - vec3<f32>(pivot)) * S.color_contrast + vec3<f32>(pivot);
+    // 3. Saturazione (mix con la luminanza)
+    let l = luma(r);
+    r = mix(vec3<f32>(l), r, S.color_saturation);
+    // 4. Clamp finale
+    return clamp(r, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Wrapper per gli early return: input lineare, output lineare gia' graded.
+fn final_out(lin: vec3<f32>, pivot: f32) -> vec4<f32> {
+    return out_g(apply_color_grade(to_gamma(lin), pivot));
+}
+
 // ------------------------------------------------------------- Pass 1
 @fragment
 fn fragment_down(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
@@ -194,13 +256,13 @@ fn blur_dir(uv: vec2<f32>, dir: vec2<f32>) -> f32 {
 
     var sum = textureSampleLevel(src_tex, samp, uv, 0.0).r * w0;
     sum += (textureSampleLevel(src_tex, samp, uv + o1, 0.0).r
-          + textureSampleLevel(src_tex, samp, uv - o1, 0.0).r) * w1;
+    + textureSampleLevel(src_tex, samp, uv - o1, 0.0).r) * w1;
     sum += (textureSampleLevel(src_tex, samp, uv + o2, 0.0).r
-          + textureSampleLevel(src_tex, samp, uv - o2, 0.0).r) * w2;
+    + textureSampleLevel(src_tex, samp, uv - o2, 0.0).r) * w2;
     sum += (textureSampleLevel(src_tex, samp, uv + o3, 0.0).r
-          + textureSampleLevel(src_tex, samp, uv - o3, 0.0).r) * w3;
+    + textureSampleLevel(src_tex, samp, uv - o3, 0.0).r) * w3;
     sum += (textureSampleLevel(src_tex, samp, uv + o4, 0.0).r
-          + textureSampleLevel(src_tex, samp, uv - o4, 0.0).r) * w4;
+    + textureSampleLevel(src_tex, samp, uv - o4, 0.0).r) * w4;
     return sum;
 }
 
@@ -224,13 +286,13 @@ fn fragment_height(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let o = px_size() * S.bump_smooth;
     var s = lum_tap(uv) * 4.0;
     s += (lum_tap(uv + vec2<f32>(o.x, 0.0))
-        + lum_tap(uv - vec2<f32>(o.x, 0.0))
-        + lum_tap(uv + vec2<f32>(0.0, o.y))
-        + lum_tap(uv - vec2<f32>(0.0, o.y))) * 2.0;
+    + lum_tap(uv - vec2<f32>(o.x, 0.0))
+    + lum_tap(uv + vec2<f32>(0.0, o.y))
+    + lum_tap(uv - vec2<f32>(0.0, o.y))) * 2.0;
     s += lum_tap(uv + vec2<f32>( o.x,  o.y))
-       + lum_tap(uv + vec2<f32>(-o.x,  o.y))
-       + lum_tap(uv + vec2<f32>( o.x, -o.y))
-       + lum_tap(uv + vec2<f32>(-o.x, -o.y));
+    + lum_tap(uv + vec2<f32>(-o.x,  o.y))
+    + lum_tap(uv + vec2<f32>( o.x, -o.y))
+    + lum_tap(uv + vec2<f32>(-o.x, -o.y));
     s *= 1.0 / 16.0;
 
     let mean = mean_tap(uv);
@@ -277,8 +339,8 @@ fn skin_mask(col: vec3<f32>) -> f32 {
     var hd = abs(hsv.x - S.skin_hue);
     hd = min(hd, 360.0 - hd);
     return tol_mask(hd, S.skin_hue_tol)
-         * tol_mask(abs(hsv.y - S.skin_sat), S.skin_sat_tol)
-         * tol_mask(abs(hsv.z - S.skin_val), S.skin_val_tol);
+    * tol_mask(abs(hsv.y - S.skin_sat), S.skin_sat_tol)
+    * tol_mask(abs(hsv.z - S.skin_val), S.skin_val_tol);
 }
 
 // ------------------------------------------------------------- Pass 5
@@ -288,6 +350,11 @@ fn fragment_relief(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let lin = scene_lin(uv);
     var col = to_gamma(lin);
 
+    // Pivot del contrasto (0.5 fisso oppure luminanza media locale). Calcolato
+    // una volta sola: tutti i rami lo riusano.
+    let pivot = compute_pivot(uv);
+
+    // --- Debug: non passa per il color grading (è una vista diagnostica) ---
     if S.debug == 4u {
         return out_g(mix(col * 0.4, vec3<f32>(1.0, 0.2, 0.8), skin_mask(col)));
     }
@@ -295,18 +362,23 @@ fn fragment_relief(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         return out_g(vec3<f32>(height_tap(uv) * 0.5 + 0.5));
     }
 
+    // Rilievo disattivato: applica solo il color grading (se attivo).
+    if S.enabled == 0u {
+        return final_out(lin, pivot);
+    }
+
     let z = depth_z(uv);
     if z / S.far_plane > 0.999 {
-        return vec4<f32>(lin, 1.0);
+        return final_out(lin, pivot);
     }
 
     let dist_fade = sat(1.0 - z / max(S.fade_distance, 0.01));
     if S.debug == 0u && dist_fade <= 0.0 {
-        return vec4<f32>(lin, 1.0);
+        return final_out(lin, pivot);
     }
     let skin = skin_mask(col);
     if S.debug == 0u && skin >= 0.999 {
-        return vec4<f32>(lin, 1.0);
+        return final_out(lin, pivot);
     }
 
     let tn = S.tan_half_fov;
@@ -332,7 +404,7 @@ fn fragment_relief(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         return out_g(vec3<f32>(f));
     }
     if S.debug == 0u && f < 0.002 {
-        return vec4<f32>(lin, 1.0);
+        return final_out(lin, pivot);
     }
 
     let screen_h = f32(textureDimensions(scene_tex).y);
@@ -409,5 +481,6 @@ fn fragment_relief(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         col += spec * sat(cl * 2.0);
     }
 
-    return out_g(saturate(col));
+    // --- Color grading finale (dopo tutti gli altri post-processing) ---
+    return out_g(apply_color_grade(saturate_vec3(col), pivot));
 }

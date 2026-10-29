@@ -32,6 +32,8 @@ bevy = { version = "0.15", default-features = false, features = [
     "vorbis",
     "wav",
 ] }
+bevy_egui = "0.33"
+
 dfmod = { version = "0.1.0", path = "../dfmod" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 texture2ddecoder = "0.1"

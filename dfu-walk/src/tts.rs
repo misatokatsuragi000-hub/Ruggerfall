@@ -202,6 +202,9 @@ pub struct Speaker {
     pub gender: Option<Gender>,
     pub role: Option<Tone>,
     pub temperament: &'static str,
+    /// Voce imposta (es. `af_sarah`, dal campo `voice=` del .txt di un NPC custom):
+    /// se presente sostituisce la scelta automatica per genere/ruolo.
+    pub voice: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -324,7 +327,11 @@ pub fn voice_for(cfg: &TtsConfig, sp: &Speaker) -> VoiceSpec {
         (Gender::Male, false) => (&cfg.voices_male, &cfg.voices_male),
     };
     let list = if preferred.is_empty() { fallback } else { preferred };
-    let voice = list.get((h >> 8) as usize % list.len().max(1)).cloned().unwrap_or_else(|| "af_bella".to_string());
+    let auto = list.get((h >> 8) as usize % list.len().max(1)).cloned().unwrap_or_else(|| "af_bella".to_string());
+    let voice = match sp.voice.as_deref().map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => auto,
+    };
     let speed = (1.0 + role_speed(sp.role) + temperament_speed(sp.temperament)).clamp(0.7, 1.3);
     VoiceSpec { voice, speed: (speed * 100.0).round() / 100.0 }
 }
@@ -742,7 +749,7 @@ mod tests {
     use std::net::TcpListener;
 
     fn speaker(key: &str, gender: Option<Gender>, role: Option<Tone>, temperament: &'static str) -> Speaker {
-        Speaker { key: key.into(), gender, role, temperament }
+        Speaker { key: key.into(), gender, role, temperament, voice: None }
     }
 
     #[test]
@@ -834,6 +841,16 @@ mod tests {
         .map(|i| cfg.voices_female.contains(&voice_for(&cfg, &speaker(&format!("face:{i}"), None, None, "")).voice))
         .collect();
         assert_eq!(genders.len(), 2);
+    }
+
+    #[test]
+    fn explicit_voice_overrides_the_automatic_choice() {
+        let cfg = TtsConfig::default();
+        let mut s = speaker("custom_Bartolo", Some(Gender::Male), None, "");
+        s.voice = Some("af_sarah".to_string());
+        assert_eq!(voice_for(&cfg, &s).voice, "af_sarah");
+        s.voice = Some("  ".to_string());
+        assert!(cfg.voices_male.contains(&voice_for(&cfg, &s).voice));
     }
 
     #[test]

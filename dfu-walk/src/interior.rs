@@ -4,7 +4,7 @@
 use crate::dialog::DialogState;
 use crate::mod_textures::ModTextures;
 use crate::player::{Player, EYE_HEIGHT};
-use crate::tiles::climate_of;
+use crate::tiles::{climate_of, next_rand};
 use crate::wall_textures::WallTextures;
 use crate::world::*;
 use bevy::prelude::*;
@@ -19,6 +19,8 @@ use crate::data::interior::{build_interior, InteriorScene};
 use crate::data::mesh_builder::{Submesh, WorldMesh};
 use crate::data::terrain_mesh::MAP_PIXEL_SIZE;
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 
 const INTERIOR_Y: f32 = 6000.0;
 const ENTER_DISTANCE: f32 = 4.5;
@@ -38,7 +40,6 @@ const DOOR_OPEN_SIGN: f32 = 1.0;
 // =============================================================================
 // FLATS.CFG: mappa (texture_archive, texture_record) del flat -> indice volto
 // =============================================================================
-
 #[derive(Clone, Copy, Debug)]
 struct FlatInfo {
     face: usize,
@@ -131,11 +132,25 @@ struct Active {
     saved_yaw: f32,
     saved_origin: (i32, i32),
     kind: PoiKind,
+    /// Identita' dell'edificio (map pixel + sorgente): serve a ritrovare i
+    /// compagni in attesa quando si rientra nello stesso edificio.
+    building: String,
 }
 
+/// Stato dell'interno attivo + tracking degli NPC già reclutati.
+///
+/// `recruited` contiene le chiavi `(flat_archive, flat_record)` degli NPC interni
+/// che sono stati convertiti in follower: al re-spawn dell'interno questi vengono
+/// saltati, così non compaiono due copie.
 #[derive(Resource, Default)]
 pub struct InteriorState {
     active: Option<Active>,
+    pub recruited: std::collections::HashSet<(u16, u8)>,
+    /// Nomi degli NPC custom reclutati: i custom non hanno un flat reale
+    /// (archivio/record sono 0), quindi si distinguono per nome. Vengono
+    /// spawnati in OGNI interno, per cui senza questo set ricomparirebbero
+    /// accanto al loro follower a ogni ingresso.
+    pub recruited_custom: std::collections::HashSet<String>,
 }
 
 impl InteriorState {
@@ -143,8 +158,38 @@ impl InteriorState {
         self.active.is_some()
     }
 
+    /// Identita' dell'edificio attivo (stessa stringa a ogni ingresso nello stesso edificio).
+    pub fn building(&self) -> Option<String> {
+        self.active.as_ref().map(|a| a.building.clone())
+    }
+
+    /// Origine (mondo) dell'interno attivo: cambia a ogni ingresso.
+    pub fn origin(&self) -> Option<Vec3> {
+        self.active.as_ref().map(|a| a.origin)
+    }
+
     pub fn kind(&self) -> Option<PoiKind> {
         self.active.as_ref().map(|a| a.kind)
+    }
+
+    /// Segna un NPC interno come reclutato: non verrà più ri-spawnato all'interno.
+    pub fn mark_recruited(&mut self, archive: u16, record: u8) {
+        self.recruited.insert((archive, record));
+    }
+
+    /// True se l'NPC (identificato da archivio+record del flat) è già stato reclutato.
+    pub fn is_recruited(&self, archive: u16, record: u8) -> bool {
+        self.recruited.contains(&(archive, record))
+    }
+
+    /// Segna un NPC custom (per nome) come reclutato.
+    pub fn mark_recruited_custom(&mut self, name: &str) {
+        self.recruited_custom.insert(name.to_string());
+    }
+
+    /// True se l'NPC custom con questo nome e' gia' stato reclutato.
+    pub fn is_recruited_custom(&self, name: &str) -> bool {
+        self.recruited_custom.contains(name)
     }
 }
 
@@ -155,11 +200,128 @@ pub fn outside(state: Res<InteriorState>) -> bool {
 #[derive(Component)]
 pub struct FlatBillboard;
 
+/// NPC interno (billboard). `size` è la dimensione reale in metri della mesh
+/// `Rectangle::new(w, h)` con cui è stato creato il billboard: serve al follower
+/// per preservare l'aspect ratio quando lo si converte in `Follower`.
 #[derive(Component)]
 pub struct InteriorNpc {
     pub face_record: usize,
     pub flat_archive: u16,
     pub flat_record: u8,
+    /// Dimensione del billboard in metri `(w, h)`.
+    pub size: Vec2,
+}
+
+/// Componente per identificare un NPC custom caricato da file esterno
+#[derive(Component)]
+pub struct CustomNpcName {
+    pub name: String,
+}
+
+/// Dati per un NPC custom caricato dalla cartella textures
+#[derive(Clone, Debug)]
+pub struct CustomNpcData {
+    pub name: String,
+    pub texture_stem: String, // Nome file senza estensione (es. "npc_bartolo")
+    /// Descrizione del personaggio (riga `description="..."` del .txt), usata
+    /// al posto del prompt generico nella generazione dei dialoghi.
+    pub description: Option<String>,
+    /// Voce TTS imposta (riga `voice = af_sarah` del .txt), es. `af_sarah`.
+    pub voice: Option<String>,
+}
+
+/// Legge il `.txt` di un NPC custom.
+/// - 1a riga non vuota: nome dell'NPC;
+/// - una riga successiva `description="A brave and kind warrior..."`: descrizione
+///   (le virgolette sono facoltative). Il campo e' opzionale.
+pub fn parse_custom_txt(content: &str) -> (String, Option<String>, Option<String>) {
+    let mut lines = content.trim_start_matches('\u{feff}').lines();
+    let name = lines
+        .by_ref()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let mut description = None;
+    let mut voice = None;
+    for line in lines {
+        let line = line.trim();
+        let (key, rest) = if let Some(r) = line.strip_prefix("description") {
+            ("description", r)
+        } else if let Some(r) = line.strip_prefix("voice") {
+            ("voice", r)
+        } else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else { continue };
+        let value = value.trim();
+        let value = value.strip_prefix('"').unwrap_or(value);
+        let value = value.strip_suffix('"').unwrap_or(value).trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "description" if description.is_none() => description = Some(value.to_string()),
+            // miscele: "af_bella,af_sky" o "af_bella:0.7,af_sky:0.3"; gli spazi si tolgono
+            "voice" if voice.is_none() => {
+                voice = Some(value.split_whitespace().collect::<String>())
+            }
+            _ => {}
+        }
+    }
+    (name, description, voice)
+}
+
+/// Risorsa che cachea gli NPC custom all'avvio
+#[derive(Resource, Default)]
+pub struct CustomNpcCache {
+    pub npcs: Vec<CustomNpcData>,
+}
+
+impl CustomNpcCache {
+    pub fn load(textures_dir: &std::path::Path) -> Self {
+        let mut npcs = Vec::new();
+        if let Ok(entries) = fs::read_dir(textures_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // Il .txt (nome dell'NPC) ha lo stesso stem dell'immagine: va escluso,
+                // altrimenti ogni NPC viene caricato due volte (immagine + txt) e
+                // compaiono due copie identiche nello stesso punto.
+                let is_txt = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map_or(false, |e| e.eq_ignore_ascii_case("txt"));
+                if is_txt {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    // Stesso stem con estensioni diverse (png/jpg): una sola copia.
+                    if npcs.iter().any(|n: &CustomNpcData| n.texture_stem == stem) {
+                        continue;
+                    }
+                    if stem.starts_with("npc_") {
+                        // Controlla se esiste il file .txt associato
+                        let txt_path = path.with_extension("txt");
+                        if txt_path.exists() {
+                            if let Ok(name) = fs::read_to_string(&txt_path) {
+                                let (trimmed_name, description, voice) = parse_custom_txt(&name);
+                                if !trimmed_name.is_empty() {
+                                    npcs.push(CustomNpcData {
+                                        name: trimmed_name,
+                                        texture_stem: stem.to_string(),
+                                        description,
+                                        voice,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        info!("Caricati {} NPC custom dalla cartella textures", npcs.len());
+        Self { npcs }
+    }
 }
 
 #[derive(Component)]
@@ -243,6 +405,7 @@ pub fn interior_enter_exit(
     mut mods: ResMut<ModTextures>,
     mut player: Query<(&mut Player, &mut Transform)>,
                            mut flats_face_map: Local<Option<FlatsFaceMap>>,
+                           custom_npcs: Res<CustomNpcCache>, // Aggiunto parametro per gli NPC custom
 ) {
     let leave = keys.just_pressed(KeyCode::Backspace);
     let act = keys.just_pressed(KeyCode::KeyE);
@@ -311,7 +474,7 @@ pub fn interior_enter_exit(
         let Some(kind) = b.kind.filter(|k| matches!(k, PoiKind::Tavern | PoiKind::Shop | PoiKind::Guild)) else {
             continue;
         };
-        let Some(src) = b.source else { continue };
+        let Some(src) = b.source else { continue; };
         let d = distance_to_building(b, px, pz);
         places += 1;
         nearest = nearest.min(d);
@@ -349,11 +512,9 @@ pub fn interior_enter_exit(
         println!("L'interno di {name} (sotto-record {sub}) non ha modelli 3D.");
         return;
     };
-
     let origin_world = Vec3::new(tf.translation.x, INTERIOR_Y, tf.translation.z);
     let climate = climate_of(&data, mx, my);
     let face_lookup = flats_face_map.as_ref().expect("inizializzata sopra");
-
     let root = commands
     .spawn((Transform::from_translation(origin_world), Visibility::default()))
     .with_children(|parent| {
@@ -377,7 +538,6 @@ pub fn interior_enter_exit(
                 m.double_sided = true;
                 m.cull_mode = None;
             }
-            // >>> Normal map: senza tangenti Bevy ignora la normal map (da File 1)
             let mut bevy_mesh = submesh_to_bevy(&scene.mesh, sm, size);
             wall_textures.prepare_mesh(&handle, &mut bevy_mesh);
             parent.spawn((
@@ -426,7 +586,6 @@ pub fn interior_enter_exit(
                         m.double_sided = true;
                         m.cull_mode = None;
                     }
-                    // >>> Normal map anche per le porte (da File 1)
                     let mut bevy_mesh = submesh_to_bevy(&d.mesh, sm, size);
                     wall_textures.prepare_mesh(&handle, &mut bevy_mesh);
                     door.spawn((
@@ -459,6 +618,10 @@ pub fn interior_enter_exit(
         }
         // People (NPC - oste, clienti, mercanti, membri di gilda) con supporto HD mod e dialogo.
         for (i, f) in scene.people.iter().enumerate() {
+            // Salta gli NPC già reclutati: al re-spawn non devono ricomparire.
+            if state.is_recruited(f.archive, f.record) {
+                continue;
+            }
             let Some((material, w_px, h_px)) = wall_textures.flat_material(
                 f.archive,
                 f.record,
@@ -484,9 +647,66 @@ pub fn interior_enter_exit(
                               face_record,
                               flat_archive: f.archive,
                               flat_record: f.record,
+                              size: Vec2::new(w, h),
                           },
             ));
         }
+
+        // --- SPAWN NPC CUSTOM DA FILE TEXTURE ---
+        for custom_npc in &custom_npcs.npcs {
+            // Salta i custom gia' reclutati: ora seguono il giocatore come follower.
+            if state.is_recruited_custom(&custom_npc.name) {
+                continue;
+            }
+            // Usa ModTextures per recuperare l'handle dell'immagine
+            // ModTextures gestisce automaticamente il caching e il decoding
+            if let Some(image_handle) = mods.image_by_name(&custom_npc.texture_stem, &mut images) {
+
+                // Recupera le dimensioni reali dell'immagine per calcolare l'aspect ratio
+                let size_px = mods.image_size(&image_handle)
+                .or_else(|| images.get(&image_handle).map(|i| i.size_f32()))
+                .unwrap_or(Vec2::new(64.0, 128.0)); // Default fallback
+
+                // Scala arbitraria per convertire pixel in metri nel mondo di gioco
+                // DF_UNIT è circa 0.04 metri per pixel nei flat originali
+                let scale_factor = DF_UNIT * 0.074; // Un po' più grandi dei flat standard
+                let w = size_px.x * scale_factor;
+                let h = size_px.y * scale_factor;
+
+                let material = materials.add(StandardMaterial {
+                    base_color_texture: Some(image_handle),
+                                             alpha_mode: AlphaMode::Mask(0.5),
+                                             cull_mode: None,
+                                             double_sided: true,
+                                             perceptual_roughness: 0.9,
+                                             reflectance: 0.1,
+                                             ..default()
+                });
+
+                // Posizione random vicina allo spawn usando next_rand
+                let mut rng_seed = custom_npc.texture_stem.len() as u64;
+                let spawn_x = scene.spawn[0] + (next_rand(&mut rng_seed) - 0.5) * 4.0;
+                let spawn_z = scene.spawn[2] + (next_rand(&mut rng_seed) - 0.5) * 4.0;
+
+                parent.spawn((
+                    Mesh3d(meshes.add(Rectangle::new(w, h))),
+                              MeshMaterial3d(material),
+                              Transform::from_xyz(spawn_x, scene.spawn[1] + h * 0.5, spawn_z),
+                              FlatBillboard,
+                              // Usiamo valori dummy per InteriorNpc dato che è un custom
+                              InteriorNpc {
+                                  face_record: 0,
+                                  flat_archive: 0,
+                                  flat_record: 0,
+                                  size: Vec2::new(w, h),
+                              },
+                              CustomNpcName {
+                                  name: custom_npc.name.clone(),
+                              },
+                ));
+            }
+        }
+
         let cx = (scene.bounds_min[0] + scene.bounds_max[0]) * 0.5;
         let cz = (scene.bounds_min[2] + scene.bounds_max[2]) * 0.5;
         parent.spawn((
@@ -501,7 +721,6 @@ pub fn interior_enter_exit(
         ));
     })
     .id();
-
     let spawn = Vec3::from(scene.spawn);
     let exit = scene.exit.map(Vec3::from).unwrap_or(spawn);
     // Orienta la visuale in avanti voltando le spalle alla porta d'uscita
@@ -520,6 +739,7 @@ pub fn interior_enter_exit(
         saved_yaw: p.yaw,
         saved_origin: (origin.east, origin.north),
         kind,
+        building: format!("{mx},{my}:{bx},{by},{sub}"),
         scene,
     };
     p.feet_y = origin_world.y + spawn.y;

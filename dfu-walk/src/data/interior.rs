@@ -45,7 +45,6 @@ pub struct InteriorDoor {
 /// Riconosce i veri pannelli porta: battente sottile (max 18 cm, esclude categoricamente gli armadi),
 /// altezza da porta e texture porta (archivio 74).
 fn looks_like_door(m: &Arch3dModel) -> bool {
-    // Un battente porta ha poche facce (max 12), gli armadi ne hanno molte di più
     if m.faces.is_empty() || m.faces.len() > 12 {
         return false;
     }
@@ -61,23 +60,16 @@ fn looks_like_door(m: &Arch3dModel) -> bool {
     }
     let (dx, dy, dz) = (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
     let (w, t) = (dx.max(dz), dx.min(dz));
-
-    // Lo spessore t deve essere <= 18 cm: un armadio è profondo 45-60 cm e viene escluso!
     (0.6..=1.8).contains(&w) && (1.8..=3.0).contains(&dy) && t <= 0.18
 }
 
-/// Faccia con texture di porta (archivio 74) di un modello dell'interno, in coordinate della scena.
 #[derive(Debug, Clone, Copy)]
 struct DoorFace {
     center: [f32; 3],
-    /// Normale orizzontale (y = 0), senza un verso affidabile: serve solo come asse.
     normal: [f32; 3],
-    /// Quota del bordo inferiore.
     bottom: f32,
 }
 
-/// Raccoglie le facce-porta di un modello posizionato come `WorldMesh::add_instance`.
-/// In Daggerfall Unity le porte di un interno sono proprio queste facce (`ModelData.Doors`).
 fn collect_door_faces(m: &Arch3dModel, px: f32, py: f32, pz: f32, rot_deg: f32, out: &mut Vec<DoorFace>) {
     let (sin_a, cos_a) = rot_deg.to_radians().sin_cos();
     let place = |v: [f32; 3]| -> [f32; 3] {
@@ -88,11 +80,11 @@ fn collect_door_faces(m: &Arch3dModel, px: f32, py: f32, pz: f32, rot_deg: f32, 
             continue;
         }
         let pts: Vec<[f32; 3]> = f
-            .vertex_indices
-            .iter()
-            .filter_map(|&i| m.vertices.get(i as usize).copied())
-            .map(place)
-            .collect();
+        .vertex_indices
+        .iter()
+        .filter_map(|&i| m.vertices.get(i as usize).copied())
+        .map(place)
+        .collect();
         if pts.len() < 3 {
             continue;
         }
@@ -104,7 +96,6 @@ fn collect_door_faces(m: &Arch3dModel, px: f32, py: f32, pz: f32, rot_deg: f32, 
         ];
         let bottom = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
         let top = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
-        // altezza da porta
         if !(1.5..=3.5).contains(&(top - bottom)) {
             continue;
         }
@@ -117,11 +108,9 @@ fn collect_door_faces(m: &Arch3dModel, px: f32, py: f32, pz: f32, rot_deg: f32, 
         ];
         let len = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
         let horizontal = (cross[0] * cross[0] + cross[2] * cross[2]).sqrt();
-        // la porta deve essere verticale
         if len < 1e-6 || horizontal / len < 0.7 {
             continue;
         }
-        // lo stesso battente puo' comparire due volte (due facce): si tiene una sola
         if out.iter().any(|d| {
             (d.center[0] - center[0]).hypot(d.center[2] - center[2]) < 0.3 && (d.center[1] - center[1]).abs() < 0.5
         }) {
@@ -131,9 +120,6 @@ fn collect_door_faces(m: &Arch3dModel, px: f32, py: f32, pz: f32, rot_deg: f32, 
     }
 }
 
-/// La porta d'ingresso: quella piu' vicina al livello del suolo e, fra queste, la piu' lontana
-/// dal centro dell'edificio (`DaggerfallInterior.FindLowestOuterInteriorDoor` di DFU). Le porte
-/// delle stanze interne stanno piu' al centro, quella d'ingresso sul perimetro.
 fn pick_entrance_door(doors: &[DoorFace], center_xz: [f32; 2]) -> Option<usize> {
     let lowest = doors.iter().map(|d| d.bottom).fold(f32::MAX, f32::min);
     if doors.is_empty() {
@@ -141,21 +127,20 @@ fn pick_entrance_door(doors: &[DoorFace], center_xz: [f32; 2]) -> Option<usize> 
     }
     let dist2 = |d: &DoorFace| (d.center[0] - center_xz[0]).powi(2) + (d.center[2] - center_xz[1]).powi(2);
     doors
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| d.bottom <= lowest + 1.0)
-        .max_by(|a, b| dist2(a.1).partial_cmp(&dist2(b.1)).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
+    .iter()
+    .enumerate()
+    .filter(|(_, d)| d.bottom <= lowest + 1.0)
+    .max_by(|a, b| dist2(a.1).partial_cmp(&dist2(b.1)).unwrap_or(std::cmp::Ordering::Equal))
+    .map(|(i, _)| i)
 }
 
-/// Il marcatore piu' vicino a `to` entro `max_dist` (distanza 3D, come in Daggerfall Unity).
 fn closest_marker(markers: &[[f32; 3]], to: [f32; 3], max_dist: f32) -> Option<[f32; 3]> {
     let dist = |m: &[f32; 3]| ((m[0] - to[0]).powi(2) + (m[1] - to[1]).powi(2) + (m[2] - to[2]).powi(2)).sqrt();
     markers
-        .iter()
-        .copied()
-        .filter(|m| dist(m) <= max_dist)
-        .min_by(|a, b| dist(a).partial_cmp(&dist(b)).unwrap_or(std::cmp::Ordering::Equal))
+    .iter()
+    .copied()
+    .filter(|m| dist(m) <= max_dist)
+    .min_by(|a, b| dist(a).partial_cmp(&dist(b)).unwrap_or(std::cmp::Ordering::Equal))
 }
 
 fn mesh_tris(mesh: &WorldMesh) -> Vec<Tri> {
@@ -259,8 +244,6 @@ impl InteriorScene {
         best
     }
 
-    /// Quota del pavimento in (x, z) più vicina a `target_y` entro `max_dist`.
-    /// Evita di agganciare soffitti o tetti.
     pub fn floor_closest_to(&self, x: f32, z: f32, target_y: f32, max_dist: f32) -> Option<f32> {
         let mut best: Option<(f32, f32)> = None;
         for t in &self.floors {
@@ -309,7 +292,6 @@ impl InteriorScene {
     }
 }
 
-/// Posizione di apparizione all'ingresso e posizione della porta d'ingresso (usata per l'uscita).
 fn find_entrance_spawn(
     scene: &InteriorScene,
     doors: &[DoorFace],
@@ -320,7 +302,6 @@ fn find_entrance_spawn(
     let door = &doors[pick_entrance_door(doors, [cx, cz])?];
     let c = door.center;
 
-    // 1. Marcatore d'ingresso piu' vicino alla porta (se occupato da un arredo, subito intorno).
     if let Some(m) = closest_marker(markers, c, MAX_MARKER_DISTANCE) {
         for radius in [0.0f32, 0.4, 0.8, 1.2] {
             let steps = if radius == 0.0 { 1 } else { 8 };
@@ -336,7 +317,6 @@ fn find_entrance_spawn(
         }
     }
 
-    // 2. Davanti alla porta, dal lato dell'interno (quello con il pavimento).
     let n = [door.normal[0], door.normal[2]];
     let toward_center = n[0] * (cx - c[0]) + n[1] * (cz - c[2]) >= 0.0;
     let sign = if toward_center { 1.0 } else { -1.0 };
@@ -441,8 +421,6 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
             if len < 1e-6 {
                 continue;
             }
-            // Solo superfici con normale Y rivolta verso l'alto (n[1] / len > 0.5)
-            // I soffitti (n[1] < 0) vengono esclusi
             if n[1] / len > 0.5 {
                 floors.push(t);
             } else {
@@ -451,13 +429,12 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
         }
     }
 
-    // Marcatori d'ingresso (flat editor 199:8 e 199:4): si usano per far apparire il giocatore.
     let enter_markers: Vec<[f32; 3]> = it
-        .flats
-        .iter()
-        .filter(|f| f.texture_archive == EDITOR_FLATS_ARCHIVE && ENTER_MARKER_RECORDS.contains(&f.texture_record))
-        .map(|f| [f.x as f32 * DF_UNIT, -(f.y as f32) * DF_UNIT, f.z as f32 * DF_UNIT])
-        .collect();
+    .flats
+    .iter()
+    .filter(|f| f.texture_archive == EDITOR_FLATS_ARCHIVE && ENTER_MARKER_RECORDS.contains(&f.texture_record))
+    .map(|f| [f.x as f32 * DF_UNIT, -(f.y as f32) * DF_UNIT, f.z as f32 * DF_UNIT])
+    .collect();
 
     let flats = it
     .flats
@@ -498,16 +475,12 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
 
     let (cx, cz) = ((mn[0] + mx[0]) * 0.5, (mn[2] + mx[2]) * 0.5);
 
-    // Come Daggerfall Unity: porta d'ingresso = la piu' bassa e piu' esterna; il giocatore appare
-    // sul marcatore d'ingresso piu' vicino ad essa o, in mancanza, davanti alla porta.
     if let Some((spawn, exit)) = find_entrance_spawn(&scene, &door_faces, &enter_markers, cx, cz) {
         scene.spawn = spawn;
         scene.exit = Some(exit);
         return Some(scene);
     }
 
-    // Ripiego (nessuna faccia-porta nei modelli): euristica sulle porte dei record.
-    // 1. Raccoglie le vere porte d'ingresso (it.doors)
     let mut candidate_doors: Vec<[f32; 3]> = it
     .doors
     .iter()
@@ -520,8 +493,6 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
     })
     .collect();
 
-    // 2. Se it.doors è vuoto, cerca tra i battenti porta (scene.doors) SOLO quelli
-    // posti lungo le pareti perimetrali esterne dell'edificio (distanza <= 2.2m dal bordo esterno)
     if candidate_doors.is_empty() {
         for d in &scene.doors {
             let dist_to_perimeter = (d.pos[0] - mn[0])
@@ -529,14 +500,12 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
             .min(d.pos[2] - mn[2])
             .min(mx[2] - d.pos[2]);
 
-            // Se è vicina al muro perimetrale e al piano terra, è la porta d'ingresso/uscita!
             if dist_to_perimeter <= 2.2 && d.pos[1] <= mn[1] + 2.5 {
                 candidate_doors.push(d.pos);
             }
         }
     }
 
-    // Se ancora vuoto, prendi qualsiasi porta disponibile
     if candidate_doors.is_empty() {
         for d in &scene.doors {
             if d.pos[1] <= mn[1] + 2.5 {
@@ -547,7 +516,6 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
 
     let mut best_spawn: Option<([f32; 3], [f32; 3])> = None;
 
-    // Cerca attorno alla porta vera un punto sul pavimento calpestabile libero da pareti
     for &d in &candidate_doors {
         let (to_cx, to_cz) = (cx - d[0], cz - d[2]);
         let base_angle = to_cz.atan2(to_cx);
@@ -574,7 +542,6 @@ pub fn build_interior(rmb: &RmbBlock, sub: usize, arch3d: &BsaArchive) -> Option
         }
     }
 
-    // Fallback sicuro se tutte le porte falliscono: piano terra
     let (spawn_pos, exit_door) = match best_spawn {
         Some((sp, dp)) => (sp, Some(dp)),
         None => {
@@ -649,8 +616,6 @@ mod tests {
 
     #[test]
     fn entrance_is_the_lowest_and_outermost_door() {
-        // centro dell'edificio in (0, 0): una porta interna vicina, una d'ingresso sul perimetro,
-        // una al piano di sopra molto esterna ma in alto.
         let doors = [door(1.0, 0.0, 0.0), door(8.0, 0.0, 0.0), door(9.0, 0.0, 3.0)];
         assert_eq!(pick_entrance_door(&doors, [0.0, 0.0]), Some(1));
         assert_eq!(pick_entrance_door(&[], [0.0, 0.0]), None);
@@ -661,13 +626,11 @@ mod tests {
         let markers = [[2.0, 0.0, 0.0], [7.0, 0.0, 0.5], [-3.0, 0.0, 4.0]];
         let near_door = [8.0, 1.1, 0.0];
         assert_eq!(closest_marker(&markers, near_door, 12.0), Some([7.0, 0.0, 0.5]));
-        // un marcatore troppo lontano e' ignorato
         assert_eq!(closest_marker(&[[-30.0, 0.0, 0.0]], near_door, 12.0), None);
     }
 
     #[test]
     fn spawn_uses_marker_next_to_entrance_door() {
-        // pavimento 20x20 e nessun muro: il marcatore e' libero e si usa cosi' com'e'
         let floor: Vec<Tri> = vec![
             [[-10.0, 0.0, -10.0], [10.0, 0.0, -10.0], [10.0, 0.0, 10.0]],
             [[-10.0, 0.0, -10.0], [10.0, 0.0, 10.0], [-10.0, 0.0, 10.0]],
@@ -677,7 +640,6 @@ mod tests {
         let (spawn, exit) = find_entrance_spawn(&s, &doors, &[[7.0, 0.0, 0.5]], 0.0, 0.0).unwrap();
         assert_eq!(spawn, [7.0, 0.0, 0.5]);
         assert_eq!(exit, doors[1].center);
-        // senza marcatori: davanti alla porta, dal lato del centro (x < 8)
         let (spawn, _) = find_entrance_spawn(&s, &doors, &[], 0.0, 0.0).unwrap();
         assert!(spawn[0] < 8.0 && (8.0 - spawn[0]) >= 1.0 - 1e-4);
     }

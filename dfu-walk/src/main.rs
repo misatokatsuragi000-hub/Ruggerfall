@@ -9,7 +9,7 @@
 //!   F = volo (Spazio/Ctrl su e giù, Maiusc = velocissimo)
 //!   T = ferma/riprendi il tempo, "," e "." = un'ora indietro/avanti
 //!   M = mappa dell'Iliac Bay
-//!   L = mappa locale della città (taverne, negozi, gilde)
+//!   L = mappa locale della città (taverne verdi, negozi rossi, gilde blu)
 //!   G = attiva/disattiva l'erba
 //!   E / U = entra nel locale/dungeon / esci vicino alla porta
 //!   Backspace = esci sempre da dungeon/locali
@@ -28,8 +28,10 @@ mod dialog;
 mod map;
 mod mod_textures;
 mod music;
+mod tuning_menu;
 mod music_zones;
 mod player;
+mod savegame;
 mod quests;
 mod quest_llm;
 mod dfquest; // ← sostituisce quest_script
@@ -43,8 +45,8 @@ mod world;
 mod compass;
 mod vitals;
 mod dungeon;
+mod relief_post;
 mod custom_cursor;
-
 use crate::data::blocks::RmbBlock;
 use crate::data::bsa::{BsaArchive, BsaDirectory};
 use crate::data::maps::{DFLocation, MapsReader};
@@ -62,32 +64,25 @@ use terrain_material::TerrainMaterial;
 use tiles::*;
 use trees::NaturePool;
 use world::*;
-
 // =============================================================================
 // Bridge Bevy ↔ dfquest
 // =============================================================================
-
 /// Wrapper `Resource` attorno a `dfquest::Library`.
 #[derive(Resource, Default)]
 pub struct QuestLibRes(pub dfquest::Library);
-
 /// Wrapper `Resource` attorno a `dfquest::QuestStates`.
 #[derive(Resource, Default)]
 pub struct QuestStatesRes(pub dfquest::QuestStates);
-
-const USAGE: &str = "uso: dfu-walk <cartella ARENA2> [--mods <cartella>] [--textures <cartella>] \
+const USAGE: &str = "uso: dfu-walk <cartella ARENA2> [--mods <cartella>] [--textures <cartella>]
 [--pixel X Y] [--radius N] [--winter] [--hour H] [--day-minutes M] [--outside]";
 const SKY: Color = Color::srgb(0.55, 0.72, 0.92);
-
 // =============================================================================
 // Risorse di avvio
 // =============================================================================
-
 #[derive(Resource, Clone, Copy)]
 pub struct StartDungeonConfig {
     pub start_in_dungeon: bool,
 }
-
 struct Args {
     dir: PathBuf,
     mods_dir: PathBuf,
@@ -99,31 +94,25 @@ struct Args {
     day_minutes: f32,
     start_dungeon: bool,
 }
-
 #[derive(Resource)]
 struct StartInfo {
     mx: i32,
     my: i32,
 }
-
 #[derive(Resource)]
 struct RadiusSetting(i32);
-
 // =============================================================================
 // Utility di parsing
 // =============================================================================
-
 fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("errore: {msg}");
     std::process::exit(1)
 }
-
 fn next_value<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>, what: &str) -> T {
     it.next()
     .and_then(|v| v.parse().ok())
     .unwrap_or_else(|| fail(format!("{what} vuole un numero\n{USAGE}")))
 }
-
 fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     let dir = it.next().unwrap_or_else(|| fail(USAGE));
@@ -185,11 +174,9 @@ fn parse_args() -> Args {
     }
     args
 }
-
 // =============================================================================
 // Caricamento dati
 // =============================================================================
-
 fn load_data(args: &Args) -> GameData {
     let open = |name: &str| {
         find_file_ci(&args.dir, name)
@@ -242,7 +229,6 @@ fn load_data(args: &Args) -> GameData {
         locations: Arc::new(locations),
     }
 }
-
 /// Corregge i nomi di blocco che non esistono in BLOCKS.BSA.
 fn fix_missing_block_names(
     locations: &mut HashMap<(i32, i32), DFLocation>,
@@ -346,11 +332,9 @@ fn fix_missing_block_names(
     }
     eprintln!("fixup blocchi: {fixed} corretti, {unfixed} non correggibili");
 }
-
 // =============================================================================
 // Scelta del punto di partenza
 // =============================================================================
-
 fn find_start(data: &GameData) -> (i32, i32) {
     let (cx, cy) = (MAP_WIDTH_PIXELS / 2, MAP_HEIGHT_PIXELS / 2);
     for r in 0..120i32 {
@@ -371,14 +355,16 @@ fn find_start(data: &GameData) -> (i32, i32) {
     }
     (cx, cy)
 }
-
 // =============================================================================
 // main
 // =============================================================================
-
 fn main() {
     let args = parse_args();
     let data = load_data(&args);
+
+    // Inizializza la cache degli NPC custom dalla cartella delle texture
+    let custom_npcs = interior::CustomNpcCache::load(&args.textures_dir);
+
     let privateer_loc = data
     .locations
     .values()
@@ -403,15 +389,14 @@ fn main() {
     println!("Partenza dal map pixel ({mx}, {my}), raggio {}.", args.radius);
     println!("Cartella mod: {}", args.mods_dir.display());
     println!("Cartella texture sciolte: {}", args.textures_dir.display());
-    println!("Comandi: clic = cattura il mouse, Esc = rilascia, WASD = cammina, Maiusc = corri,");
-    println!("         Spazio = salta, F = volo (Spazio/Ctrl su e giù, Maiusc in volo = velocissimo).");
-    println!("         T = ferma/riprendi il tempo, , e . = un'ora indietro/avanti.");
-    println!("         M = apri/chiudi mappa dell'Iliac Bay.");
-    println!("         L = mappa locale della città (taverne verdi, negozi rossi, gilde blu).");
-    println!("         G = attiva/disattiva l'erba.");
-    println!("         E / U = entra nel locale o dungeon / esci vicino alla porta (Backspace = esci sempre).");
-    println!("         C = equipaggiamento, Z = arma, X = torcia.");
-
+    println!("Comandi: clic = cattura il mouse, Esc = rilascia, WASD = cammina, Maiusc = corri, ");
+    println!("         Spazio = salta, F = volo (Spazio/Ctrl su e giù, Maiusc in volo = velocissimo). ");
+    println!("         T = ferma/riprendi il tempo, , e . = un'ora indietro/avanti. ");
+    println!("         M = apri/chiudi mappa dell'Iliac Bay. ");
+    println!("         L = mappa locale della città (taverne verdi, negozi rossi, gilde blu). ");
+    println!("         G = attiva/disattiva l'erba. ");
+    println!("         E / U = entra nel locale o dungeon / esci vicino alla porta (Backspace = esci sempre). ");
+    println!("         C = equipaggiamento, Z = arma, X = torcia. ");
     // ── dfquest: libreria + stato delle quest ─────────────────────────────
     let (quest_lib, quest_warnings) = dfquest::Library::load_dir(
         std::path::Path::new(dfquest::DEFAULT_QUESTS_DIR),
@@ -440,7 +425,6 @@ fn main() {
              quest_lib.get("N0B00Y16").is_some(),
     );
     // ────────────────────────────────────────────────────────────────────────
-
     App::new()
     .add_plugins(
         DefaultPlugins.set(WindowPlugin {
@@ -458,9 +442,12 @@ fn main() {
     .add_plugins(fps_weapon::FpsWeaponPlugin)
     .add_plugins(compass::CompassPlugin)
     .add_plugins(vitals::VitalsPlugin)
+    .add_plugins(tuning_menu::TuningMenuPlugin)
     .add_plugins(dungeon_enemies::DungeonEnemyPlugin)
     .add_plugins(torch::TorchPlugin)
+    .add_plugins(savegame::SaveGamePlugin)
     .add_plugins(equipment::EquipmentPlugin)
+    .add_plugins(relief_post::FakeReliefPlugin)
     .add_plugins(dungeon::DungeonPlugin)
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(ModTexturesPlugin {
@@ -480,6 +467,8 @@ fn main() {
     // ── dfquest: risorse lette da `dialog.rs` (wrapper Resource) ──────
     .insert_resource(QuestLibRes(quest_lib))
     .insert_resource(QuestStatesRes(quest_states))
+    // ── NPC Custom ────────────────────────────────────────────────────
+    .insert_resource(custom_npcs)
     // ────────────────────────────────────────────────────────────────
     .insert_resource(HeightField::default())
     .insert_resource(StartInfo { mx, my })
@@ -520,7 +509,7 @@ fn main() {
          interior::interior_move,
          interior::face_flats,
          tiles::update_npcs,
-         tiles::update_followers,  // ← aggiunto
+         tiles::update_followers, // ← aggiunto
          tiles::update_enemies,
          player::player_move,
          rebase_origin,
@@ -547,11 +536,9 @@ fn main() {
     )
     .run();
 }
-
 // =============================================================================
 // Setup iniziale
 // =============================================================================
-
 fn setup(
     mut commands: Commands,
     data: Res<GameData>,
@@ -594,11 +581,9 @@ fn setup(
     ));
     let _ = CELL_SIZE;
 }
-
 // =============================================================================
 // Titolo della finestra
 // =============================================================================
-
 #[allow(clippy::too_many_arguments)]
 fn update_title(
     time: Res<Time>,

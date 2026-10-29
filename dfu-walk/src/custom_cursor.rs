@@ -7,6 +7,13 @@
 //!
 //! La texture viene letta da `<textures_dir>/cursor.png` (PNG con alpha).
 //! Se il file manca o non si legge, si usa una freccia bianca procedurale.
+//!
+//! ## Menu di tuning (F1)
+//!
+//! Con il menu aperto il cursore custom non serve: bevy_egui disegna la sua
+//! finestra *dopo* Bevy UI, quindi coprirebbe il nostro `ImageNode`. In quel
+//! caso lasciamo il cursore di sistema visibile (lo gestisce
+//! `tuning_menu::apply_menu_state`) e nascondiamo il nostro.
 
 use std::path::PathBuf;
 
@@ -74,8 +81,8 @@ fn load_cursor_image(path: Option<&PathBuf>) -> Option<Image> {
         Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         TextureDimension::D2,
         dyn_img.into_raw(),
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
+                               TextureFormat::Rgba8UnormSrgb,
+                               RenderAssetUsages::default(),
     );
     image.sampler = bevy::image::ImageSampler::linear();
     info!("cursore: caricato {} ({}x{})", path.display(), w, h);
@@ -91,8 +98,8 @@ fn make_fallback_image() -> Image {
         },
         TextureDimension::D2,
         generate_arrow_rgba(),
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
+                               TextureFormat::Rgba8UnormSrgb,
+                               RenderAssetUsages::default(),
     );
     image.sampler = bevy::image::ImageSampler::nearest();
     image
@@ -116,38 +123,47 @@ fn setup_custom_cursor(
         }
         (
             make_fallback_image(),
-            Vec2::splat(FALLBACK_PX as f32),
+         Vec2::splat(FALLBACK_PX as f32),
         )
     };
 
     let handle = images.add(image);
     commands.spawn((
         Name::new("Custom cursor"),
-        ImageNode::new(handle),
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(0.0),
-            top: Val::Px(0.0),
-            width: Val::Px(CURSOR_DISPLAY),
-            height: Val::Px(CURSOR_DISPLAY),
-            ..default()
-        },
-        GlobalZIndex(9999),
-        Visibility::Hidden,
-        CustomCursor { source_size },
+                    ImageNode::new(handle),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(0.0),
+                    top: Val::Px(0.0),
+                    width: Val::Px(CURSOR_DISPLAY),
+                    height: Val::Px(CURSOR_DISPLAY),
+                    ..default()
+                    },
+                    GlobalZIndex(9999),
+                    Visibility::Hidden,
+                    CustomCursor { source_size },
     ));
 }
 
 fn update_custom_cursor(
     dialog: Res<crate::dialog::DialogState>,
     equipment: Res<crate::equipment::EquipmentState>,
+    // Opzionale: se il plugin del menu non è caricato, il gioco funziona come prima.
+    menu: Option<Res<crate::tuning_menu::TuningMenuState>>,
     // Un'unica query mutabile sulla finestra: `cursor_position()` ritorna
     // `Option<Vec2>` per valore, quindi il borrow finisce subito e possiamo
     // scrivere `cursor_options.visible` sullo stesso handle senza conflitti.
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut cursor_q: Query<(&CustomCursor, &mut Node, &mut Visibility)>,
 ) {
-    let want_custom = dialog.open || equipment.open;
+    // Il cursore custom non va mostrato quando c'è il menu F1 aperto:
+    // bevy_egui disegna la sua finestra *dopo* Bevy UI, quindi coprirebbe
+    // il nostro `ImageNode` e resteremmo senza cursore visibile. In quel
+    // caso lasciamo il cursore di sistema visibile (gestito da
+    // `tuning_menu::apply_menu_state`).
+    let menu_open = menu.as_ref().is_some_and(|m| m.open);
+    let want_custom = (dialog.open || equipment.open) && !menu_open;
+
     let Ok(mut window) = windows.get_single_mut() else { return };
     let mouse = window.cursor_position();
 
@@ -170,7 +186,11 @@ fn update_custom_cursor(
     if want_custom {
         window.cursor_options.visible = false;
     }
+    // Se `want_custom` è false NON tocchiamo `visible`: lo gestisce chi di
+    // dovere — `player::grab_cursor` nel gioco normale, `tuning_menu` con il
+    // menu aperto. Questo evita che i due sistemi si combattano a vicenda.
 }
+
 // =============================================================================
 // Fallback procedurale: freccia bianca con bordo nero
 // =============================================================================
@@ -216,8 +236,8 @@ fn generate_arrow_rgba() -> Vec<u8> {
                 continue;
             }
             let on_border = [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)]
-                .iter()
-                .any(|(dx, dy)| !inside(px + dx, py + dy));
+            .iter()
+            .any(|(dx, dy)| !inside(px + dx, py + dy));
             let color = if on_border {
                 [0u8, 0, 0, 255]
             } else {

@@ -16,7 +16,16 @@
 //! tonemapping e non supporta le camere HDR (le salta).
 //!
 //! Tasti: F8 attiva/disattiva, F7 cambia modalita' (classico / bump map), F9 scorre le viste di debug.
-//! I parametri sono i campi pubblici di `FakeRelief` e si possono cambiare a runtime sulla camera.
+//! I parametri sono i campi pubblici di `FakeRelief` e si possono cambiare a runtime sulla camera
+//! (dal menu F1 in `tuning_menu.rs`).
+//!
+//! ## Color grading e adaptive contrast
+//!
+//! Dopo il rilievo lo shader applica saturazione, luminosita' e contrasto. Il contrasto ha due
+//! modalita': pivot fisso (`color_contrast_pivot`, default 0.5) oppure **adaptive** (pivot = media
+//! locale della luminanza, da `mean_tex`). L'adaptive evita che alzare il contrasto per gli interni
+//! scuri renda ancora piu' scuri gli esterni chiari: il contrasto agisce *attorno* alla luminanza
+//! media della zona, quindi non sposta la media.
 
 use bevy::asset::load_internal_asset;
 use bevy::core_pipeline::{
@@ -49,6 +58,11 @@ const MEAN_DIV: u32 = 4;
 
 /// Parametri dell'effetto (stessi nomi e valori di default di DFU_FakeRelief.fx).
 /// I campi `u32` fanno da booleani (0 = no, 1 = si).
+///
+/// **Ordine dei campi**: deve combaciare byte-per-byte con `struct Settings` in
+/// `fake_relief.wgsl`. Se aggiungi un campo qui, aggiungilo **in fondo** anche
+/// nel WGSL; se lo metti in mezzo, l'uniform va fuori allineamento e lo shader
+/// legge valori sbagliati.
 #[derive(Component, Clone, Copy, ExtractComponent, ShaderType)]
 pub struct FakeRelief {
     /// 0 = classico (gradiente diretto della luminanza), 1 = bump map (mappa altezza).
@@ -96,6 +110,25 @@ pub struct FakeRelief {
     pub tan_half_fov: f32,
     /// Deve coincidere con `MEAN_DIV`.
     pub mean_div: f32,
+
+    // --- Colore (scheda "Colore" del menu F1) ---
+    // Applicati alla fine di `fragment_relief`, dopo tutti gli altri
+    // post-processing, in spazio gamma.
+    /// 0 = color grading disattivato, 1 = attivo.
+    pub color_enabled: u32,
+    /// 1.0 = neutro, 0.0 = bianco e nero, 2.0 = saturazione doppia.
+    pub color_saturation: f32,
+    /// 1.0 = neutro, 0.5 = meta' luminosita', 2.0 = doppia.
+    pub color_brightness: f32,
+    /// 1.0 = neutro, >1 = piu' contrasto attorno al pivot.
+    pub color_contrast: f32,
+    /// 0 = pivot fisso (`color_contrast_pivot`), 1 = pivot adattivo
+    /// (luminanza media locale, da `mean_tex`). Con 1 il contrasto non
+    /// sposta la luminosita' media della zona.
+    pub color_adaptive_contrast: u32,
+    /// Pivot del contrasto quando `color_adaptive_contrast == 0`.
+    /// 0.5 = grigio medio.
+    pub color_contrast_pivot: f32,
 }
 
 impl Default for FakeRelief {
@@ -125,12 +158,24 @@ impl Default for FakeRelief {
             skin_sat: 0.45,
             skin_sat_tol: 0.25,
             skin_val: 0.65,
-            skin_val_tol: 0.3,
+            skin_val_tol: 0.30,
             far_plane: 1000.0,
             fade_distance: 80.0,
             near: 0.3,
             tan_half_fov: (60.0_f32.to_radians() * 0.5).tan(),
             mean_div: MEAN_DIV as f32,
+
+            // Colore: disattivato e valori neutri.
+            color_enabled: 0,
+            color_saturation: 1.0,
+            color_brightness: 1.0,
+            color_contrast: 1.0,
+
+            // Adaptive contrast: attivo di default. Con il pivot = media
+            // locale, alzare il contrasto non sposta la luminosita' media
+            // della zona: interni restano scuri, esterni chiari.
+            color_adaptive_contrast: 1,
+            color_contrast_pivot: 0.5,
         }
     }
 }
@@ -143,18 +188,18 @@ impl Plugin for FakeReliefPlugin {
 
         app.add_plugins((
             ExtractComponentPlugin::<FakeRelief>::default(),
-            UniformComponentPlugin::<FakeRelief>::default(),
+                         UniformComponentPlugin::<FakeRelief>::default(),
         ))
         .add_systems(Update, (attach_to_cameras, update_from_camera, hotkeys).chain());
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app
-            .add_systems(Render, prepare_relief_textures.in_set(RenderSet::PrepareResources))
-            .add_render_graph_node::<ViewNodeRunner<FakeReliefNode>>(Core3d, FakeReliefLabel)
-            .add_render_graph_edges(
-                Core3d,
-                (Node3d::Tonemapping, FakeReliefLabel, Node3d::EndMainPassPostProcessing),
-            );
+        .add_systems(Render, prepare_relief_textures.in_set(RenderSet::PrepareResources))
+        .add_render_graph_node::<ViewNodeRunner<FakeReliefNode>>(Core3d, FakeReliefLabel)
+        .add_render_graph_edges(
+            Core3d,
+            (Node3d::Tonemapping, FakeReliefLabel, Node3d::EndMainPassPostProcessing),
+        );
     }
 
     fn finish(&self, app: &mut App) {
@@ -236,13 +281,13 @@ fn prepare_relief_textures(
                 &render_device,
                 TextureDescriptor {
                     label: Some(label),
-                    size: Extent3d { width, height, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: TextureDimension::D2,
-                    format: TextureFormat::R16Float,
-                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
+                              size: Extent3d { width, height, depth_or_array_layers: 1 },
+                              mip_level_count: 1,
+                              sample_count: 1,
+                              dimension: TextureDimension::D2,
+                              format: TextureFormat::R16Float,
+                                  usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                                  view_formats: &[],
                 },
             )
         };
@@ -280,19 +325,19 @@ fn queue_pass(
 ) -> CachedRenderPipelineId {
     cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some(label.into()),
-        layout: vec![layout.clone()],
-        vertex: fullscreen_shader_vertex_state(),
-        fragment: Some(FragmentState {
-            shader: SHADER_HANDLE.clone(),
-            shader_defs: vec![],
-            entry_point: entry_point.into(),
-            targets: vec![Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })],
-        }),
-        primitive: PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: MultisampleState::default(),
-        push_constant_ranges: vec![],
-        zero_initialize_workgroup_memory: false,
+                                layout: vec![layout.clone()],
+                                vertex: fullscreen_shader_vertex_state(),
+                                fragment: Some(FragmentState {
+                                    shader: SHADER_HANDLE.clone(),
+                                               shader_defs: vec![],
+                                               entry_point: entry_point.into(),
+                                               targets: vec![Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })],
+                                }),
+                                primitive: PrimitiveState::default(),
+                                depth_stencil: None,
+                                multisample: MultisampleState::default(),
+                                push_constant_ranges: vec![],
+                                zero_initialize_workgroup_memory: false,
     })
 }
 
@@ -336,11 +381,11 @@ impl FromWorld for ReliefPipelines {
                 ShaderStages::FRAGMENT,
                 (
                     (0, float_tex()),
-                    (1, texture_depth_2d()),
-                    (2, filtering()),
-                    (4, float_tex()),
-                    (5, float_tex()),
-                    (6, settings()),
+                 (1, texture_depth_2d()),
+                 (2, filtering()),
+                 (4, float_tex()),
+                 (5, float_tex()),
+                 (6, settings()),
                 ),
             ),
         );
@@ -381,14 +426,14 @@ fn run_pass(
 ) {
     let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some(label),
-        color_attachments: &[Some(RenderPassColorAttachment {
-            view: target,
-            resolve_target: None,
-            ops: Operations::default(),
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
+                                                            color_attachments: &[Some(RenderPassColorAttachment {
+                                                                view: target,
+                                                                resolve_target: None,
+                                                                ops: Operations::default(),
+                                                            })],
+                                                            depth_stencil_attachment: None,
+                                                            timestamp_writes: None,
+                                                            occlusion_query_set: None,
     });
     pass.set_render_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[settings_offset]);
@@ -409,7 +454,7 @@ impl ViewNode for FakeReliefNode {
         _graph: &mut RenderGraphContext,
         render_context: &mut RenderContext,
         (view_target, settings, settings_index, prepass, textures): QueryItem<Self::ViewQuery>,
-        world: &World,
+           world: &World,
     ) -> Result<(), NodeRunError> {
         if settings.enabled == 0 || view_target.main_texture_format() != TextureFormat::bevy_default() {
             return Ok(());
@@ -418,10 +463,10 @@ impl ViewNode for FakeReliefNode {
         let cache = world.resource::<PipelineCache>();
         let (Some(down), Some(blur_h), Some(blur_v), Some(height), Some(relief)) = (
             cache.get_render_pipeline(pipelines.down),
-            cache.get_render_pipeline(pipelines.blur_h),
-            cache.get_render_pipeline(pipelines.blur_v),
-            cache.get_render_pipeline(pipelines.height),
-            cache.get_render_pipeline(pipelines.relief),
+                                                                                    cache.get_render_pipeline(pipelines.blur_h),
+                                                                                    cache.get_render_pipeline(pipelines.blur_v),
+                                                                                    cache.get_render_pipeline(pipelines.height),
+                                                                                    cache.get_render_pipeline(pipelines.relief),
         ) else {
             return Ok(());
         };
@@ -444,8 +489,8 @@ impl ViewNode for FakeReliefNode {
             &pipelines.layout_blur,
             &BindGroupEntries::with_indices((
                 (2, &pipelines.sampler),
-                (3, &textures.a.default_view),
-                (6, settings_binding.clone()),
+                                             (3, &textures.a.default_view),
+                                             (6, settings_binding.clone()),
             )),
         );
         let bg_blur_v = device.create_bind_group(
@@ -453,8 +498,8 @@ impl ViewNode for FakeReliefNode {
             &pipelines.layout_blur,
             &BindGroupEntries::with_indices((
                 (2, &pipelines.sampler),
-                (3, &textures.b.default_view),
-                (6, settings_binding.clone()),
+                                             (3, &textures.b.default_view),
+                                             (6, settings_binding.clone()),
             )),
         );
         let bg_height = device.create_bind_group(
@@ -462,9 +507,9 @@ impl ViewNode for FakeReliefNode {
             &pipelines.layout_height,
             &BindGroupEntries::with_indices((
                 (0, post.source),
-                (2, &pipelines.sampler),
-                (4, &textures.mean.default_view),
-                (6, settings_binding.clone()),
+                                             (2, &pipelines.sampler),
+                                             (4, &textures.mean.default_view),
+                                             (6, settings_binding.clone()),
             )),
         );
         let bg_relief = device.create_bind_group(
@@ -472,11 +517,11 @@ impl ViewNode for FakeReliefNode {
             &pipelines.layout_relief,
             &BindGroupEntries::with_indices((
                 (0, post.source),
-                (1, depth_view),
-                (2, &pipelines.sampler),
-                (4, &textures.mean.default_view),
-                (5, &textures.height.default_view),
-                (6, settings_binding.clone()),
+                                             (1, depth_view),
+                                             (2, &pipelines.sampler),
+                                             (4, &textures.mean.default_view),
+                                             (5, &textures.height.default_view),
+                                             (6, settings_binding.clone()),
             )),
         );
 

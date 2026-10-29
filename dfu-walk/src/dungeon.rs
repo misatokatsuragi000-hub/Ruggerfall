@@ -6,6 +6,18 @@
 //! I nemici sono i flat editor 199 con `FactionID != 0`, estratti da
 //! `dungeon_builder::build_dungeon` in `BuiltDungeon::enemies`. Vengono gestiti
 //! da `dungeon_enemies` tramite l'evento `SpawnDungeonEnemies`.
+//!
+//! ## Fix crash all'uscita
+//!
+//! All'uscita il root del dungeon viene despawnato (deferred). La coda
+//! `PendingDungeonEnemies` contiene riferimenti a quel root: se non viene
+//! svuotata, `stream_dungeon_enemies` al frame successivo prova ad aggiungere
+//! figli a un'entità già despawnata (panic in Bevy 0.15). Per questo
+//! `dungeon_enter_exit` azzera la coda prima del `despawn_recursive`.
+//!
+//! Inoltre, se sei vicino all'uscita, il tasto E deve servire a uscire e non
+//! ad aprire una porta vicina: `dungeon_move` salta il toggle delle porte
+//! quando `d_exit < DUNGEON_EXIT_DISTANCE`.
 
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
@@ -21,7 +33,7 @@ use crate::data::mesh_builder::{Submesh, WorldMesh};
 use crate::data::terrain_mesh::MAP_PIXEL_SIZE;
 use crate::dialog::DialogState;
 use crate::dungeon_enemies::{
-    SpawnDungeonEnemies, DungeonKind, DEFAULT_MONSTER_POWER,
+    SpawnDungeonEnemies, DungeonKind, PendingDungeonEnemies, DEFAULT_MONSTER_POWER,
 };
 use crate::fps_weapon::FpsWeaponState;
 use crate::mod_textures::ModTextures;
@@ -89,10 +101,10 @@ impl Plugin for DungeonPlugin {
             Update,
             (
                 check_initial_dungeon_spawn,
-             dungeon_enter_exit,
-             handle_dungeon_door_click,
-             dungeon_move,
-             face_dungeon_flats,
+                dungeon_enter_exit,
+                handle_dungeon_door_click,
+                dungeon_move,
+                face_dungeon_flats,
             )
             .chain()
             .before(crate::interior::interior_enter_exit)
@@ -440,6 +452,11 @@ pub fn dungeon_enter_exit(
     mut wall_textures: ResMut<WallTextures>,
     mut mods: ResMut<ModTextures>,
     mut player: Query<(&mut Player, &mut Transform)>,
+                          // La coda nemici contiene `item.parent` = root del dungeon che stiamo
+                          // per despawnare. Svuotarla PRIMA del `despawn_recursive` evita che
+                          // `stream_dungeon_enemies` al frame successivo provi ad aggiungere
+                          // figli a un'entità già despawnata (panic in Bevy 0.15).
+                          mut pending_enemies: ResMut<PendingDungeonEnemies>,
 ) {
     let leave = keys.just_pressed(KeyCode::Backspace);
     let act = keys.just_pressed(KeyCode::KeyE);
@@ -454,6 +471,15 @@ pub fn dungeon_enter_exit(
         let exit_now = leave || (act && d_exit < DUNGEON_EXIT_DISTANCE);
         if exit_now {
             let active = state.active.take().unwrap();
+
+            // Svuota la coda nemici prima di despawnare il root: evita il
+            // panic "entity already despawned" in `stream_dungeon_enemies`.
+            let cleared = pending_enemies.items.len();
+            pending_enemies.items.clear();
+            if cleared > 0 {
+                info!("Dungeon: {} nemici in coda scartati (uscita)", cleared);
+            }
+
             let (de, dn) = (
                 origin.east - active.saved_origin.0,
                 origin.north - active.saved_origin.1,
@@ -508,6 +534,13 @@ pub fn handle_dungeon_door_click(
 
     let local = tf.translation - active.origin;
     let feet_local = local.y - EYE_HEIGHT;
+
+    // Se sei vicino all'uscita, il click sinistro non deve aprire porte:
+    // l'uscita è gestita dal tasto E e dal Backspace in `dungeon_enter_exit`.
+    let d_exit = (local.x - active.dungeon.exit_pos[0])
+    .hypot(local.z - active.dungeon.exit_pos[2]);
+    if d_exit < DUNGEON_EXIT_DISTANCE { return; }
+
     if let Some(i) = active
         .dungeon
         .toggle_nearest_door(local.x, local.z, feet_local, DOOR_INTERACTION_REACH)
@@ -538,12 +571,20 @@ pub fn dungeon_move(
     if keys.just_pressed(KeyCode::KeyE) {
         let (lx, lz) = (tf.translation.x - o.x, tf.translation.z - o.z);
         let feet = p.feet_y - o.y;
-        if let Some(door_idx) = dungeon.toggle_nearest_door(lx, lz, feet, DOOR_INTERACTION_REACH) {
-            println!(
-                "Porta {} {}.",
-                door_idx,
-                if dungeon.door_open[door_idx] { "aperta" } else { "chiusa" }
-            );
+
+        // Se sei vicino all'uscita, E deve servire a uscire (gestito da
+        // `dungeon_enter_exit`, che gira prima in chain), NON ad aprire
+        // una porta vicina. Questo evita il doppio effetto "esci + apri
+        // porta" quando una porta si trova a ridosso dell'uscita.
+        let d_exit = (lx - dungeon.exit_pos[0]).hypot(lz - dungeon.exit_pos[2]);
+        if d_exit >= DUNGEON_EXIT_DISTANCE {
+            if let Some(door_idx) = dungeon.toggle_nearest_door(lx, lz, feet, DOOR_INTERACTION_REACH) {
+                println!(
+                    "Porta {} {}.",
+                    door_idx,
+                    if dungeon.door_open[door_idx] { "aperta" } else { "chiusa" }
+                );
+            }
         }
     }
 

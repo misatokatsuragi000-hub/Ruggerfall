@@ -69,6 +69,9 @@ pub struct PendingInterior {
     pub root_transform: Transform,
     /// true quando non c'e' nessuna richiesta in sospeso (stato iniziale/fresco)
     pub consumed: bool,
+    /// se generare anche gli NPC custom della mesh: lo decide `interior_enter`
+    /// in base alla casa degli NPC (`npc_home`). Mai `true` fuori dalla casa.
+    pub spawn_npcs: bool,
 }
 
 /// Componente marker della porta d'uscita dell'interno attualmente in scena:
@@ -80,65 +83,140 @@ pub struct InteriorExitDoor {
 }
 
 /// Spawna la radice + i figli della mesh interna; ritorna l'entita' radice.
+/// Se `spawn_npcs`, genera anche gli NPC custom come ulteriori figli della
+/// radice (marcati `CustomNpc` per il reclutamento con R).
+#[allow(clippy::too_many_arguments)]
 fn spawn_mesh(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     interior_textures: &InteriorTextures,
+    npc_materials: &mut NpcMaterials,
     mesh: &InteriorMesh,
     root: Transform,
+    spawn_npcs: bool,
+    recruited: &crate::npc_home::RecruitedNpcs,
+    building: &Option<crate::interior_enter::BuildingKey>,
 ) -> Entity {
-    commands
+    let root_entity = commands
         .spawn((root, InteriorRoot))
-        .with_children(|parent| {
-            for kind in InteriorMaterial::ALL {
-                let part = &mesh.parts[kind.index()];
-                if part.is_empty() {
-                    continue;
+        .id();
+    commands.entity(root_entity).with_children(|parent| {
+        for kind in InteriorMaterial::ALL {
+            let part = &mesh.parts[kind.index()];
+            if part.is_empty() {
+                continue;
+            }
+            let material = materials.add(interior_base_material(kind));
+            parent.spawn((
+                Mesh3d(meshes.add(to_bevy_part(part.clone()))),
+                MeshMaterial3d(material),
+                Transform::IDENTITY,
+            ));
+        }
+        for ((archive, record), part) in &mesh.textured {
+            if part.is_empty() {
+                continue;
+            }
+            let handle = interior_textures.images.get(&(*archive, *record)).cloned();
+            let material = match handle {
+                Some(tex) => StandardMaterial {
+                    base_color_texture: Some(tex),
+                    base_color: Color::srgb(1.0, 1.0, 1.0),
+                    perceptual_roughness: 0.9,
+                    reflectance: 0.1,
+                    double_sided: true,
+                    cull_mode: None,
+                    alpha_mode: AlphaMode::Blend,
+                    ..default()
+                },
+                None => interior_base_material(InteriorMaterial::Furniture),
+            };
+            let material = materials.add(material);
+            parent.spawn((
+                Mesh3d(meshes.add(to_bevy_part(part.clone()))),
+                MeshMaterial3d(material),
+                Transform::IDENTITY,
+            ));
+        }
+        // ---- NPC custom: SOLO se autorizzati (casa degli NPC) --------------
+        if spawn_npcs {
+            for (i, person) in mesh.people.iter().enumerate() {
+                // non rigenerare chi e' gia' stato reclutato
+                if let Some(b) = building {
+                    if recruited.is_recruited(b, i) {
+                        continue;
+                    }
                 }
-                let material = materials.add(interior_base_material(kind));
+                let material = npc_materials.material(person.texture_archive, person.texture_record, materials);
+                // persona in piedi: capsula alta ~1.8 m, meta' sotto gli occhi
+                let y = person.position[1] + 0.9 - crate::player::EYE_HEIGHT * 0.0;
                 parent.spawn((
-                    Mesh3d(meshes.add(to_bevy_part(part.clone()))),
+                    Mesh3d(meshes.add(npc_capsule())),
                     MeshMaterial3d(material),
-                    Transform::IDENTITY,
+                    CustomNpc { index: i },
+                    Transform::from_xyz(person.position[0], y, person.position[2])
+                        .with_rotation(Quat::from_rotation_y(-person.direction_deg.to_radians())),
                 ));
             }
-            for ((archive, record), part) in &mesh.textured {
-                if part.is_empty() {
-                    continue;
-                }
-                let handle = interior_textures.images.get(&(*archive, *record)).cloned();
-                let material = match handle {
-                    Some(tex) => StandardMaterial {
-                        base_color_texture: Some(tex),
-                        base_color: Color::srgb(1.0, 1.0, 1.0),
-                        perceptual_roughness: 0.9,
-                        reflectance: 0.1,
-                        double_sided: true,
-                        cull_mode: None,
-                        alpha_mode: AlphaMode::Blend,
-                        ..default()
-                    },
-                    None => interior_base_material(InteriorMaterial::Furniture),
-                };
-                let material = materials.add(material);
-                parent.spawn((
-                    Mesh3d(meshes.add(to_bevy_part(part.clone()))),
-                    MeshMaterial3d(material),
-                    Transform::IDENTITY,
-                ));
-            }
-        })
-        .id()
+        }
+    });
+    root_entity
+}
+
+/// Componente marker degli NPC custom in scena (figli della radice).
+pub use crate::npc_home::CustomNpc;
+
+/// Colori deterministici per gli NPC: uno per ogni (archivio, record) dichiarato
+/// nel RMB, cosi' lo stesso PNGD ha sempre lo stesso "vestito". La cache viene
+/// riempita da `spawn_mesh` quando servono materiali nuovi.
+#[derive(Resource, Default)]
+pub struct NpcMaterials {
+    cache: HashMap<(u16, u8), Handle<StandardMaterial>>,
+}
+
+impl NpcMaterials {
+    /// Materiale per l'NPC con la texture `(archive, record)`; crea l'asset se
+    /// non e' ancora in cache.
+    fn material(
+        &mut self,
+        archive: u16,
+        record: u8,
+        materials: &mut Assets<StandardMaterial>,
+    ) -> Handle<StandardMaterial> {
+        if let Some(h) = self.cache.get(&(archive, record)) {
+            return h.clone();
+        }
+        // tonalita' "veste", variate con un hash semplice dei due indici
+        let hue = (archive as f32 * 7.0 + record as f32 * 23.0).rem_euclid(360.0);
+        let color = Color::hsl(hue / 360.0, 0.45, 0.42);
+        let handle = materials.add(StandardMaterial {
+            base_color: color,
+            perceptual_roughness: 0.8,
+            ..default()
+        });
+        self.cache.insert((archive, record), handle.clone());
+        handle
+    }
+}
+
+/// Geometria dell'NPC: capsula alta ~1.8 m (0.55 semi-altezza cilindro + raggi).
+fn npc_capsule() -> Mesh {
+    use bevy::render::primitives::Capsule3d as RenderCapsule;
+    Mesh::from(RenderCapsule::new(0.35, 0.55))
 }
 
 /// Sistema: converte `PendingInterior` (dati) in entita' Bevy e attiva la scena.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_interior(
     mut pending: ResMut<PendingInterior>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     interior_textures: Res<InteriorTextures>,
+    mut npc_materials: ResMut<NpcMaterials>,
+    recruited: Res<crate::npc_home::RecruitedNpcs>,
+    current: Res<crate::interior_enter::CurrentInterior>,
     mut scene: ResMut<ActiveScene>,
     existing: Query<Entity, With<InteriorRoot>>,
 ) {
@@ -155,13 +233,18 @@ pub fn spawn_interior(
         return;
     }
     let root_tf = pending.root_transform;
+    let spawn_npcs = pending.spawn_npcs;
     let root_entity = spawn_mesh(
         &mut commands,
         &mut meshes,
         &mut materials,
         &interior_textures,
+        &mut npc_materials,
         &mesh,
         root_tf,
+        spawn_npcs,
+        &recruited,
+        &current.building,
     );
     // marca la porta d'uscita (= ingresso dell'edificio): serve a
     // exit_interior_system per il check di prossimita'
@@ -208,6 +291,7 @@ impl Plugin for InteriorRenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ActiveScene>()
             .init_resource::<InteriorTextures>()
+            .init_resource::<NpcMaterials>()
             .init_resource::<PendingInterior>();
     }
 }

@@ -29,6 +29,8 @@ bevy = { version = "0.15", default-features = false, features = [
     "tonemapping_luts",
 ] }
 dfmod = { version = "0.1.0", path = "../dfmod" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.dev]
 opt-level = 1

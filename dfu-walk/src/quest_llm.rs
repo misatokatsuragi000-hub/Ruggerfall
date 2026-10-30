@@ -16,12 +16,12 @@ use crate::data::maps::DFLocation;
 use crate::player::Player;
 use crate::quests::{
     build_npc_ask_prompt, build_npc_flavor_prompt, build_npc_voice_prompt, build_rumors_prompt,
-    build_seed_prompt, clean_question, enrich_seed, is_town, jstr, parse_follow, parse_mood,
-    rumors_from_json, theme_for, validate_answer, validate_npc_flavors, validate_rumors,
-    validate_seed, validate_voice, Json, NpcFlavor, Quest, QuestBook, QuestConfig, Seed,
-    VoiceState, MAX_HISTORY_TURNS, MAX_NPC_FLAVORS, CONFIG_FILE, DEFAULT_NPC_ASK_PROMPT,
-    DEFAULT_NPC_FLAVOR_PROMPT, DEFAULT_NPC_VOICE_PROMPT, DEFAULT_RUMORS_PROMPT,
-    DEFAULT_SEED_PROMPT,
+    build_seed_prompt, clean_question, enrich_seed, guild_name_from_prefix, is_town, jstr,
+    parse_follow, parse_mood, rumors_from_json, theme_for, validate_answer,
+    validate_npc_flavors, validate_rumors, validate_seed, validate_voice, Json, NpcFlavor,
+    Quest, QuestBook, QuestConfig, Seed, VoiceState, MAX_HISTORY_TURNS, MAX_NPC_FLAVORS,
+    CONFIG_FILE, DEFAULT_NPC_ASK_PROMPT, DEFAULT_NPC_FLAVOR_PROMPT, DEFAULT_NPC_VOICE_PROMPT,
+    DEFAULT_RUMORS_PROMPT, DEFAULT_SEED_PROMPT,
 };
 use crate::world::{map_pixel_of, GameData, Origin};
 use bevy::prelude::*;
@@ -440,8 +440,19 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                 matches!(bt, 0 | 2 | 5 | 6 | 7 | 8 | 9 | 11 | 12 | 13 | 14 | 15)
             }
 
+            /// Raccoglie gli NPC (persone e flat "faction") che abitano gli interni
+            /// visitabili della località. Per ognuno restituisce anche il nome
+            /// dell'organizzazione (se l'edificio ne è la sede), ricavato dal
+            /// prefisso del nome del blocco RMB.
+            ///
+            /// Serve a `generate_npc_flavors`: se un "robed woman" sta dentro
+            /// MAGE, il prompt deve dire "*robed woman* — member of Mages Guild"
+            /// così l'LLM genera una frase da insider, non da estraneo che ha
+            /// sentito dire qualcosa.
+            ///
+            /// Restituisce `(archive, record, caption, guild)`.
             fn collect_npc_flats(location: &DFLocation, blocks_buf: &[u8], catalog: &FlatCatalog)
-            -> Vec<(u16, u8, String)>
+            -> Vec<(u16, u8, String, Option<String>)>
             {
                 let Ok(blocks_bsa) = BsaArchive::parse(blocks_buf) else { return Vec::new() };
                 let mut seen = std::collections::HashSet::new();
@@ -451,6 +462,14 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                         let Some(name) = location.block_names.get(by * location.width + bx) else { continue };
                         let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
                         let Ok(rmb) = RmbBlock::parse(raw) else { continue };
+
+                        // Prefisso a 4 lettere del nome del blocco RMB ("MAGE",
+                        // "FIGH", "THIE", "TEMP", ...) → nome della gilda.
+                        // `None` per taverna, negozio, residenza, mura, ecc.
+                        let block_prefix: String = name.get(..4).unwrap_or("").to_ascii_uppercase();
+                        let guild: Option<String> = guild_name_from_prefix(&block_prefix)
+                        .map(str::to_string);
+
                         for (i, it) in rmb.interiors.iter().enumerate() {
                             let enterable = rmb.buildings.get(i).map_or(false, |b| is_enterable_type(b.building_type));
                             if !enterable { continue; }
@@ -459,7 +478,12 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                 if !seen.insert(key) { continue; }
                                 if let Some(info) = catalog.get(p.texture_archive, p.texture_record) {
                                     if !info.caption.is_empty() {
-                                        out.push((p.texture_archive, p.texture_record, info.caption.clone()));
+                                        out.push((
+                                            p.texture_archive,
+                                            p.texture_record,
+                                            info.caption.clone(),
+                                                  guild.clone(),
+                                        ));
                                     }
                                 }
                             }
@@ -469,7 +493,12 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                 if !seen.insert(key) { continue; }
                                 if let Some(info) = catalog.get(f.texture_archive, f.texture_record) {
                                     if !info.caption.is_empty() {
-                                        out.push((f.texture_archive, f.texture_record, info.caption.clone()));
+                                        out.push((
+                                            f.texture_archive,
+                                            f.texture_record,
+                                            info.caption.clone(),
+                                                  guild.clone(),
+                                        ));
                                     }
                                 }
                             }
@@ -480,19 +509,30 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                 out
             }
 
+            /// Genera un flavor per ogni (caption, gilda) distinta. La stessa
+            /// caption ("robed woman") che compare in una taverna e nella gilda
+            /// dei maghi riceve DUE flavor distinti: uno da estraneo, uno da
+            /// membro. La riga `npc_list` passata al prompt dice "member of
+            /// <guild>" quando è il caso, e il prompt (DEFAULT_NPC_FLAVOR_PROMPT)
+            /// ha la regola GUILD MEMBERSHIP per gestirlo.
             fn generate_npc_flavors(cfg: &QuestConfig, tpl: &Templates, seed: &Seed,
-                                    npc_flats: &[(u16, u8, String)]) -> Vec<NpcFlavor>
+                                    npc_flats: &[(u16, u8, String, Option<String>)]) -> Vec<NpcFlavor>
                                     {
                                         if npc_flats.is_empty() { return Vec::new(); }
-                                        let mut order: Vec<String> = Vec::new();
-                                        let mut by_cap: HashMap<String, Vec<(u16, u8)>> = HashMap::new();
-                                        for (a, r, cap) in npc_flats {
-                                            if !by_cap.contains_key(cap) { order.push(cap.clone()); }
-                                            by_cap.entry(cap.clone()).or_default().push((*a, *r));
+                                        let mut order: Vec<(String, Option<String>)> = Vec::new();
+                                        let mut by_cap: HashMap<(String, Option<String>), Vec<(u16, u8)>> = HashMap::new();
+                                        for (a, r, cap, guild) in npc_flats {
+                                            let key = (cap.clone(), guild.clone());
+                                            if !by_cap.contains_key(&key) { order.push(key.clone()); }
+                                            by_cap.entry(key).or_default().push((*a, *r));
                                         }
                                         order.truncate(MAX_NPC_FLAVORS);
-                                        let npc_list = order.iter().enumerate().map(|(i, c)| format!("[{i}] \"{c}\""))
-                                        .collect::<Vec<_>>().join("\n");
+                                        let npc_list = order.iter().enumerate().map(|(i, (cap, guild))| {
+                                            match guild {
+                                                Some(g) => format!("[{i}] \"{cap}\" — member of {g}"),
+                                                                                    None => format!("[{i}] \"{cap}\""),
+                                            }
+                                        }).collect::<Vec<_>>().join("\n");
                                         let prompt = build_npc_flavor_prompt(&tpl.npc_flavor, seed, &npc_list);
                                         let ev = match try_json(cfg, &prompt, "NPC_FLAVORS", validate_npc_flavors) {
                                             Ok(ev) => ev,
@@ -503,10 +543,10 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                         for item in arr {
                                             let idx = item.get("index").and_then(Json::as_int).unwrap_or(-1);
                                             if idx < 0 || (idx as usize) >= order.len() { continue; }
-                                            let cap = &order[idx as usize];
+                                            let cap = &order[idx as usize].0;
                                             let text = item.get("text").and_then(Json::as_str).unwrap_or(" ").trim().to_string();
                                             if text.is_empty() || text.chars().count() > 500 { continue; }
-                                            for &(a, r) in &by_cap[cap] {
+                                            for &(a, r) in &by_cap[&order[idx as usize]] {
                                                 out.push(NpcFlavor { archive: a, record: r, caption: cap.clone(), text: text.clone() });
                                             }
                                         }
@@ -514,7 +554,7 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                     }
 
                                     fn generate_quest(cfg: &QuestConfig, tpl: &Templates, job: &Job,
-                                                      npc_flats: &[(u16, u8, String)]) -> Result<Quest, String>
+                                                      npc_flats: &[(u16, u8, String, Option<String>)]) -> Result<Quest, String>
                                                       {
                                                           let seed_json = try_json(cfg, &build_seed_prompt(&tpl.seed, job.theme), "SEED", validate_seed)?;
                                                           let seed = enrich_seed(&seed_json)?;

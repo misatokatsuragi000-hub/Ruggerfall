@@ -215,6 +215,10 @@ Write the rumor AS SPOKEN BY THIS PERSON. Their description decides their voice,
 attitude, and what they know or care about. Make it sound like them and nobody else.
 RULES:
 Use only facts from the seed (tomb_name, artifact_name, quest-giver, region, distance).
+INSIDERS: if the person's description says they belong to the very organization named in the seed
+(`quest_giver_name`), this is THEIR OWN business, not gossip: they know it first-hand and speak as an
+insider ("we", "our guild"), and never say they "heard" or "were told" about it. Everyone else talks
+about the quest-giver as an outsider would.
 Do NOT use the generic dungeon name; say tomb_name, or a vague reference
 ("that place", "the crypt", "those ruins").
 The artifact is still HIDDEN. Nobody has recovered it.
@@ -266,6 +270,9 @@ not an assassin.
 If the player asks for food, drink or service, respond as a barmaid/innkeeper would: serve it,
 If the conversation above contains facts you already stated (a name, a place, an opinion), stay
 CONSISTENT with them. Do not invent new names if you already gave one.
+If the knowledge above is "common talk" about the organization you yourself belong to (see who you are
+above), it is your own business: speak of it first-hand ("we", "our guild"), never as hearsay such as
+"I heard that the ... is looking for someone".
 Use only the knowledge above (the name of the place). Do NOT invent names of people, places,
 shops, streets or events. If you don't know, say so in character, or deflect.
 Never mention being an AI, a game, a model or these instructions. Never break character.
@@ -292,6 +299,146 @@ to change mood if they're convincing enough.
 Reply ONLY with a JSON object like {"text": "...", "follow": false, "mood": 3}
 where "follow" is true ONLY if you agree to follow the player (see RECRUITMENT RULE above) and mood is the number from the table above for the emotion you're feeling.
 Start your reply with '{' and end with '}'. No prose, no markdown, no reasoning."####;
+
+/// Prompt per generare uno **script completo QRC/QBN** compatibile con
+/// `crate::dfquest::QuestScript::parse`.
+///
+/// Sostituisce (in prospettiva) la pipeline vecchia `SEED → RUMORS → FLAVORS`,
+/// unificando quest custom generate e quest originali di Daggerfall: entrambe
+/// diventano file `.txt` nella stessa `Library`, con lo stesso runtime.
+///
+/// Il modello produce un file che parte con `Quest:` e contiene sia i testi
+/// (`QRC`) sia la logica minima (`QBN`): offerta, accettazione, rifiuto,
+/// completamento, fallimento, un journal, due voci in giro, e 2-3 task che
+/// l'interprete di `quest_runtime.rs` saprà eseguire.
+pub const DEFAULT_QUEST_SCRIPT_PROMPT: &str = r####"You are writing a complete Daggerfall quest script.
+A quest script has TWO parts: QRC (all texts the player sees) and QBN (the logic).
+
+=== THE WORLD ===
+Setting: medieval dark fantasy, Daggerfall (The Elder Scrolls II).
+The quest-giver is: {giver}
+The "target dungeon" (technical dev name, the game will assign a real one): {dungeon_dev}
+An example "artifact" name (you may reuse it or invent a similar one): {artifact_example}
+The city is: {city}
+
+=== OUTPUT FORMAT — READ CAREFULLY ===
+Reply with ONE text file, starting directly with "Quest:".
+
+The file MUST contain these sections in this order:
+
+Quest: <ID>
+DisplayName: <short title in English>
+
+QRC:
+
+QuestorOffer:  [1000]
+<text shown by the quest-giver when offering the quest>
+
+AcceptQuest:  [1002]
+<text shown when the player accepts>
+
+RefuseQuest:  [1001]
+<text shown when the player refuses>
+
+QuestComplete:  [1004]
+<text shown when the quest is completed successfully>
+
+QuestFail:  [1003]
+<text shown when the quest has failed>
+
+Message:  1010
+<one line the player can read about the target>
+
+Message:  1011
+<one line the player can read about the quest-giver>
+
+RumorsDuringQuest:  [1005]
+<one rumor>
+<--->
+<another rumor, different angle>
+
+RumorsPostsuccess:  [1007]
+<one rumor, past tense, quest succeeded>
+
+RumorsPostfailure:  [1006]
+<one rumor, past tense, quest failed>
+
+QBN:
+
+Item _artifact_ artifact <ItemName>
+Person _questgiver_ named <GiverName>
+Person _qgfriend_ named <HelperName>
+Place _mondung_ remote dungeon
+Clock _1stparton_ 00:00 0 flag 1 range 3 5
+
+Quest start-up:
+start timer _1stparton_
+log 1020 step 0
+place foe _monster_ at _mondung_
+
+_qgfriend_ task:
+clicked npc _qgfriend_
+say 1030
+give pc _artifact_
+end quest
+
+_mondead_ task:
+killed 1 _monster_
+say 1030
+give pc _artifact_
+
+=== RULES FOR THE LOGIC (QBN) ===
+Use ONLY these task forms. Do not invent new ones.
+
+1. Offer / accept:
+The game handles QuestorOffer/AcceptQuest/RefuseQuest automatically.
+
+2. Completion by killing a foe:
+_X_ task:
+killed 1 _Y_
+say 1030
+give pc _artifact_
+end quest
+Where _Y_ is the Foe defined in QBN ("Foe _Y_ is <MonsterType>").
+
+3. Completion by talking to a NPC:
+_X_ task:
+clicked npc _qgfriend_
+say 1030
+give pc _artifact_
+end quest
+
+4. Timer failure:
+_1stparton_ task:
+end quest
+
+5. Startup:
+Quest start-up:
+start timer _1stparton_
+log 1020 step 0
+place foe _monster_ at _mondung_
+
+=== WHAT THE PLAYER SEES ===
+Message 1020 is the journal entry: a short paragraph starting with %qdt:
+and using =1stparton_ for the day limit, _monster_ for the target,
+_artifact_ for the reward, ___mondung_ for the dungeon, _qgfriend_ for the helper.
+Example: "%qdt: I have =1stparton_ days to slay a _monster_ in ___mondung_
+and receive Meridia's _artifact_ from _qgfriend_."
+
+Message 1030 is the moment of success: "=monster_ lies dead at your feet."
+or "Well done, %pcn. Here is the _artifact_ you were promised."
+
+=== CONTENT RULES ===
+- Do not invent other dungeons besides {dungeon_dev}.
+- Do not use the words "tomb", "crypt" etc. as proper names: the dungeon is called
+whatever you put in the `Place _mondung_ remote dungeon` line — but since it's
+`remote`, the game will pick it. Just reference it as ___mondung_ in texts.
+- The artifact must have ONE name, invented by you, 2-3 words, exotic.
+- The helper (_qgfriend_) is a real person the player will meet: give them
+a name and a short Message 1011 about who they are.
+- All texts are 1-3 sentences, no narration, no markdown.
+- Reply ONLY with the file. No fences. No comments. No `-- lines` starting with `--`
+unless you are writing a section name (they are ignored as comments, don't use them)."####;
 
 // =============================================================================
 // JSON minimale
@@ -831,6 +978,26 @@ impl Seed {
     }
 }
 
+/// Input per generare uno script QRC/QBN completo con
+/// `crate::quest_llm::generate_full_quest_script` (Fase 1 del runtime
+/// unificato: sostituisce la pipeline `Seed → Quest` con quella che produce
+/// direttamente un file `QuestScript` compatibile con `dfquest::Library`).
+#[derive(Clone, Debug)]
+pub struct QuestScriptJob {
+    /// Map pixel della città per cui si sta generando la quest.
+    pub city: (i32, i32),
+    /// Nome della città (per il prompt).
+    pub city_name: String,
+    /// Nome leggibile della gilda/persona che offre la quest (es. "Mages Guild").
+    pub giver_name: String,
+    /// Id tecnico della gilda (es. "mages_guild").
+    pub giver_id: String,
+    /// Nome "tecnico" del dungeon (dev label, es. "Crypt of Ash").
+    pub dungeon_dev: String,
+    /// Nome d'esempio di artefatto, suggerito all'LLM.
+    pub artifact_example: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NpcFlavor {
     pub archive: u16,
@@ -932,6 +1099,17 @@ pub fn build_npc_flavor_prompt(template: &str, seed: &Seed, npc_list: &str) -> S
 
 pub fn build_npc_voice_prompt(template: &str, seed: &Seed, npc: &str) -> String {
     template.replace("{seed_json}", &seed.to_prompt_json().pretty()).replace("{npc}", npc)
+}
+
+/// Costruisce il prompt per generare uno script QRC/QBN completo.
+/// `template` è `DEFAULT_QUEST_SCRIPT_PROMPT` (o una versione modificata
+/// dall'utente in `quest_script_prompt.txt`).
+pub fn build_quest_script_prompt(template: &str, job: &QuestScriptJob) -> String {
+    template
+    .replace("{giver}", &job.giver_name)
+    .replace("{dungeon_dev}", &job.dungeon_dev)
+    .replace("{artifact_example}", &job.artifact_example)
+    .replace("{city}", &job.city_name)
 }
 
 pub fn history_block(history: &[(String, String)]) -> String {
@@ -1113,14 +1291,11 @@ pub fn validate_answer(ev: &Json) -> Result<(), String> {
             return Err(format!("breaks character ('{phrase}'): stay in character, you are a person in the town"));
         }
     }
-    // "follow" è opzionale: se il modello lo omette va bene così. Se presente,
-    // deve essere un booleano, altrimenti rifiutiamo (scatta il retry).
     if let Some(f) = ev.get("follow") {
         if !matches!(f, Json::Bool(_)) {
             return Err("'follow' must be a boolean (true/false)".into());
         }
     }
-    // "mood" è opzionale: se presente deve essere un intero in 0..=7.
     if let Some(m) = ev.get("mood") {
         if !matches!(m, Json::Num(_)) {
             return Err("'mood' must be a number (0-7)".into());
@@ -1133,12 +1308,10 @@ pub fn validate_answer(ev: &Json) -> Result<(), String> {
     Ok(())
 }
 
-/// Estrae il flag di reclutamento dalla risposta JSON (default: false).
 pub fn parse_follow(ev: &Json) -> bool {
     matches!(ev.get("follow"), Some(Json::Bool(true)))
 }
 
-/// Estrae il mood dalla risposta JSON (default 0 = neutro).
 pub fn parse_mood(ev: &Json) -> u8 {
     ev.get("mood")
     .and_then(Json::as_int)
@@ -1187,7 +1360,40 @@ pub fn temperament_for(key: &str, city: (i32, i32)) -> &'static str {
     TEMPERAMENTS[(h % TEMPERAMENTS.len() as u64) as usize]
 }
 
+/// Prefisso a 4 lettere del nome di un blocco RMB (es. `"MAGEAA05.RMB"` →
+/// `"MAGE"`) → nome della gilda o organizzazione che ha sede in quell'edificio.
+///
+/// **Nomi senza articolo**: `describe_npc_in` e il prompt `NPC_FLAVORS` in
+/// `quest_llm.rs` prependono "the" quando serve. Restituire il nome "nudo"
+/// evita il bug `"the the Temple"` che si aveva con la versione precedente
+/// (che produceva `"the Temple"`).
+///
+/// Restituisce `None` per prefissi che non identificano un'organizzazione
+/// specifica (taverna, negozio, residenza, mura).
+pub fn guild_name_from_prefix(prefix: &str) -> Option<&'static str> {
+    match prefix.to_ascii_uppercase().as_str() {
+        "MAGE" => Some("Mages Guild"),
+        "FIGH" => Some("Fighters Guild"),
+        "THIE" => Some("Thieves Guild"),
+        "DARK" => Some("Dark Brotherhood"),
+        "GUIL" => Some("Guild"),
+        "TEMP" | "PTEM" => Some("Temple"),
+        "SHRI" => Some("Shrine"),
+        "PALA" | "CAST" => Some("Royal Palace"),
+        _ => None,
+    }
+}
+
 pub fn describe_npc(who: &str, role: Option<&str>, place: Option<PoiKind>, temperament: &str) -> String {
+    describe_npc_in(who, role, place, temperament, None)
+}
+
+/// Come `describe_npc`, ma con il nome della gilda dell'edificio (`"Mages Guild"`, senza
+/// articolo) quando e' noto: un membro sa di prima mano cosa fa la propria gilda.
+///
+/// Ottieni il nome con `InteriorState::block_prefix().and_then(guild_name_from_prefix)`:
+/// se non sei in una gilda, passa `None`.
+pub fn describe_npc_in(who: &str, role: Option<&str>, place: Option<PoiKind>, temperament: &str, guild: Option<&str>) -> String {
     let mut s = format!("- Appearance (visual descriptor from the game data, not a name or title): {who}\n");
     if let Some(r) = role { s.push_str(&format!("- Social role: {r}\n")); }
     let lower = who.to_lowercase();
@@ -1210,9 +1416,20 @@ pub fn describe_npc(who: &str, role: Option<&str>, place: Option<PoiKind>, tempe
             }
         }
         Some(PoiKind::Shop) => Some("You likely work here as the shopkeeper or an assistant."),
-        Some(PoiKind::Guild) => Some("You are likely a member or employee of this guild."),
+        Some(PoiKind::Guild) => None,
         _ => None,
     };
+    if place == Some(PoiKind::Guild) {
+        let org = match guild {
+            Some(g) => format!("the {g}"),
+            None => "the guild whose hall this is".to_string(),
+        };
+        s.push_str(&format!(
+            "- Occupation: You are a member or employee of {org}, and you are inside its hall right now. \
+Its affairs are your own: you know them first-hand. Never say you \"heard\" or \"were told\" what your guild is doing; \
+speak as an insider (\"we\", \"our guild\").\n"
+        ));
+    }
     if let Some(o) = occupation { s.push_str(&format!("- Occupation: {o}\n")); }
     s.push_str(&format!("- Location: {}\n", place_label(place)));
     s.push_str(&format!("- Temperament (not visible, shapes how they talk): {temperament}"));
@@ -1256,9 +1473,6 @@ pub struct QuestBook {
     voices: HashMap<((i32, i32), String), String>,
     pub(crate) voices_pending: HashSet<((i32, i32), String)>,
     pub(crate) voices_failed: HashSet<((i32, i32), String)>,
-    /// Risposte LLM alle domande libere: `(testo, follow, mood)`.
-    /// `follow == true` ⇒ l'NPC è stato convinto a seguire il giocatore.
-    /// `mood` ⇒ stato emotivo (0 = neutro, 1+ = frame idle dedicato).
     answers: HashMap<u64, Result<(String, bool, u8), ()>>,
 }
 
@@ -1300,6 +1514,14 @@ impl QuestBook {
         let Some(city) = city else { return Hint::Nothing };
         if let Some(q) = self.quests.get(&city) { return q.rumor(tone).map_or(Hint::Nothing, Hint::Text); }
         if self.pending.contains(&city) { Hint::Pending } else { Hint::Nothing }
+    }
+
+    /// L'`id` della fazione che ha emesso la quest per questa città, se c'è
+    /// una quest salvata. Serve a `dialog::npc_reply` per riconoscere se stai
+    /// parlando con un membro della gilda che ha dato la quest (bypass insider:
+    /// risposta diretta invece di "ho sentito che...").
+    pub fn active_quest_giver_id(&self, city: (i32, i32)) -> Option<&str> {
+        self.quests.get(&city).map(|q| q.seed.quest_giver_id.as_str())
     }
 
     pub fn load_voices(&mut self, path: &Path) {
@@ -1460,7 +1682,6 @@ mod tests {
         let ok = |t: &str| validate_answer(&Json::Obj(vec![("text".into(), jstr(t))]));
         assert!(ok("Welcome to Daggerfall, stranger.").is_ok());
         assert!(ok("As an AI, I cannot say.").unwrap_err().contains("breaks character"));
-        // "follow" opzionale: assente / false / true sono tutti validi; non-bool no.
         let with_follow = |f: Json| validate_answer(&Json::Obj(vec![
             ("text".into(), jstr("Sure.")), ("follow".into(), f),
         ]));
@@ -1474,12 +1695,10 @@ mod tests {
 
     #[test]
     fn mood_validation() {
-        // "mood" assente = valido, default 0.
         let base = Json::Obj(vec![("text".into(), jstr("Sure."))]);
         assert!(validate_answer(&base).is_ok());
         assert_eq!(parse_mood(&base), 0);
 
-        // "mood" 0..=7 valido.
         for m in 0..=7i64 {
             let j = Json::Obj(vec![
                 ("text".into(), jstr("Sure.")),
@@ -1489,21 +1708,18 @@ mod tests {
             assert_eq!(parse_mood(&j), m as u8);
         }
 
-        // Fuori range.
         let j = Json::Obj(vec![
             ("text".into(), jstr("Sure.")),
                           ("mood".into(), Json::Num(9.0)),
         ]);
         assert!(validate_answer(&j).unwrap_err().contains("out of range"));
 
-        // Non numerico.
         let j = Json::Obj(vec![
             ("text".into(), jstr("Sure.")),
                           ("mood".into(), jstr("happy")),
         ]);
         assert!(validate_answer(&j).unwrap_err().contains("'mood'"));
 
-        // Clamp in parse_mood.
         let j = Json::Obj(vec![("mood".into(), Json::Num(42.0))]);
         assert_eq!(parse_mood(&j), 7);
     }
@@ -1614,5 +1830,106 @@ mod tests {
         assert!(d.contains("barmaid"), "{d}");
         let d = describe_npc("old beggar", None, None, "weary");
         assert!(!d.contains("barmaid"));
+    }
+
+    #[test]
+    fn describe_npc_makes_guild_members_insiders() {
+        let d = describe_npc_in("robed woman", None, Some(PoiKind::Guild), "calm", Some("Mages Guild"));
+        assert!(d.contains("member or employee of the Mages Guild"), "{d}");
+        assert!(d.contains("first-hand") && !d.contains("likely"), "{d}");
+        let d = describe_npc("robed woman", None, Some(PoiKind::Guild), "calm");
+        assert!(d.contains("the guild whose hall this is"), "{d}");
+    }
+
+    // -------------------------------------------------- guild_name_from_prefix
+
+    #[test]
+    fn guild_prefixes_are_mapped_without_articles() {
+        // I nomi ritornati non hanno articolo: `describe_npc_in` e il prompt
+        // `NPC_FLAVORS` in `quest_llm.rs` aggiungono "the" quando serve.
+        assert_eq!(guild_name_from_prefix("MAGE"), Some("Mages Guild"));
+        assert_eq!(guild_name_from_prefix("mage"), Some("Mages Guild"));
+        assert_eq!(guild_name_from_prefix("FIGH"), Some("Fighters Guild"));
+        assert_eq!(guild_name_from_prefix("THIE"), Some("Thieves Guild"));
+        assert_eq!(guild_name_from_prefix("DARK"), Some("Dark Brotherhood"));
+        assert_eq!(guild_name_from_prefix("TEMP"), Some("Temple"));
+        assert_eq!(guild_name_from_prefix("PTEM"), Some("Temple"));
+        assert_eq!(guild_name_from_prefix("PALA"), Some("Royal Palace"));
+        assert_eq!(guild_name_from_prefix("CAST"), Some("Royal Palace"));
+        // Prefissi non-organizzazione: nessun nome
+        assert_eq!(guild_name_from_prefix("TAVN"), None);
+        assert_eq!(guild_name_from_prefix("GENR"), None);
+        assert_eq!(guild_name_from_prefix("RESI"), None);
+        assert_eq!(guild_name_from_prefix("WALL"), None);
+        assert_eq!(guild_name_from_prefix(""), None);
+    }
+
+    #[test]
+    fn describe_npc_in_does_not_double_the_article() {
+        // Regression: con `guild_name_from_prefix("TEMP") == "the Temple"`
+        // e `format!("the {g}")` in `describe_npc_in`, il testo diventava
+        // "member of the the Temple". Ora il prefisso torna senza articolo.
+        let d = describe_npc_in("priest", None, Some(PoiKind::Guild), "calm", guild_name_from_prefix("TEMP"));
+        assert!(d.contains("member or employee of the Temple"), "{d}");
+        assert!(!d.contains("the the"), "{d}");
+    }
+
+    // ------------------------------------------------------ active_quest_giver_id
+
+    #[test]
+    fn active_quest_giver_id_returns_the_seed_giver() {
+        let mut book = QuestBook::default();
+        assert_eq!(book.active_quest_giver_id((207, 213)), None);
+        book.insert_quest(sample_quest());
+        assert_eq!(book.active_quest_giver_id((207, 213)), Some("mages_guild"));
+        assert_eq!(book.active_quest_giver_id((1, 1)), None);
+    }
+
+    // -------------------------------------------------- QuestScriptJob / prompt
+
+    fn sample_script_job() -> QuestScriptJob {
+        QuestScriptJob {
+            city: (207, 213),
+            city_name: "Daggerfall".into(),
+            giver_name: "Mages Guild".into(),
+            giver_id: "mages_guild".into(),
+            dungeon_dev: "Crypt of Ash".into(),
+            artifact_example: "Eye of Vael".into(),
+        }
+    }
+
+    #[test]
+    fn build_quest_script_prompt_fills_placeholders() {
+        let job = sample_script_job();
+        let p = build_quest_script_prompt(DEFAULT_QUEST_SCRIPT_PROMPT, &job);
+        assert!(p.contains("Mages Guild"), "giver");
+        assert!(p.contains("Crypt of Ash"), "dungeon_dev");
+        assert!(p.contains("Eye of Vael"), "artifact_example");
+        assert!(p.contains("Daggerfall"), "city");
+        assert!(!p.contains("{giver}"), "placeholder non sostituito");
+        assert!(!p.contains("{dungeon_dev}"));
+        assert!(!p.contains("{artifact_example}"));
+        assert!(!p.contains("{city}"));
+    }
+
+    #[test]
+    fn quest_script_prompt_has_the_required_sections() {
+        // Il prompt deve menzionare tutte le sezioni che `dfquest::QuestScript`
+        // sa parsare, altrimenti l'LLM non le produrrà.
+        for section in [
+            "Quest: <ID>",
+            "QuestorOffer:", "AcceptQuest:", "RefuseQuest:",
+            "QuestComplete:", "QuestFail:",
+            "RumorsDuringQuest:", "RumorsPostsuccess:", "RumorsPostfailure:",
+            "QBN:",
+            "start timer", "log 1020 step 0", "place foe _monster_ at _mondung_",
+            "killed 1 _monster_", "clicked npc _qgfriend_",
+            "give pc _artifact_", "end quest",
+        ] {
+            assert!(
+                DEFAULT_QUEST_SCRIPT_PROMPT.contains(section),
+                    "il prompt non menziona `{section}`"
+            );
+        }
     }
 }

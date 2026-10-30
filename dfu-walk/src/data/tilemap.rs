@@ -223,64 +223,21 @@ pub fn generate_default_tilemap(
     generate_tilemap(samples, map_pixel_x, map_pixel_y, preset, perlin_noise, unity_beach_jitter, true)
 }
 
-/// Record "naturali": quelli che la lookup di marching squares puo' produrre.
-const NATURAL_RECORDS: [u8; 16] = [0, 1, 2, 3, 5, 6, 7, 10, 11, 12, 15, 16, 17, 48, 51, 53];
-
-/// DEBUG temporaneo: stampa i record che finiscono davvero alla GPU. Se compare un record
-/// non naturale (es. da un preset cittadino), stampa anche la griglia centrale 48..80.
-fn debug_dump_encoded(encoded: &[u8]) {
-    let mut counts = [0usize; 64];
-    for &e in encoded {
-        counts[((e >> 2) & 0x3F) as usize] += 1;
-    }
-    let used: Vec<String> = counts
-        .iter()
-        .enumerate()
-        .filter(|(_, &n)| n > 0)
-        .map(|(r, n)| format!("{r}:{n}"))
-        .collect();
-    let has_unnatural = counts
-        .iter()
-        .enumerate()
-        .any(|(r, &n)| n > 0 && !NATURAL_RECORDS.contains(&(r as u8)));
-    eprintln!("[GPU] record (record:conteggio): {}", used.join(" "));
-    if !has_unnatural || encoded.len() != TILEMAP_DIM * TILEMAP_DIM {
-        return;
-    }
-    eprintln!("[GPU] griglia 48..80 (record + r=rotate f=flip), tilemap inviata alla GPU:");
-    for y in 48..80 {
-        let row: Vec<String> = (48..80)
-            .map(|x| {
-                let e = encoded[y * TILEMAP_DIM + x];
-                format!(
-                    "{:02}{}{}",
-                    (e >> 2) & 0x3F,
-                    if e & 1 != 0 { "r" } else { " " },
-                    if e & 2 != 0 { "f" } else { " " }
-                )
-            })
-            .collect();
-        eprintln!("{}", row.join(" "));
-    }
-}
-
 pub fn encode_for_shader(tilemap: &[u8], convert_water: bool) -> Vec<u8> {
-    let encoded: Vec<u8> = tilemap
-        .iter()
-        .map(|&tile| {
-            if convert_water && tile == UNSET_TILE {
-                return 0;
-            }
-            let mut record = (tile & 0x3F) as u32 * 4;
-            if tile & ROTATE_BIT != 0 {
-                record += 1;
-            }
-            if tile & FLIP_BIT != 0 {
-                record += 2;
-            }
-            (record & 0xFF) as u8
-        })
-        .collect();
-    debug_dump_encoded(&encoded);
-    encoded
+    tilemap
+    .iter()
+    .map(|&tile| {
+        if convert_water && tile == UNSET_TILE {
+            return 0;
+        }
+        let mut record = (tile & 0x3F) as u32 * 4;
+        if tile & ROTATE_BIT != 0 {
+            record += 1;
+        }
+        if tile & FLIP_BIT != 0 {
+            record += 2;
+        }
+        (record & 0xFF) as u8
+    })
+    .collect()
 }

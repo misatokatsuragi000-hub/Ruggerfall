@@ -1,11 +1,26 @@
 //! Salvataggio e caricamento dello stato persistente.
 //!
+//! ## Cosa viene salvato
+//!
+//! - **Posizione del giocatore** (`player pos X Y Z`), **con l'origine mobile**
+//!   (`player origin E N`). `player_pos` è un offset relativo all'origine di
+//!   `rebase_origin`, quindi senza l'origine è incomprensibile. Vecchi save
+//!   senza `player origin` sono interpretati con l'origine corrente (come prima
+//!   del fix).
+//! - **Ultima posizione esterna** (`player outside_pos X Y Z` e
+//!   `player outside_yaw`, `player outside_feet`): se il save è stato fatto
+//!   dentro un interno (`in_interior: 1`), il player viene riportato all'ultimo
+//!   punto all'aperto, dove potrà rientrare con E. Senza questo fallback, il
+//!   player restava dove era prima del caricamento.
+//! - **Recruited flat/custom** (set), follower esterni/interni/custom (con
+//!   mood), e lo stato "in interior".
+//!
 //! ## Due tipi di salvataggio
 //!
 //! - **Automatico** (`savegame.txt`): scritto dai trigger automatici
 //!   (reclutamento, W/F, cambio mood, ingresso/uscita da interni, chiusura
-//!   dell'app) e ad ogni click "Sovrascrivi" nella finestra F2.
-//!   È quello che viene letto all'avvio.
+//!   dell'app, autosave periodico 15s, F5 quicksave) e ad ogni click
+//!   "Sovrascrivi" nella finestra F2. È quello che viene letto all'avvio.
 //! - **Con nome** (`saves/<nome>.txt`): creato manualmente dalla finestra F2.
 //!   Non viene mai letto all'avvio; si carica solo dalla finestra. Non
 //!   interferisce con l'autosave.
@@ -13,8 +28,8 @@
 //! ## Finestra F2
 //!
 //! F2 apre una finestra egui centrata con titolo rosso "Salva/Carica". Esc o
-//! F2 chiudono (Esc dentro il campo "Nome" lo deseleziona prima, come in
-//! qualunque TextEdit egui).
+//! F2 chiudono. F5 è un quicksave diretto su `savegame.txt`, senza aprire
+//! la finestra.
 //!
 //! Mentre la finestra è aperta, `apply_save_menu_state` setta
 //! `DialogState.open = true` **e** `DialogState.forced_by_menu = true`. Il flag
@@ -28,13 +43,12 @@
 //! in ogni riga `follower ...` come `mood=N`, e ripristinato con
 //! `Follower::with_mood(N)` al reload. File vecchi senza `mood=` → default 0.
 //!
-//! ## Idle per flat normali
+//! ## Height fix
 //!
-//! Anche i follower nati da un flat interno possono avere un set di idle, con
-//! la convenzione `<archive>_<record>-0_idle_N.png` (es. `182_11-0.png` →
-//! `182_11-0_idle_0.png`, `_idle_1.png`, ...). Stessa cosa per il mood:
-//! `mood > 0` mostra staticamente `idle[mood]`. Al reload la scoperta viene
-//! rifatta, così basta aggiungere i PNG nella cartella textures.
+//! Dopo un caricamento (all'avvio o via F2), `HeightFixPending(true)` fa
+//! scattare `fix_player_height_after_load`, che ricalcola `feet_y` in base al
+//! terreno del map pixel corrente. Prima era `Local<bool>`, che si attivava
+//! solo una volta: dopo un caricamento manuale il fix non veniva rieseguito.
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, PrimaryWindow};
 use bevy_egui::{egui, EguiContexts};
@@ -61,7 +75,10 @@ const MAX_NAME_LEN: usize = 64;
 /// Moltiplicatore dimensionale per gli idle (custom e flat). 1.0 = identico
 /// all'idle base, 0.5 = metà. Allineato a `IDLE_SIZE_SCALE` in `dialog.rs`.
 const IDLE_SIZE_SCALE: f32 = 0.5;
-const IDLE_SIZE_SCALE_FLAT:   f32 = 1.0;
+const IDLE_SIZE_SCALE_FLAT: f32 = 1.0;
+/// Intervallo dell'autosave periodico (secondi).
+const AUTOSAVE_SECS: f32 = 15.0;
+
 // =============================================================================
 // Evento
 // =============================================================================
@@ -110,6 +127,29 @@ pub struct SaveLoadRequest {
     pub load_path: Option<PathBuf>,
     pub delete_path: Option<PathBuf>,
 }
+
+// =============================================================================
+// Timer autosave periodico
+// =============================================================================
+#[derive(Resource)]
+pub struct AutosaveTimer(pub Timer);
+
+impl Default for AutosaveTimer {
+    fn default() -> Self {
+        Self(Timer::from_seconds(AUTOSAVE_SECS, TimerMode::Repeating))
+    }
+}
+
+// =============================================================================
+// Flag per il ricalcolo dell'altezza dopo un load
+// =============================================================================
+/// Se `true`, `fix_player_height_after_load` ricalcola `feet_y` in base al
+/// terreno del map pixel corrente. Settato a `true` da `load_savegame_now`
+/// (chiamato all'avvio e da `apply_load_request`). Prima era `Local<bool>`,
+/// che si attivava una volta sola: dopo un load manuale via F2 non veniva
+/// rieseguito e il player restava con la `feet_y` del file.
+#[derive(Resource, Default)]
+pub struct HeightFixPending(pub bool);
 
 // =============================================================================
 // Utility nomi/cartelle
@@ -313,6 +353,16 @@ pub struct SaveGame {
     pub player_pos: Option<[f32; 3]>,
     pub player_yaw: Option<f32>,
     pub player_feet: Option<f32>,
+    /// Origine mobile al momento del salvataggio (`Origin { east, north }`).
+    /// `player_pos` è un offset locale a questa origine: senza questo campo
+    /// il load non sa dove interpretarlo (rebase_origin può aver cambiato
+    /// l'origine nel frattempo).
+    pub origin: Option<(i32, i32)>,
+    /// Ultima posizione all'aperto prima di entrare in un interno.
+    /// Popolata solo se `in_interior == true`.
+    pub player_outside_pos: Option<[f32; 3]>,
+    pub player_outside_yaw: Option<f32>,
+    pub player_outside_feet: Option<f32>,
     pub in_interior: bool,
     pub interior_recruited: Vec<(u16, u8)>,
     pub followers_external: Vec<SavedFollowerExternal>,
@@ -397,6 +447,40 @@ impl SaveGame {
                                         sg.in_interior = true;
                                     }
                                     sg.player_feet = Some(f);
+                                }
+                            }
+                        }
+                        "origin" => {
+                            if parts.len() >= 4 {
+                                if let (Ok(e), Ok(n)) =
+                                    (parts[2].parse::<i32>(), parts[3].parse::<i32>())
+                                    {
+                                        sg.origin = Some((e, n));
+                                    }
+                            }
+                        }
+                        "outside_pos" => {
+                            if parts.len() >= 5 {
+                                if let (Ok(x), Ok(y), Ok(z)) = (
+                                    parts[2].parse::<f32>(),
+                                                                parts[3].parse::<f32>(),
+                                                                parts[4].parse::<f32>(),
+                                ) {
+                                    sg.player_outside_pos = Some([x, y, z]);
+                                }
+                            }
+                        }
+                        "outside_yaw" => {
+                            if parts.len() >= 3 {
+                                if let Ok(y) = parts[2].parse::<f32>() {
+                                    sg.player_outside_yaw = Some(y);
+                                }
+                            }
+                        }
+                        "outside_feet" => {
+                            if parts.len() >= 3 {
+                                if let Ok(f) = parts[2].parse::<f32>() {
+                                    sg.player_outside_feet = Some(f);
                                 }
                             }
                         }
@@ -576,6 +660,21 @@ impl SaveGame {
         if let Some(f) = self.player_feet {
             out.push_str(&format!("player feet {:.3}\n", f));
         }
+        if let Some((e, n)) = self.origin {
+            out.push_str(&format!("player origin {} {}\n", e, n));
+        }
+        if let Some(p) = self.player_outside_pos {
+            out.push_str(&format!(
+                "player outside_pos {:.3} {:.3} {:.3}\n",
+                p[0], p[1], p[2]
+            ));
+        }
+        if let Some(y) = self.player_outside_yaw {
+            out.push_str(&format!("player outside_yaw {:.4}\n", y));
+        }
+        if let Some(f) = self.player_outside_feet {
+            out.push_str(&format!("player outside_feet {:.3}\n", f));
+        }
         let mut rec: Vec<(u16, u8)> = self.interior_recruited.clone();
         rec.sort();
         rec.dedup();
@@ -697,6 +796,7 @@ fn build_savegame(
                       Option<&FollowerWait>,
                       Option<&CustomNpcName>,
                   ), Without<Player>>,
+                  origin: &Origin,
 ) -> SaveGame {
     let inside = interior.is_inside();
     let mut sg = SaveGame {
@@ -709,6 +809,18 @@ fn build_savegame(
         sg.player_pos = Some(tf.translation.to_array());
         sg.player_yaw = Some(p.yaw);
         sg.player_feet = Some(p.feet_y);
+    }
+    sg.origin = Some((origin.east, origin.north));
+    if inside {
+        // Fallback per il load: se il player è dentro un interno, la posizione
+        // salvata in `player_pos` è la coordinata locale del `Transform` nel
+        // mondo dell'interno (Y ≈ 6000), non utile per ricomparire fuori.
+        // Salviamo l'ultima posizione esterna (che `InteriorState` conserva in
+        // `Active::saved_translation`), così il player ricompare davanti
+        // all'edificio e può rientrare con E.
+        sg.player_outside_pos = interior.outside_pos().map(|v| v.to_array());
+        sg.player_outside_feet = interior.outside_feet();
+        sg.player_outside_yaw = interior.outside_yaw();
     }
     for (_e, fol, tf, wait, custom) in followers.iter() {
         let pos = tf.translation.to_array();
@@ -762,6 +874,7 @@ pub fn save_after_recruit(
     mut delayed: ResMut<SaveDelayed>,
     player: Query<(&Player, &Transform), With<Player>>,
                           interior: Res<InteriorState>,
+                          origin: Res<Origin>,
                           followers: Query<(
                               Entity,
                               &Follower,
@@ -777,7 +890,7 @@ pub fn save_after_recruit(
     if delayed.frames_to_wait > 0 {
         return;
     }
-    let sg = build_savegame(&player, &interior, &followers);
+    let sg = build_savegame(&player, &interior, &followers, &origin);
     if let Err(e) = write_savegame_to(&sg, Path::new(SAVEGAME_FILE)) {
         warn!("savegame: impossibile scrivere {}: {e}", SAVEGAME_FILE);
     } else {
@@ -789,6 +902,7 @@ pub fn save_on_exit(
     mut exit: EventReader<AppExit>,
     player: Query<(&Player, &Transform), With<Player>>,
                     interior: Res<InteriorState>,
+                    origin: Res<Origin>,
                     followers: Query<(
                         Entity,
                         &Follower,
@@ -804,8 +918,79 @@ pub fn save_on_exit(
     if !any {
         return;
     }
-    let sg = build_savegame(&player, &interior, &followers);
+    let sg = build_savegame(&player, &interior, &followers, &origin);
     let _ = write_savegame_to(&sg, Path::new(SAVEGAME_FILE));
+}
+
+/// Autosave periodico (ogni `AUTOSAVE_SECS` secondi). Risolve il caso "gioco
+/// chiuso in modo non pulito / crash / kill": senza questo, l'ultima
+/// posizione salvata è quella dell'ultimo evento (reclutamento, F5, …),
+/// non quella in cui ti trovavi.
+pub fn autosave_periodic(
+    time: Res<Time>,
+    mut timer: ResMut<AutosaveTimer>,
+    player: Query<(&Player, &Transform), With<Player>>,
+                         interior: Res<InteriorState>,
+                         origin: Res<Origin>,
+                         followers: Query<(
+                             Entity,
+                             &Follower,
+                             &Transform,
+                             Option<&FollowerWait>,
+                             Option<&CustomNpcName>,
+                         ), Without<Player>>,
+) {
+    if !timer.0.tick(time.delta()).just_finished() {
+        return;
+    }
+    let sg = build_savegame(&player, &interior, &followers, &origin);
+    if let Err(e) = write_savegame_to(&sg, Path::new(SAVEGAME_FILE)) {
+        warn!("savegame: autosave periodico fallito: {e}");
+    } else {
+        debug!(
+            "savegame: autosave periodico (pos {:?}, origin {:?}, follower {})",
+               sg.player_pos.map(|p| (p[0], p[2])),
+               sg.origin,
+               sg.followers_external.len()
+               + sg.followers_interior.len()
+               + sg.followers_custom.len()
+        );
+    }
+}
+
+/// F5 = quicksave immediato su `savegame.txt`, senza aprire la finestra F2.
+pub fn quicksave_f5(
+    keys: Res<ButtonInput<KeyCode>>,
+    player: Query<(&Player, &Transform), With<Player>>,
+                    interior: Res<InteriorState>,
+                    origin: Res<Origin>,
+                    followers: Query<(
+                        Entity,
+                        &Follower,
+                        &Transform,
+                        Option<&FollowerWait>,
+                        Option<&CustomNpcName>,
+                    ), Without<Player>>,
+                    mut menu: ResMut<SaveMenuState>,
+) {
+    if !keys.just_pressed(KeyCode::F5) {
+        return;
+    }
+    let sg = build_savegame(&player, &interior, &followers, &origin);
+    match write_savegame_to(&sg, Path::new(SAVEGAME_FILE)) {
+        Ok(()) => {
+            menu.set_ok("Quicksave scritto");
+            info!(
+                "savegame: quicksave F5, pos {:?}, origin {:?}",
+                sg.player_pos.map(|p| (p[0], p[2])),
+                  sg.origin
+            );
+        }
+        Err(e) => {
+            menu.set_err(format!("Quicksave fallito: {e}"));
+            warn!("savegame: quicksave fallito: {e}");
+        }
+    }
 }
 
 // =============================================================================
@@ -816,6 +1001,8 @@ pub fn save_on_exit(
 fn load_savegame_now(
     commands: &mut Commands,
     interior: &mut InteriorState,
+    origin: &mut Origin,
+    height_pending: &mut HeightFixPending,
     player: &mut Query<(&mut Player, &mut Transform), With<Player>>,
                      data: &GameData,
                      mods: &mut ModTextures,
@@ -838,14 +1025,24 @@ fn load_savegame_now(
     interior.recruited_custom.clear();
 
     info!(
-        "savegame: caricato {} ({} ext, {} int, {} custom, {} recruited, in_int={})",
+        "savegame: caricato {} ({} ext, {} int, {} custom, {} recruited, in_int={}, origin={:?})",
           path.display(),
           sg.followers_external.len(),
           sg.followers_interior.len(),
           sg.followers_custom.len(),
           sg.interior_recruited.len(),
-          sg.in_interior
+          sg.in_interior,
+          sg.origin
     );
+
+    // Ripristina l'origine PRIMA di applicare la posizione. `player_pos` è un
+    // offset relativo all'origine: se `rebase_origin` ha cambiato l'origine
+    // nel frattempo, senza questo passaggio il player finirebbe a decine di
+    // map pixel di distanza.
+    if let Some((e, n)) = sg.origin {
+        origin.east = e;
+        origin.north = n;
+    }
 
     for (a, r) in &sg.interior_recruited {
         interior.mark_recruited(*a, *r);
@@ -862,27 +1059,41 @@ fn load_savegame_now(
         Vec3::ZERO
     };
 
-    if !sg.in_interior {
-        if let Ok((mut p, mut tf)) = player.get_single_mut() {
-            if let Some(pos) = sg.player_pos {
-                if pos[1].abs() < PLAUSIBLE_Y_LIMIT {
-                    tf.translation.x = pos[0];
-                    tf.translation.z = pos[2];
-                }
-            }
-            if let Some(f) = sg.player_feet {
-                if f.abs() < PLAUSIBLE_Y_LIMIT {
-                    p.feet_y = f;
-                    p.on_ground = true;
-                    p.vel_y = 0.0;
-                    tf.translation.y = f + EYE_HEIGHT;
-                }
-            }
-            if let Some(y) = sg.player_yaw {
-                p.yaw = y;
+    // Se il save era in interior, applichiamo la posizione esterna di
+    // fallback (`player outside_*`). Il player ricompare davanti all'edificio
+    // e può rientrare con E. Senza questo, resterebbe dov'era prima del load.
+    let (pos_to_apply, feet_to_apply, yaw_to_apply) = if sg.in_interior {
+        (
+            sg.player_outside_pos.or(sg.player_pos),
+         sg.player_outside_feet.or(sg.player_feet),
+         sg.player_outside_yaw.or(sg.player_yaw),
+        )
+    } else {
+        (sg.player_pos, sg.player_feet, sg.player_yaw)
+    };
+
+    if let Ok((mut p, mut tf)) = player.get_single_mut() {
+        if let Some(pos) = pos_to_apply {
+            if pos[1].abs() < PLAUSIBLE_Y_LIMIT {
+                tf.translation.x = pos[0];
+                tf.translation.z = pos[2];
             }
         }
+        if let Some(f) = feet_to_apply {
+            if f.abs() < PLAUSIBLE_Y_LIMIT {
+                p.feet_y = f;
+                p.on_ground = true;
+                p.vel_y = 0.0;
+                tf.translation.y = f + EYE_HEIGHT;
+            }
+        }
+        if let Some(y) = yaw_to_apply {
+            p.yaw = y;
+        }
     }
+
+    // Dopo un load ricalcola sempre l'altezza in base al terreno del pixel.
+    height_pending.0 = true;
 
     let quad = meshes.add(Rectangle::new(1.0, 1.0));
     let mut sprite_cache: HashMap<u16, Option<Arc<NpcSpriteSet>>> = HashMap::new();
@@ -1050,6 +1261,8 @@ pub fn load_on_startup(
     mut commands: Commands,
     mut done: Local<bool>,
     mut interior: ResMut<InteriorState>,
+    mut origin: ResMut<Origin>,
+    mut height_pending: ResMut<HeightFixPending>,
     mut player: Query<(&mut Player, &mut Transform), With<Player>>,
                        data: Res<GameData>,
                        mut mods: ResMut<ModTextures>,
@@ -1069,6 +1282,8 @@ pub fn load_on_startup(
     let _ = load_savegame_now(
         &mut commands,
         &mut interior,
+        &mut origin,
+        &mut height_pending,
         &mut player,
         &data,
         &mut mods,
@@ -1081,13 +1296,16 @@ pub fn load_on_startup(
     );
 }
 
+/// Ricalcola l'altezza del player dopo un load. Prima era `Local<bool>`
+/// (una sola volta); ora è pilotato da `HeightFixPending`, che
+/// `load_savegame_now` setta a `true` ad ogni caricamento (avvio o F2).
 pub fn fix_player_height_after_load(
-    mut done: Local<bool>,
+    mut pending: ResMut<HeightFixPending>,
     field: Res<HeightField>,
     origin: Res<Origin>,
     mut player: Query<(&mut Player, &mut Transform), With<Player>>,
 ) {
-    if *done {
+    if !pending.0 {
         return;
     }
     let Ok((mut p, mut tf)) = player.get_single_mut() else { return };
@@ -1102,7 +1320,7 @@ pub fn fix_player_height_after_load(
         p.on_ground = true;
         tf.translation.y = ground + EYE_HEIGHT;
     }
-    *done = true;
+    pending.0 = false;
 }
 
 // =============================================================================
@@ -1118,9 +1336,6 @@ fn detect_f2_save_menu(
     let esc = keys.just_pressed(KeyCode::Escape);
 
     if menu.open {
-        // Menu aperto: F2 ed Esc chiudono. Esc è utile quando il campo "Nome"
-        // non ha il focus, altrimenti egui lo consuma da solo (per
-        // deselezionare il TextEdit).
         if f2 || esc {
             menu.open = false;
             menu.confirm_delete_path = None;
@@ -1137,9 +1352,6 @@ fn detect_f2_save_menu(
 }
 
 fn suppress_save_menu_keys(mut keys: ResMut<ButtonInput<KeyCode>>) {
-    // F2 e Esc sono gestiti da `detect_f2_save_menu` (che gira prima e li
-    // consuma): qui restano solo i tasti che dialog/player potrebbero
-    // intercettare e che vogliamo bloccare mentre la finestra è aperta.
     for key in [
         KeyCode::KeyE,
         KeyCode::Digit1,
@@ -1148,6 +1360,7 @@ fn suppress_save_menu_keys(mut keys: ResMut<ButtonInput<KeyCode>>) {
         KeyCode::Numpad2,
         KeyCode::KeyA,
         KeyCode::KeyR,
+        KeyCode::F5,
     ] {
         keys.clear_just_pressed(key);
     }
@@ -1220,7 +1433,7 @@ fn save_menu_ui(
     .frame(
         egui::Frame::window(&ctx.style())
         .fill(panel_bg)
-        .stroke(egui::Stroke::new(1.5, red_title))
+        .stroke(egui::Stroke::new(1.5_f32, red_title))
         .inner_margin(egui::Margin::same(14))
         .corner_radius(egui::CornerRadius::same(8)),
     );
@@ -1240,7 +1453,7 @@ fn save_menu_ui(
             .add(
                 egui::Button::new(egui::RichText::new("💾  Sovrascrivi").color(egui::Color32::WHITE).strong())
                 .fill(egui::Color32::from_rgb(50, 130, 70))
-                .stroke(egui::Stroke::new(1.0, leaf)),
+                .stroke(egui::Stroke::new(1.0_f32, leaf)),
             )
             .clicked()
             {
@@ -1269,7 +1482,7 @@ fn save_menu_ui(
                     can_save,
                     egui::Button::new(egui::RichText::new("💾  Salva").color(egui::Color32::WHITE).strong())
                     .fill(egui::Color32::from_rgb(40, 100, 160))
-                    .stroke(egui::Stroke::new(1.0, sky)),
+                    .stroke(egui::Stroke::new(1.0_f32, sky)),
                 );
                 if btn.clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can_save) {
                     clicked_save_named = true;
@@ -1299,7 +1512,7 @@ fn save_menu_ui(
                         };
                         egui::Frame::group(ui.style())
                         .fill(bg)
-                        .stroke(egui::Stroke::new(1.0, amber))
+                        .stroke(egui::Stroke::new(1.0_f32, amber))
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .corner_radius(egui::CornerRadius::same(6))
                         .show(ui, |ui| {
@@ -1317,7 +1530,7 @@ fn save_menu_ui(
                                     !inside,
                                     egui::Button::new(egui::RichText::new("📂  Carica").color(egui::Color32::WHITE).size(12.0))
                                     .fill(egui::Color32::from_rgb(40, 100, 160))
-                                    .stroke(egui::Stroke::new(1.0, sky)),
+                                    .stroke(egui::Stroke::new(1.0_f32, sky)),
                                 );
                                 if load_btn.clicked() {
                                     clicked_load = Some(info.path.clone());
@@ -1332,7 +1545,7 @@ fn save_menu_ui(
                                 let overwrite_btn = ui.add(
                                     egui::Button::new(egui::RichText::new("💾  Sovrascrivi").color(egui::Color32::WHITE).size(12.0))
                                     .fill(egui::Color32::from_rgb(50, 130, 70))
-                                    .stroke(egui::Stroke::new(1.0, leaf)),
+                                    .stroke(egui::Stroke::new(1.0_f32, leaf)),
                                 );
                                 if overwrite_btn.clicked() {
                                     clicked_overwrite = Some(info.path.clone());
@@ -1340,7 +1553,7 @@ fn save_menu_ui(
                                 let del_btn = ui.add(
                                     egui::Button::new(egui::RichText::new("🗑  Elimina").color(egui::Color32::WHITE).size(12.0))
                                     .fill(egui::Color32::from_rgb(140, 45, 40))
-                                    .stroke(egui::Stroke::new(1.0, blood)),
+                                    .stroke(egui::Stroke::new(1.0_f32, blood)),
                                 );
                                 if del_btn.clicked() {
                                     clicked_delete = Some(info.path.clone());
@@ -1375,7 +1588,7 @@ fn save_menu_ui(
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("F2 = chiudi  ·  Esc = chiudi")
+                    egui::RichText::new("F2 = chiudi  ·  Esc = chiudi  ·  F5 = quicksave")
                     .color(faint)
                     .size(11.0),
                 );
@@ -1431,6 +1644,7 @@ fn apply_save_request(
     mut menu: ResMut<SaveMenuState>,
     player: Query<(&Player, &Transform), With<Player>>,
                       interior: Res<InteriorState>,
+                      origin: Res<Origin>,
                       followers: Query<(
                           Entity,
                           &Follower,
@@ -1444,7 +1658,7 @@ fn apply_save_request(
     if !save_auto && save_named.is_none() {
         return;
     }
-    let sg = build_savegame(&player, &interior, &followers);
+    let sg = build_savegame(&player, &interior, &followers, &origin);
     let n = sg.followers_external.len() + sg.followers_interior.len() + sg.followers_custom.len();
 
     if save_auto {
@@ -1481,6 +1695,8 @@ fn apply_load_request(
     mut request: ResMut<SaveLoadRequest>,
     mut menu: ResMut<SaveMenuState>,
     mut interior: ResMut<InteriorState>,
+    mut origin: ResMut<Origin>,
+    mut height_pending: ResMut<HeightFixPending>,
     mut player: Query<(&mut Player, &mut Transform), With<Player>>,
                       data: Res<GameData>,
                       mut mods: ResMut<ModTextures>,
@@ -1499,6 +1715,8 @@ fn apply_load_request(
     match load_savegame_now(
         &mut commands,
         &mut interior,
+        &mut origin,
+        &mut height_pending,
         &mut player,
         &data,
         &mut mods,
@@ -1548,6 +1766,8 @@ impl Plugin for SaveGamePlugin {
         app.init_resource::<SaveDelayed>()
         .init_resource::<SaveMenuState>()
         .init_resource::<SaveLoadRequest>()
+        .init_resource::<AutosaveTimer>()
+        .init_resource::<HeightFixPending>()
         .add_event::<FollowerCommandEvent>()
         .add_systems(
             PreUpdate,
@@ -1570,6 +1790,8 @@ impl Plugin for SaveGamePlugin {
              save_on_interior_change,
              save_after_recruit,
              save_on_exit,
+             autosave_periodic,
+             quicksave_f5,
              apply_save_menu_state
              .after(crate::player::grab_cursor)
              .before(crate::player::player_look),
@@ -1639,5 +1861,58 @@ mod tests {
         assert_eq!(humanize_size(500), "500 B");
         assert_eq!(humanize_size(2048), "2.0 KB");
         assert!(humanize_size(2 * 1024 * 1024).ends_with("MB"));
+    }
+
+    #[test]
+    fn origin_round_trip() {
+        let sg = SaveGame {
+            player_pos: Some([100.0, 50.0, -200.0]),
+            player_yaw: Some(1.2),
+            player_feet: Some(50.0),
+            origin: Some((207, 213)),
+            ..Default::default()
+        };
+        let text = sg.to_text();
+        assert!(text.contains("player origin 207 213"), "{text}");
+        let back = SaveGame::parse(&text);
+        assert_eq!(back.origin, Some((207, 213)));
+        assert_eq!(back.player_pos, Some([100.0, 50.0, -200.0]));
+    }
+
+    #[test]
+    fn old_save_without_origin_still_parses() {
+        let text = "player in_interior 0\nplayer pos 100.000 50.000 -200.000\nplayer yaw 1.2000\nplayer feet 50.000\n";
+        let sg = SaveGame::parse(text);
+        assert_eq!(sg.origin, None);
+        assert_eq!(sg.player_pos, Some([100.0, 50.0, -200.0]));
+    }
+
+    #[test]
+    fn inside_interior_saves_outside_fallback() {
+        let sg = SaveGame {
+            in_interior: true,
+            player_pos: Some([10.0, 6000.0, 20.0]),
+            player_feet: Some(6000.0),
+            origin: Some((207, 213)),
+            player_outside_pos: Some([500.0, 0.0, -700.0]),
+            player_outside_feet: Some(0.0),
+            player_outside_yaw: Some(2.0),
+            ..Default::default()
+        };
+        let text = sg.to_text();
+        assert!(text.contains("player outside_pos 500.000 0.000 -700.000"), "{text}");
+        assert!(text.contains("player outside_yaw 2.0000"), "{text}");
+        assert!(text.contains("player outside_feet 0.000"), "{text}");
+        let back = SaveGame::parse(&text);
+        assert!(back.in_interior);
+        assert_eq!(back.player_outside_pos, Some([500.0, 0.0, -700.0]));
+    }
+
+    #[test]
+    fn old_save_without_outside_fallback_still_parses() {
+        let text = "player in_interior 1\nplayer pos 10.000 6000.000 20.000\n";
+        let sg = SaveGame::parse(text);
+        assert!(sg.in_interior);
+        assert!(sg.player_outside_pos.is_none());
     }
 }

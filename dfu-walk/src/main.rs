@@ -67,6 +67,7 @@ use terrain_material::TerrainMaterial;
 use tiles::*;
 use trees::NaturePool;
 use world::*;
+
 // =============================================================================
 // Bridge Bevy ↔ dfquest
 // =============================================================================
@@ -76,6 +77,29 @@ pub struct QuestLibRes(pub dfquest::Library);
 /// Wrapper `Resource` attorno a `dfquest::QuestStates`.
 #[derive(Resource, Default)]
 pub struct QuestStatesRes(pub dfquest::QuestStates);
+
+// =============================================================================
+// Evento ponte quest_llm → main
+// =============================================================================
+/// Emesso da `quest_llm.rs` (Fase 2 del runtime unificato) quando un nuovo
+/// script QRC/QBN è stato generato dall'LLM e salvato in `quests/generated/`.
+///
+/// `main.rs` reagisce con `reload_quest_library`, che rilegge il file e lo
+/// inserisce nella `Library` già in uso. Da quel momento la quest diventa
+/// attiva nel gioco, esattamente come una quest originale di Daggerfall.
+///
+/// Finché `quest_llm.rs` non emette l'evento, il sistema di reload è inerte
+/// e il gioco funziona come prima.
+#[derive(Event, Debug, Clone)]
+pub struct QuestScriptReadyEvent {
+    /// Id dello script (`Quest: X` nel file, es. `"N0B00Y16"`).
+    pub id: String,
+    /// Percorso completo del file `.txt` salvato.
+    pub path: PathBuf,
+    /// Map pixel della città per cui la quest è stata generata.
+    pub city: (i32, i32),
+}
+
 const USAGE: &str = "uso: dfu-walk <cartella ARENA2> [--mods <cartella>] [--textures <cartella>]
 [--pixel X Y] [--radius N] [--winter] [--hour H] [--day-minutes M] [--outside]";
 const SKY: Color = Color::srgb(0.55, 0.72, 0.92);
@@ -358,6 +382,47 @@ fn find_start(data: &GameData) -> (i32, i32) {
     }
     (cx, cy)
 }
+
+// =============================================================================
+// Ricarica della Library quando arriva un nuovo script QRC/QBN
+// =============================================================================
+/// Sistema di reload della `Library` dei quest.
+///
+/// Emesso da `quest_llm.rs` (Fase 2 del runtime unificato) quando l'LLM produce
+/// uno script QRC/QBN completo e lo salva in `quests/generated/`. Il sistema
+/// rilegge il file, lo parsa con `dfquest::QuestScript::parse`, e lo inserisce
+/// nella `Library` in uso. Da quel momento la quest è attiva nel gioco,
+/// esattamente come una quest originale di Daggerfall.
+///
+/// Finché `quest_llm.rs` non emette `QuestScriptReadyEvent`, il sistema è
+/// inerte: nessun comportamento cambia.
+pub fn reload_quest_library(
+    mut events: EventReader<QuestScriptReadyEvent>,
+    mut lib: ResMut<QuestLibRes>,
+    states: Res<QuestStatesRes>,
+) {
+    for ev in events.read() {
+        match std::fs::read_to_string(&ev.path) {
+            Ok(text) => match dfquest::QuestScript::parse(&text) {
+                Ok(script) => {
+                    let id = script.id.clone();
+                    lib.0.insert(script);
+                    info!(
+                        "Quest: library reloaded with `{id}` from {} (city {:?}, states active: {})",
+                          ev.path.display(),
+                          ev.city,
+                          states.0.active_quests().count(),
+                    );
+                }
+                Err(e) => {
+                    warn!("Quest: parse failed for {}: {e}", ev.path.display());
+                }
+            },
+            Err(e) => warn!("Quest: read failed for {}: {e}", ev.path.display()),
+        }
+    }
+}
+
 // =============================================================================
 // main
 // =============================================================================
@@ -400,6 +465,7 @@ fn main() {
     println!("         G = attiva/disattiva l'erba. ");
     println!("         E / U = entra nel locale o dungeon / esci vicino alla porta (Backspace = esci sempre). ");
     println!("         C = equipaggiamento, Z = arma, X = torcia. ");
+
     // ── dfquest: libreria + stato delle quest ─────────────────────────────
     let (quest_lib, quest_warnings) = dfquest::Library::load_dir(
         std::path::Path::new(dfquest::DEFAULT_QUESTS_DIR),
@@ -407,6 +473,29 @@ fn main() {
     for w in &quest_warnings {
         eprintln!("dfquest: {w}");
     }
+
+    // Fase 2: includi anche gli script generati dall'LLM in `quests/generated/`.
+    // Se la cartella non esiste, `load_dir` restituisce una Library vuota e un
+    // warning: non è un errore, vuol dire che nessuno script è stato generato
+    // finora.
+    let generated_dir = std::path::Path::new("quests/generated");
+    let mut quest_lib = quest_lib;
+    if generated_dir.is_dir() {
+        let (gen_lib, gen_warnings) = dfquest::Library::load_dir(generated_dir);
+        for script in gen_lib.scripts() {
+            info!(
+                "Quest: script generato `{}` ({} messaggi, {} task)",
+                  script.id, script.messages.len(), script.tasks.len()
+            );
+            quest_lib.insert(script.clone());
+        }
+        for w in &gen_warnings {
+            eprintln!("dfquest (generated): {w}");
+        }
+    } else {
+        info!("Quest: nessuna cartella `quests/generated/` (attesa alla Fase 2)");
+    }
+
     println!(
         "dfquest: {} quest script caricati ({} avvisi)",
              quest_lib.len(),
@@ -427,6 +516,7 @@ fn main() {
         quest_states.phase("S0000001"),
              quest_lib.get("N0B00Y16").is_some(),
     );
+
     // ────────────────────────────────────────────────────────────────────────
     App::new()
     .add_plugins(
@@ -472,6 +562,8 @@ fn main() {
     // ── dfquest: risorse lette da `dialog.rs` (wrapper Resource) ──────
     .insert_resource(QuestLibRes(quest_lib))
     .insert_resource(QuestStatesRes(quest_states))
+    // ── evento ponte quest_llm → reload ───────────────────────────────
+    .add_event::<QuestScriptReadyEvent>()
     // ── NPC Custom ────────────────────────────────────────────────────
     .insert_resource(custom_npcs)
     // ────────────────────────────────────────────────────────────────
@@ -539,6 +631,11 @@ fn main() {
         .chain()
         .after(collect_tiles),
     )
+    // ── Gruppo C: ricarica Library degli script generati (Fase 2) ─────
+    // Separato dagli altri gruppi: dipende solo dal fatto che `quest_poll`
+    // (in `quest_llm.rs`) abbia emesso `QuestScriptReadyEvent`. Finché non
+    // succede, il sistema è inerte (nessun evento da leggere).
+    .add_systems(Update, reload_quest_library)
     .run();
 }
 // =============================================================================

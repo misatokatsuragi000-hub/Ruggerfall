@@ -35,6 +35,9 @@
 //! `182_11-0_idle_1.png`, ...). Vengono caricati da `load_flat_idle_frames` e
 //! agganciati al `Follower` con `with_idle`, esattamente come per i custom.
 //! Stessa cosa per il mood: `mood > 0` mostra staticamente `idle[mood]`.
+//! Vale anche la camminata: `<archive>_<record>-0_walk_N.png` (`load_flat_walk_frames`).
+//! I txt degli NPC classici (`classic_npc.rs`, `182_3-0.txt`, ...) possono fissare
+//! `walk_fps` e `idle_fps` come i custom.
 //!
 //! ## Aspect ratio
 //!
@@ -58,7 +61,6 @@ use crate::player::{Player, EYE_HEIGHT};
 use crate::tiles::{climate_of, next_rand};
 use crate::wall_textures::WallTextures;
 use crate::world::*;
-use bevy::math::Affine2;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
@@ -223,6 +225,13 @@ struct Active {
     saved_origin: (i32, i32),
     kind: PoiKind,
     building: String,
+    /// Prefisso a 4 lettere del nome del blocco RMB (es. `"MAGE"`, `"FIGH"`,
+    /// `"THIE"`, `"TEMP"`, ...). Serve a `describe_npc_in` e `classic_npc::resolve`
+    /// (via `crate::quests::guild_name_from_prefix`) per riconoscere che questo
+    /// edificio è la sede di una gilda specifica: un membro della Mages Guild
+    /// deve parlare delle faccende della propria gilda in prima persona, non
+    /// come un estraneo che le ha "sentite dire".
+    block_prefix: String,
 }
 
 #[derive(Resource, Default)]
@@ -237,6 +246,34 @@ impl InteriorState {
     pub fn building(&self) -> Option<String> { self.active.as_ref().map(|a| a.building.clone()) }
     pub fn origin(&self) -> Option<Vec3> { self.active.as_ref().map(|a| a.origin) }
     pub fn kind(&self) -> Option<PoiKind> { self.active.as_ref().map(|a| a.kind) }
+
+    /// Posizione esterna prima di entrare nell'edificio corrente.
+    pub fn outside_pos(&self) -> Option<Vec3> {
+        self.active.as_ref().map(|a| a.saved_translation)
+    }
+
+    /// Quota dei piedi all'esterno prima di entrare nell'edificio corrente.
+    pub fn outside_feet(&self) -> Option<f32> {
+        self.active.as_ref().map(|a| a.saved_feet_y)
+    }
+
+    /// Rotazione (yaw) all'esterno prima di entrare nell'edificio corrente.
+    pub fn outside_yaw(&self) -> Option<f32> {
+        self.active.as_ref().map(|a| a.saved_yaw)
+    }
+
+    /// Prefisso a 4 lettere del nome del blocco RMB corrente: `"MAGE"`,
+    /// `"FIGH"`, `"THIE"`, `"TEMP"`, `"PALA"`, ... `None` se non sei dentro
+    /// un interno.
+    ///
+    /// Usalo con `crate::quests::guild_name_from_prefix` per ottenere il nome
+    /// della gilda (es. `"Mages Guild"`) da passare a `describe_npc_in` e a
+    /// `classic_npc::resolve`: così l'LLM sa che l'NPC è un membro della gilda
+    /// in cui ti trovi, non un estraneo che ne parla per sentito dire.
+    pub fn block_prefix(&self) -> Option<&str> {
+        self.active.as_ref().map(|a| a.block_prefix.as_str())
+    }
+
     pub fn mark_recruited(&mut self, archive: u16, record: u8) { self.recruited.insert((archive, record)); }
     pub fn is_recruited(&self, archive: u16, record: u8) -> bool { self.recruited.contains(&(archive, record)) }
     pub fn mark_recruited_custom(&mut self, name: &str) { self.recruited_custom.insert(name.to_string()); }
@@ -604,6 +641,36 @@ pub fn load_flat_idle_frames(
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
 ) -> Option<(Vec<Handle<StandardMaterial>>, Vec<Vec2>)> {
+    load_flat_frames("idle", archive, record, frame, base_size_px, base_size_m, mods, images, materials)
+}
+
+/// Come `load_flat_idle_frames`, ma per la camminata: `<archive>_<record>-<frame>_walk_<N>.png`
+/// (es. `182_3-0_walk_0.png`). Stessa convenzione dei custom (`npc_ellie_walk_0.png`),
+/// con il nome della texture al posto di `npc_<nome>`.
+pub fn load_flat_walk_frames(
+    archive: u16,
+    record: u8,
+    frame: u16,
+    base_size_px: Vec2,
+    base_size_m: Vec2,
+    mods: &mut ModTextures,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+) -> Option<(Vec<Handle<StandardMaterial>>, Vec<Vec2>)> {
+    load_flat_frames("walk", archive, record, frame, base_size_px, base_size_m, mods, images, materials)
+}
+
+fn load_flat_frames(
+    kind: &str,
+    archive: u16,
+    record: u8,
+    frame: u16,
+    base_size_px: Vec2,
+    base_size_m: Vec2,
+    mods: &mut ModTextures,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+) -> Option<(Vec<Handle<StandardMaterial>>, Vec<Vec2>)> {
     // Prova entrambi i prefissi (padding a 3 cifre e senza).
     let prefixes = [
         format!("{:03}_{}-{}", archive, record, frame),
@@ -613,7 +680,7 @@ pub fn load_flat_idle_frames(
         let mut stems = Vec::new();
         let mut i = 0usize;
         loop {
-            let candidate = format!("{prefix}_idle_{i}");
+            let candidate = format!("{prefix}_{kind}_{i}");
             if mods.has_image(&candidate) {
                 stems.push(candidate);
                 i += 1;
@@ -623,14 +690,14 @@ pub fn load_flat_idle_frames(
         }
         if !stems.is_empty() {
             info!(
-                "flat {}:{}: {} frame idle trovati (prefisso '{}')",
-                  archive, record, stems.len(), prefix
+                "flat {}:{}: {} frame {} trovati (prefisso '{}')",
+                  archive, record, stems.len(), kind, prefix
             );
             // `size_scale = 1.0`: base_size_m è già quello scalato dal chiamante.
             return load_frames_from_stems(
                 &stems,
                 &format!("flat {}:{}", archive, record),
-                                          "idle",
+                                          kind,
                                           base_size_px,
                                           base_size_m,
                                           1.0,
@@ -1009,6 +1076,7 @@ pub fn interior_enter_exit(
         saved_origin: (origin.east, origin.north),
         kind,
         building: building_id,
+        block_prefix: current_prefix.clone(),
         scene,
     };
     p.feet_y = origin_world.y + spawn.y;

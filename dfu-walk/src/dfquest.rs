@@ -1033,7 +1033,7 @@ pub fn knowledge_block(lib: &Library, states: &QuestStates, question: &str, npc_
         return String::new();
     }
     let mut block = String::from(
-        "\nTHINGS YOU HAVE HEARD (common talk: you may repeat or paraphrase it in your own words, but add nothing beyond it):\n",
+        "\nTHINGS YOU HAVE HEARD (common talk: you may repeat or paraphrase it in your own words, but add nothing beyond it; if it is about an organization you belong to, it is your own business: speak first-hand, never as hearsay):\n",
     );
     let mut budget = opts.max_chars;
     for l in lines {

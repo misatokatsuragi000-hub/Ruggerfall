@@ -642,6 +642,14 @@ impl ModTextures {
         None
     }
 
+    /// True se esiste una texture con questo nome: o dentro un `.dfmod`
+    /// (in `by_name`) o come file sciolto in `StreamingAssets/Textures`
+    /// (in `loose_paths`). Non carica né decodifica nulla.
+    pub fn has_image(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.by_name.contains_key(&lower) || self.loose_paths.contains_key(&lower)
+    }
+
     /// Dimensioni in pixel (larghezza, altezza) di una texture 2D della mod, senza caricarla
     /// in `Assets<Image>`. Per i PNG sciolti legge solo l'header del file.
     pub fn size_by_name(&self, name: &str) -> Option<(u32, u32)> {
@@ -660,6 +668,53 @@ impl ModTextures {
     pub fn loose_size(&self, name: &str) -> Option<(u32, u32)> {
         let path = self.loose_paths.get(&name.to_ascii_lowercase())?;
         image::image_dimensions(path).ok()
+    }
+
+    /// Pixel RGBA8 top-down (larghezza, altezza, dati) di una texture di mod gia' caricata.
+    ///
+    /// Ri-decodifica dal container `.dfmod`, perché in `Assets<Image>` la copia CPU può
+    /// non esserci (`RENDER_WORLD`) o essere compressa (BCn). Restituisce `None` se l'handle
+    /// non viene da una mod o se il formato non è supportato.
+    ///
+    /// BC7 (25) e BC7 lineare Unity (108) vengono decodificati on-demand con
+    /// `texture2ddecoder`. DXT1/DXT5/BC4/BC5/BC6H/RGBA32 sono gestiti da
+    /// `Texture2D::to_rgba8_top_down()`.
+    pub fn export_rgba(&self, handle: &Handle<Image>) -> Option<(u32, u32, Vec<u8>)> {
+        let ((idx, name), _srgb) = self
+        .handles
+        .iter()
+        .find(|(_, h)| h.as_ref() == Some(handle))?
+        .0;
+        let tex = self.archives[*idx].texture(name).ok()??;
+        let (w, h) = (tex.width as usize, tex.height as usize);
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        // BC7 (25) e BC7 lineare Unity (108): il decodificatore della crate dfmod non li
+        // gestisce. `texture2ddecoder` li decodifica in BGRA32 (u32), poi convertiamo in
+        // RGBA8 e facciamo il flip verticale per la convenzione top-down del PNG.
+        if tex.format.0 == 25 || tex.format.0 == 108 {
+            let blocks = ((w + 3) / 4) * ((h + 3) / 4);
+            let mip0_size = blocks * 16;
+            let mip0 = tex.data.get(..mip0_size)?;
+            let mut bgra32 = vec![0u32; w * h];
+            texture2ddecoder::decode_bc7(mip0, w, h, &mut bgra32).ok()?;
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for &p in &bgra32 {
+                rgba.extend_from_slice(&[
+                    ((p >> 16) & 0xFF) as u8,
+                                       ((p >> 8) & 0xFF) as u8,
+                                       (p & 0xFF) as u8,
+                                       ((p >> 24) & 0xFF) as u8,
+                ]);
+            }
+            flip_v_in_place(&mut rgba, w, h);
+            return Some((tex.width, tex.height, rgba));
+        }
+
+        let rgba = tex.to_rgba8_top_down().ok()?;
+        Some((tex.width, tex.height, rgba))
     }
 
     /// Cerca un nome che inizia per `prefix` senza caricarlo. Stessa logica di
@@ -1010,5 +1065,22 @@ mod tests {
         let names = albedo_loose_names(&key);
         assert!(names[0] == "381_0-3");
         assert!(names[1] == "381_0-3");
+    }
+
+    #[test]
+    fn has_image_checks_both_sources() {
+        let mut m = ModTextures::default();
+        assert!(!m.has_image("missing_0-0"));
+        m.loose_paths.insert("381_0-0".into(), PathBuf::from("/tmp/x.png"));
+        assert!(m.has_image("381_0-0"));
+        assert!(m.has_image("381_0-0".to_ascii_uppercase().as_str()));
+        assert!(!m.has_image("other"));
+    }
+
+    #[test]
+    fn export_rgba_returns_none_for_unknown_handle() {
+        let m = ModTextures::default();
+        let handle = Handle::<Image>::default();
+        assert!(m.export_rgba(&handle).is_none());
     }
 }

@@ -1,5 +1,14 @@
 //! Infrastruttura LLM: HTTP, gestione llama-server, worker thread, plugin.
 //! Non contiene modelli di dominio: quelli sono in `crate::quests`.
+//!
+//! ## Mood
+//!
+//! Oltre a `text` e `follow`, il prompt chiede al modello un campo `mood`
+//! (0-7) che descrive lo stato emotivo dell'NPC in quel momento. `mood` viene
+//! propagato fino a `dialog.rs` → `FollowerMoodEvent` → `Follower.mood`, dove
+//! `update_followers` lo usa per scegliere il frame idle (0 = ciclo normale,
+//! 1+ = frame statico dedicato). Se il modello non include `mood`, il default
+//! è 0 (neutro) e non cambia nulla rispetto a prima.
 use crate::data::blocks::RmbBlock;
 use crate::data::bsa::BsaArchive;
 use crate::data::flats::FlatCatalog;
@@ -7,11 +16,12 @@ use crate::data::maps::DFLocation;
 use crate::player::Player;
 use crate::quests::{
     build_npc_ask_prompt, build_npc_flavor_prompt, build_npc_voice_prompt, build_rumors_prompt,
-    build_seed_prompt, clean_question, enrich_seed, is_town, jstr, parse_follow, rumors_from_json,
-    theme_for, validate_answer, validate_npc_flavors, validate_rumors, validate_seed, validate_voice,
-    Json, NpcFlavor, Quest, QuestBook, QuestConfig, Seed, VoiceState, MAX_HISTORY_TURNS,
-    MAX_NPC_FLAVORS, CONFIG_FILE, DEFAULT_NPC_ASK_PROMPT, DEFAULT_NPC_FLAVOR_PROMPT,
-    DEFAULT_NPC_VOICE_PROMPT, DEFAULT_RUMORS_PROMPT, DEFAULT_SEED_PROMPT,
+    build_seed_prompt, clean_question, enrich_seed, is_town, jstr, parse_follow, parse_mood,
+    rumors_from_json, theme_for, validate_answer, validate_npc_flavors, validate_rumors,
+    validate_seed, validate_voice, Json, NpcFlavor, Quest, QuestBook, QuestConfig, Seed,
+    VoiceState, MAX_HISTORY_TURNS, MAX_NPC_FLAVORS, CONFIG_FILE, DEFAULT_NPC_ASK_PROMPT,
+    DEFAULT_NPC_FLAVOR_PROMPT, DEFAULT_NPC_VOICE_PROMPT, DEFAULT_RUMORS_PROMPT,
+    DEFAULT_SEED_PROMPT,
 };
 use crate::world::{map_pixel_of, GameData, Origin};
 use bevy::prelude::*;
@@ -524,14 +534,17 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                                           Ok(text.trim_matches('"').trim().to_string())
                                                       }
 
-                                                      /// Genera la risposta a una domanda libera. Ritorna `(testo, follow)`:
-                                                      /// `follow == true` se l'LLM ha deciso che l'NPC segue il giocatore.
-                                                      fn generate_answer(cfg: &QuestConfig, tpl: &Templates, job: &AskJob) -> Result<(String, bool), String> {
+                                                      /// Genera la risposta a una domanda libera.
+                                                      /// Ritorna `(testo, follow, mood)`:
+                                                      /// - `follow == true` se l'LLM ha deciso che l'NPC segue il giocatore;
+                                                      /// - `mood` è lo stato emotivo (0 = neutro, 1+ = frame idle dedicato).
+                                                      fn generate_answer(cfg: &QuestConfig, tpl: &Templates, job: &AskJob) -> Result<(String, bool, u8), String> {
                                                           let prompt = build_npc_ask_prompt(&tpl.ask, &job.city_name, &job.description, &job.question, &job.history);
                                                           let ev = try_json(cfg, &prompt, "NPC_ASK", validate_answer)?;
                                                           let text = ev.get("text").and_then(Json::as_str).unwrap_or(" ").trim();
                                                           let follow = parse_follow(&ev);
-                                                          Ok((text.trim_matches('"').trim().to_string(), follow))
+                                                          let mood = parse_mood(&ev);
+                                                          Ok((text.trim_matches('"').trim().to_string(), follow, mood))
                                                       }
 
                                                       fn append_quest(path: &Path, quest: &Quest) -> std::io::Result<()> {
@@ -560,8 +573,8 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                                           Voice { city: (i32, i32), key: String, text: String },
                                                           VoiceFailed { city: (i32, i32), key: String },
                                                           /// Risposta a una domanda libera. `follow` = true se l'NPC è stato
-                                                          /// convinto a seguire il giocatore.
-                                                          Answer { id: u64, text: String, follow: bool },
+                                                          /// convinto a seguire il giocatore. `mood` = stato emotivo (0-7).
+                                                          Answer { id: u64, text: String, follow: bool, mood: u8 },
                                                           AnswerFailed { id: u64 },
                                                       }
 
@@ -591,10 +604,10 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                                                    fn run_ask(cfg: &QuestConfig, tpl: &Templates, server: &SharedServer, a: &AskJob) -> QuestMsg {
                                                                        let started = Instant::now();
                                                                        match ensure_server(cfg, server).and_then(|_| generate_answer(cfg, tpl, a)) {
-                                                                           Ok((text, follow)) => {
-                                                                               info!("Quest: answer #{} ready in {:?} ({} turns, follow={})",
-                                                                                     a.id, started.elapsed(), a.history.len() / 2, follow);
-                                                                               QuestMsg::Answer { id: a.id, text, follow }
+                                                                           Ok((text, follow, mood)) => {
+                                                                               info!("Quest: answer #{} ready in {:?} ({} turns, follow={}, mood={})",
+                                                                                     a.id, started.elapsed(), a.history.len() / 2, follow, mood);
+                                                                               QuestMsg::Answer { id: a.id, text, follow, mood }
                                                                            }
                                                                            Err(reason) => {
                                                                                warn!("Quest: answer #{}: {reason}", a.id);
@@ -786,7 +799,7 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                                                                }
                                                                                QuestMsg::Voice { city, key, text } => book.store_voice(city, key, text),
                                                                                QuestMsg::VoiceFailed { city, key } => book.fail_voice(city, key),
-                                                                               QuestMsg::Answer { id, text, follow } => book.store_answer(id, text, follow),
+                                                                               QuestMsg::Answer { id, text, follow, mood } => book.store_answer(id, text, follow, mood),
                                                                                QuestMsg::AnswerFailed { id } => book.fail_answer(id),
                                                                            }
                                                                        }

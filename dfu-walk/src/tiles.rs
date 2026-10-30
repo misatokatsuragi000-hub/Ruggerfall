@@ -1,5 +1,30 @@
 //! Caricamento e streaming dei map pixel: terreno, città, vegetazione,
 //! flat esterni (decorazioni) e NPC animati con supporto texture HD (.dfmod).
+//!
+//! ## Mood dei follower
+//!
+//! I follower nati da NPC custom possono cambiare espressione in base allo
+//! stato emotivo (`Follower.mood`): quando `mood > 0`, `update_followers`
+//! mostra staticamente il frame `idle[mood]` (clamped) invece del ciclo
+//! Still/Animated. Quando `mood == 0`, il comportamento è quello di sempre.
+//!
+//! Il mood viene impostato da:
+//! - `Follower::with_mood(..)` al momento del reclutamento (via
+//!   `dialog::apply_recruit` che legge `initial_mood` da `RecruitFollowerEvent`);
+//! - `FollowerMoodEvent` per i follower già attivi quando arriva una nuova
+//!   risposta LLM con mood.
+//!
+//! ## Ciclo idle
+//!
+//! Quando il follower è fermo e `mood == 0`:
+//! - per `IDLE_START_DELAY` secondi resta su `Still` (mostra il primo frame o
+//!   la posa di riposo);
+//! - poi passa in `Animated` e mostra i frame idle uno dopo l'altro, ognuno
+//!   per `IDLE_FRAME_SECONDS`;
+//! - finiti i frame, torna in `Still` per altri `IDLE_START_DELAY` secondi.
+//!
+//! Quando si muove, il ciclo torna in `Still` con timer azzerato, così al
+//! prossimo stop riparte con un'attesa pulita.
 use crate::interior::InteriorState;
 use crate::mod_textures::ModTextures;
 use crate::player::Player;
@@ -33,8 +58,6 @@ const MAX_PENDING: usize = 4;
 const MAX_SPAWNS_PER_FRAME: usize = 2;
 const DEFAULT_CLIMATE: i32 = 231;
 
-/// Flat che in Daggerfall originale sono alberi ma il RMB decodifica come
-/// "lampioni": li sostituiamo con cross-billboard 3D dell'archivio natura.
 const FLAT_IDS_AS_TREES: &[(u16, u8)] = &[(210, 28)];
 
 const PERSON_ARCHIVES: [u16; 24] = [
@@ -71,45 +94,72 @@ pub(crate) const ORIENTATIONS: [(usize, bool); 8] = [
 
 const IDLE_RECORD: u8 = 5;
 const NPC_MAX_FRAMES: usize = 32;
-const NPC_FRAME_SECONDS: f32 = 0.25;
-const NPC_SPEED: f32 = 1.3;
+pub(crate) const NPC_FRAME_SECONDS: f32 = 0.25;
+pub(crate) const NPC_SPEED: f32 = 1.3;
 const NPC_STEP: f32 = 4.0;
-const NPC_IDLE_DISTANCE: f32 = 2.5;
+pub(crate) const NPC_IDLE_DISTANCE: f32 = 2.5;
 const NPC_RANDOM_TURN_CHANCE: f32 = 0.025;
-const NPC_RADIUS: f32 = 0.35;
+pub(crate) const NPC_RADIUS: f32 = 0.35;
 const CARDINALS: [Vec2; 4] = [Vec2::X, Vec2::NEG_X, Vec2::Y, Vec2::NEG_Y];
 
-// --- Follower: costanti di inseguimento ---
-const FOLLOW_STOP: f32 = 1.6;          // sotto questa distanza dal player si ferma
-const FOLLOW_SPEED: f32 = 3.5;         // velocità normale di inseguimento
-const FOLLOW_CATCHUP_DIST: f32 = 7.0;  // oltre questa distanza accelera
-const FOLLOW_CATCHUP_SPEED: f32 = 6.5; // velocità per raggiungere il player
-const FOLLOW_TELEPORT_DIST: f32 = 120.0; // oltre questa distanza, teletrasporta dietro al player
-/// Offset verticale tra la camera del player e il pavimento interno.
-/// La camera è a EYE_HEIGHT sopra i piedi; il follower deve stare sui piedi.
+const FOLLOW_SPEED: f32 = 3.5;
+const FOLLOW_CATCHUP_DIST: f32 = 7.0;
+const FOLLOW_CATCHUP_SPEED: f32 = 6.5;
+const FOLLOW_TELEPORT_DIST: f32 = 120.0;
+const FOLLOW_TELEPORT_DIST_DUNGEON: f32 = 12.0;
+const FOLLOW_ARRIVE_THRESHOLD: f32 = 0.05;
 const EYE_OFFSET: f32 = 1.7;
 
+const FORMATION_LINE_DEPTH: f32 = 1.5;
+const FORMATION_COL_WIDTH: f32 = 0.8;
+const FORMATION_COLS_PER_LINE: u32 = 3;
+const MIN_FOLLOWER_DIST: f32 = 1.4;
+const FORMATION_ROT_SPEED: f32 = 1.5;
+const PLAYER_MOVING_SPEED: f32 = 0.3;
+
+/// Ogni quanti secondi cambia il frame durante l'idle animato. Gli idle degli
+/// NPC custom non sono "animazioni" reali ma pose/espressioni, quindi ogni
+/// frame dura volutamente molto (5s). Il periodo `Animated` termina quando
+/// tutti i frame sono stati mostrati almeno una volta.
+const IDLE_FRAME_SECONDS: f32 = 5.0;
+
+/// Quanti secondi restare in `Still` tra un ciclo `Animated` e il successivo.
+const IDLE_START_DELAY: f32 = 4.0;
+
+fn formation_offset(slot: u32, behind: Vec2, right: Vec2) -> Vec3 {
+    let line = slot / FORMATION_COLS_PER_LINE;
+    let pos_in_line = slot % FORMATION_COLS_PER_LINE;
+    let depth = (line as f32 + 1.0) * FORMATION_LINE_DEPTH;
+    let lateral = match pos_in_line {
+        0 => 0.0,
+        1 => -1.0,
+        2 => 1.0,
+        _ => 0.0,
+    } * FORMATION_COL_WIDTH;
+    Vec3::new(
+        behind.x * depth + right.x * lateral,
+        0.0,
+        behind.y * depth + right.y * lateral,
+    )
+}
+
 pub struct NpcSpriteSet {
-    /// Archivio TEXTURE.nnn di provenienza (per il savegame).
     pub archive: u16,
-    walk: [Vec<Handle<StandardMaterial>>; 5],
-    walk_size: [Vec2; 5],
-    idle: Vec<Handle<StandardMaterial>>,
-    idle_size: Vec2,
+    pub(crate) walk: [Vec<Handle<StandardMaterial>>; 5],
+    pub(crate) walk_size: [Vec2; 5],
+    pub(crate) idle: Vec<Handle<StandardMaterial>>,
+    pub(crate) idle_size: Vec2,
     portrait: Handle<Image>,
     portrait_size: Vec2,
 }
 
 impl NpcSpriteSet {
-    /// Accessor per il savegame: dimensioni del frame walk[0] in metri.
     pub fn walk_size(&self, record: usize) -> Vec2 {
         self.walk_size.get(record).copied().unwrap_or(Vec2::ONE)
     }
-    /// Accessor per il savegame: primo materiale walk[0] (per ricreare la mesh al load).
     pub fn walk_material(&self, record: usize) -> Option<Handle<StandardMaterial>> {
         self.walk.get(record).and_then(|v| v.first().cloned())
     }
-    /// Numero di frame walk per il record dato.
     pub fn walk_frame_count(&self, record: usize) -> usize {
         self.walk.get(record).map(|v| v.len()).unwrap_or(0)
     }
@@ -225,13 +275,13 @@ pub(crate) fn next_rand(state: &mut u64) -> f32 {
     ((*state >> 11) & 0xFF_FFFF) as f32 / 16_777_215.0
 }
 
-fn pick_target(
+pub(crate) fn pick_target(
     pos: Vec2,
     heading: &mut Vec2,
     bounds: (Vec2, Vec2),
-               rng: &mut u64,
-               force_new: bool,
-                   blocked: &dyn Fn(Vec2) -> bool,
+                          rng: &mut u64,
+                          force_new: bool,
+                              blocked: &dyn Fn(Vec2) -> bool,
 ) -> Vec2 {
     let inside = |p: Vec2| {
         p.x >= bounds.0.x && p.x <= bounds.1.x && p.y >= bounds.0.y && p.y <= bounds.1.y
@@ -254,16 +304,16 @@ fn pick_target(
     if free(target) { target } else { pos }
 }
 
-fn npc_blocked(colliders: Option<&Colliders>, samples: &HeightSamples, p: Vec2) -> bool {
+pub(crate) fn npc_blocked(
+    colliders: Option<&Colliders>,
+    samples: &HeightSamples,
+    p: Vec2,
+) -> bool {
     colliders.is_some_and(|c| {
         let ground = terrain_height(samples, p.x / CELL_SIZE, -p.y / CELL_SIZE);
         c.hits(p, ground, NPC_RADIUS + 0.2)
     })
 }
-
-// ---------------------------------------------------------------------------
-// Collisioni statiche
-// ---------------------------------------------------------------------------
 
 const COLLISION_GRID: usize = 64;
 const COLLIDER_MARGIN: f32 = 1.0;
@@ -596,22 +646,18 @@ pub fn probe_world<'a>(
     best
 }
 
-// ---------------------------------------------------------------------------
-// NPC Walker
-// ---------------------------------------------------------------------------
-
 #[derive(Component)]
 pub struct NpcWalker {
-    sprites: Arc<NpcSpriteSet>,
-    heading: Vec2,
-    target: Vec2,
-    frame: usize,
-    frame_timer: f32,
-    shown: Option<(usize, bool, usize)>,
-    rng: u64,
-    bounds: (Vec2, Vec2),
-    samples: Arc<HeightSamples>,
-    colliders: Option<Arc<Colliders>>,
+    pub(crate) sprites: Arc<NpcSpriteSet>,
+    pub(crate) heading: Vec2,
+    pub(crate) target: Vec2,
+    pub(crate) frame: usize,
+    pub(crate) frame_timer: f32,
+    pub(crate) shown: Option<(usize, bool, usize)>,
+    pub(crate) rng: u64,
+    pub(crate) bounds: (Vec2, Vec2),
+    pub(crate) samples: Arc<HeightSamples>,
+    pub(crate) colliders: Option<Arc<Colliders>>,
     face_record: Option<usize>,
 }
 
@@ -622,28 +668,20 @@ impl NpcWalker {
     pub fn portrait(&self) -> (Handle<Image>, Vec2) {
         (self.sprites.portrait.clone(), self.sprites.portrait_size)
     }
-    /// Accessor per il savegame: archivio sprite.
     pub fn sprite_archive(&self) -> u16 {
         self.sprites.archive
     }
-    /// Accessor per il savegame: dimensioni walk[0].
     pub fn size(&self) -> Vec2 {
         self.sprites.walk_size[0]
     }
 }
 
-// ---------------------------------------------------------------------------
-// Follower (NPC reclutato che segue il giocatore)
-// ---------------------------------------------------------------------------
-
-/// Identità di un follower esterno animato (per il savegame).
 #[derive(Clone, Debug)]
 pub struct ExternalFollowerId {
     pub face_record: usize,
     pub sprite_archive: u16,
 }
 
-/// Identità di un follower interno statico (per il savegame).
 #[derive(Clone, Debug)]
 pub struct InteriorFollowerId {
     pub flat_archive: u16,
@@ -652,46 +690,31 @@ pub struct InteriorFollowerId {
     pub size: Vec2,
 }
 
-/// Un NPC reclutato che segue il giocatore.
-///
-/// Tre modalità:
-/// - `sprites = Some(..)` + `moves = true` → **esterno animato**: cammina con
-///   8 direzioni + flip, riusa gli sprite del `NpcWalker`.
-/// - `static_material = Some(..)` + `moves = true` → **interno mobile**: si
-///   muove inseguendo il player ma mostra SEMPRE la stessa immagine (texture
-///   del billboard originale), nessuna camminata.
-/// - `moves = false` → **marker statico** (non usato al momento).
-/// Il compagno aspetta fermo dove si trova (comando "Aspettami qui" del dialogo).
-///
-/// L'attesa e' persistente: resta valida anche se il giocatore entra o esce da
-/// un edificio. Nell'ambiente in cui e' stato dato l'ordine il compagno e' fermo;
-/// altrove e' "congelato" (e nascosto, se l'ordine era dentro un edificio) e
-/// riprende l'attesa quando si torna li':
-/// - ordine dato fuori: resta nella sua posizione esterna (il mondo esterno non
-///   viene ribasato mentre si e' dentro);
-/// - ordine dato dentro un edificio: si ricorda l'edificio e la posizione LOCALE
-///   (l'origine dell'interno cambia a ogni ingresso) e ricompare nello stesso
-///   punto quando si rientra in quell'edificio.
-#[derive(Component)]
-pub struct FollowerWait {
-    /// None = ordine dato all'esterno; Some(id) = dentro quell'edificio.
-    pub building: Option<String>,
-    /// Posizione rispetto all'origine dell'interno (solo se `building` e' Some).
-    pub local: Vec3,
-    /// True finche' `update_followers` non ha registrato dove e' stato dato l'ordine.
-    pub pending: bool,
+#[derive(Clone)]
+pub struct CustomWalkAnim {
+    pub frames: Vec<Handle<StandardMaterial>>,
+    /// Dimensioni in metri di ogni frame (stessa lunghezza di `frames`).
+    /// Calcolate in `interior::load_frames_from_stems` in proporzione
+    /// all'idle base, per preservare l'aspect ratio di ciascun frame.
+    pub sizes: Vec<Vec2>,
+    pub fps: f32,
 }
 
-impl FollowerWait {
-    /// Nuovo ordine: ambiente e posizione si registrano al primo frame.
-    pub fn new() -> Self {
-        Self { building: None, local: Vec3::ZERO, pending: true }
-    }
+#[derive(Clone)]
+pub struct CustomIdleAnim {
+    pub frames: Vec<Handle<StandardMaterial>>,
+    /// Dimensioni in metri di ogni frame (stessa lunghezza di `frames`).
+    pub sizes: Vec<Vec2>,
+    /// Non più usato per la velocità del ciclo: la durata di ogni frame è
+    /// fissata a `IDLE_FRAME_SECONDS`. Il campo resta per compatibilità con
+    /// la struct di `interior.rs` e per eventuali override futuri.
+    pub fps: f32,
+}
 
-    /// Attesa all'esterno gia' registrata (ripristino da savegame).
-    pub fn outside() -> Self {
-        Self { building: None, local: Vec3::ZERO, pending: false }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleCycle {
+    Still,
+    Animated,
 }
 
 #[derive(Component)]
@@ -699,11 +722,18 @@ pub struct Follower {
     sprites: Option<Arc<NpcSpriteSet>>,
     static_material: Option<Handle<StandardMaterial>>,
     static_size: Vec2,
-    /// Se `Some`, questo follower è una copia statica di un NPC interno:
-    /// salva l'identità del flat per ricrearlo al load.
     static_flat_archive: Option<u16>,
     static_flat_record: Option<u8>,
     static_face_record: Option<usize>,
+    custom_walk: Option<CustomWalkAnim>,
+    custom_idle: Option<CustomIdleAnim>,
+    idle_cycle: IdleCycle,
+    idle_timer: f32,
+    idle_rng: u64,
+    /// Stato emotivo corrente (0 = neutro). Vedi `FollowerMoodEvent`.
+    /// Se > 0 e il follower è fermo, il frame idle mostrato è `idle[mood]`
+    /// (clamped) invece del ciclo Still/Animated.
+    mood: u8,
     moves: bool,
     frame: usize,
     frame_timer: f32,
@@ -712,7 +742,6 @@ pub struct Follower {
 }
 
 impl Follower {
-    /// Follower esterno animato: riusa gli sprite già caricati del `NpcWalker`.
     pub fn from_walker(walker: &NpcWalker) -> Self {
         Follower {
             sprites: Some(Arc::clone(&walker.sprites)),
@@ -721,6 +750,12 @@ impl Follower {
             static_flat_archive: None,
             static_flat_record: None,
             static_face_record: None,
+            custom_walk: None,
+            custom_idle: None,
+            idle_cycle: IdleCycle::Still,
+            idle_timer: 0.0,
+            idle_rng: 0,
+            mood: 0,
             moves: true,
             frame: 0,
             frame_timer: 0.0,
@@ -729,9 +764,6 @@ impl Follower {
         }
     }
 
-    /// Copia MOBILE di un NPC interno: usa la texture del flat come immagine
-    /// fissa (un solo materiale), ma si muove seguendo il player.
-    /// Versione senza metadati: usata solo se non hai bisogno del savegame.
     pub fn from_static_mobile(material: Handle<StandardMaterial>, size: Vec2) -> Self {
         Follower {
             sprites: None,
@@ -740,6 +772,12 @@ impl Follower {
             static_flat_archive: None,
             static_flat_record: None,
             static_face_record: None,
+            custom_walk: None,
+            custom_idle: None,
+            idle_cycle: IdleCycle::Still,
+            idle_timer: 0.0,
+            idle_rng: 0,
+            mood: 0,
             moves: true,
             frame: 0,
             frame_timer: 0.0,
@@ -748,7 +786,6 @@ impl Follower {
         }
     }
 
-    /// Copia MOBILE di un NPC interno, con metadati per il savegame.
     pub fn from_static_mobile_full(
         material: Handle<StandardMaterial>,
         size: Vec2,
@@ -763,6 +800,12 @@ impl Follower {
             static_flat_archive: Some(flat_archive),
             static_flat_record: Some(flat_record),
             static_face_record: Some(face_record),
+            custom_walk: None,
+            custom_idle: None,
+            idle_cycle: IdleCycle::Still,
+            idle_timer: 0.0,
+            idle_rng: 0,
+            mood: 0,
             moves: true,
             frame: 0,
             frame_timer: 0.0,
@@ -771,7 +814,6 @@ impl Follower {
         }
     }
 
-    /// Ricrea un follower esterno dai dati salvati.
     pub fn from_saved_external(sprites: Arc<NpcSpriteSet>, face_record: usize) -> Self {
         Follower {
             sprites: Some(sprites),
@@ -780,6 +822,12 @@ impl Follower {
             static_flat_archive: None,
             static_flat_record: None,
             static_face_record: None,
+            custom_walk: None,
+            custom_idle: None,
+            idle_cycle: IdleCycle::Still,
+            idle_timer: 0.0,
+            idle_rng: 0,
+            mood: 0,
             moves: true,
             frame: 0,
             frame_timer: 0.0,
@@ -788,7 +836,47 @@ impl Follower {
         }
     }
 
-    /// Identità per il savegame, se questo è un follower esterno animato.
+    /// Imposta l'animazione camminata (frames, dimensioni per frame, fps).
+    pub fn with_walk(
+        mut self,
+        frames: Vec<Handle<StandardMaterial>>,
+        sizes: Vec<Vec2>,
+        fps: f32,
+    ) -> Self {
+        if !frames.is_empty() && frames.len() == sizes.len() {
+            self.custom_walk = Some(CustomWalkAnim { frames, sizes, fps });
+        }
+        self
+    }
+
+    /// Imposta l'animazione idle (frames, dimensioni per frame, fps).
+    pub fn with_idle(
+        mut self,
+        frames: Vec<Handle<StandardMaterial>>,
+        sizes: Vec<Vec2>,
+        fps: f32,
+    ) -> Self {
+        if !frames.is_empty() && frames.len() == sizes.len() {
+            self.custom_idle = Some(CustomIdleAnim { frames, sizes, fps });
+            self.idle_cycle = IdleCycle::Still;
+            self.idle_timer = 0.0;
+            self.idle_rng = 0;
+        }
+        self
+    }
+
+    /// Imposta lo stato emotivo iniziale (0 = neutro).
+    pub fn with_mood(mut self, mood: u8) -> Self {
+        self.mood = mood;
+        self
+    }
+
+
+    /// Legge lo stato emotivo corrente (0 = neutro).
+    pub fn mood(&self) -> u8 {
+        self.mood
+    }
+
     pub fn external_identity(&self) -> Option<ExternalFollowerId> {
         let sprites = self.sprites.as_ref()?;
         let face = self.face_record?;
@@ -798,13 +886,12 @@ impl Follower {
         })
     }
 
-    /// Identità per il savegame, se questo è un follower interno statico.
     pub fn interior_identity(&self) -> Option<InteriorFollowerId> {
         if !self.moves || self.sprites.is_some() {
             return None;
         }
         let material = self.static_material.as_ref()?;
-        let _ = material; // check di presenza
+        let _ = material;
         Some(InteriorFollowerId {
             flat_archive: self.static_flat_archive?,
             flat_record: self.static_flat_record?,
@@ -813,16 +900,30 @@ impl Follower {
         })
     }
 
-    /// Face record per il dialogo (esterni: dal walker, interni: dal flat).
     pub fn face_record(&self) -> Option<usize> {
         self.face_record.or(self.static_face_record)
     }
 
-    /// Ritratto di ripiego (solo per i follower esterni animati).
     pub fn portrait(&self) -> Option<(Handle<Image>, Vec2)> {
         self.sprites
-            .as_ref()
-            .map(|s| (s.portrait.clone(), s.portrait_size))
+        .as_ref()
+        .map(|s| (s.portrait.clone(), s.portrait_size))
+    }
+}
+
+#[derive(Component)]
+pub struct FollowerWait {
+    pub building: Option<String>,
+    pub local: Vec3,
+    pub pending: bool,
+}
+
+impl FollowerWait {
+    pub fn new() -> Self {
+        Self { building: None, local: Vec3::ZERO, pending: true }
+    }
+    pub fn outside() -> Self {
+        Self { building: None, local: Vec3::ZERO, pending: false }
     }
 }
 
@@ -831,10 +932,6 @@ pub struct TerrainTile {
     pub mx: i32,
     pub my: i32,
 }
-
-// ---------------------------------------------------------------------------
-// Nemici selvatici
-// ---------------------------------------------------------------------------
 
 const ENEMIES_PER_TILE: usize = 4;
 const ENEMY_NOTICE_DISTANCE: f32 = 25.0;
@@ -1236,14 +1333,12 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
 pub fn rebase_origin(
     mut origin: ResMut<Origin>,
     interior: Res<InteriorState>,
+    dungeon: Res<crate::dungeon::DungeonState>,
     mut player: Query<&mut Transform, (With<Player>, Without<TerrainTile>)>,
                      mut tiles: Query<(&TerrainTile, &mut Transform), Without<Player>>,
                      mut followers: Query<&mut Transform, (With<Follower>, Without<Player>, Without<TerrainTile>, Without<Parent>)>,
 ) {
-    // Dentro un edificio il player è in coordinate interne: non ribasiamo il
-    // mondo esterno (altrimenti calcoleremmo un map pixel senza senso e
-    // sposteremmo male tile e follower).
-    if interior.is_inside() {
+    if interior.is_inside() || dungeon.is_inside() {
         return;
     }
     let Ok(mut pt) = player.get_single_mut() else { return };
@@ -1261,7 +1356,6 @@ pub fn rebase_origin(
     for (tile, mut tf) in &mut tiles {
         tf.translation = tile_translation(&origin, tile.mx, tile.my);
     }
-    // I follower sono entità root in coordinate mondo: vanno traslati come i tile.
     for mut ft in &mut followers {
         ft.translation.x -= de as f32 * crate::data::terrain_mesh::MAP_PIXEL_SIZE;
         ft.translation.z += dn as f32 * crate::data::terrain_mesh::MAP_PIXEL_SIZE;
@@ -1442,7 +1536,6 @@ pub fn collect_tiles(
                 }
             });
         }
-        // --- Flat esterni (decorazioni + alberi) ---
         let climate = climate_of(&data, key.0, key.1);
         let tree_archive = crate::trees::nature_archive_for_climate(climate, data.winter);
         nature_pool.get_or_load(
@@ -1521,7 +1614,6 @@ pub fn collect_tiles(
                 ));
             }
         });
-        // --- NPC animati con texture HD (.dfmod) ---
         let mut spawned = 0usize;
         let npc_quad = meshes.add(Rectangle::new(1.0, 1.0));
         for (fx, fz, archive, bounds) in &tile.exterior_npcs {
@@ -1589,7 +1681,6 @@ pub fn collect_tiles(
         if spawned > 0 {
             debug!("  {} NPC animati nel tile ({},{})", spawned, key.0, key.1);
         }
-        // --- Nemici selvatici ---
         let mut enemies_spawned = 0usize;
         for (fx, fz, species) in &tile.exterior_enemies {
             let sp = &ENEMY_SPECIES[*species];
@@ -1683,100 +1774,13 @@ pub(crate) fn orientation_index(heading: Vec2, to_camera: Vec2) -> usize {
     ((angle / std::f32::consts::FRAC_PI_4).round() as i32).rem_euclid(8) as usize
 }
 
-pub fn update_npcs(
-    time: Res<Time>,
-    player: Query<&Transform, (With<Player>, Without<NpcWalker>)>,
-                   mut npcs: Query<(
-                       &mut NpcWalker,
-                       &mut Transform,
-                       &GlobalTransform,
-                       &mut MeshMaterial3d<StandardMaterial>,
-                   ), Without<Follower>>,
-                   mut last_player_pos: Local<Option<Vec3>>,
-) {
-    let real_dt = time.delta_secs();
-    let dt = real_dt.min(0.1);
-    let Ok(player_tf) = player.get_single() else { return };
-    let player_pos = player_tf.translation;
-    let player_still =
-    last_player_pos.is_some_and(|p| p.distance(player_pos) < 0.1 * real_dt.max(1e-4));
-    *last_player_pos = Some(player_pos);
-    let cam_forward = player_tf.forward();
-    let cam_forward_xz = Vec2::new(cam_forward.x, cam_forward.z).normalize_or_zero();
-    let yaw = (cam_forward_xz != Vec2::ZERO).then(|| (-cam_forward_xz.x).atan2(-cam_forward_xz.y));
-    for (mut npc, mut tf, gtf, mut material) in &mut npcs {
-        let npc = &mut *npc;
-        let world = gtf.translation();
-        let to_player = Vec2::new(player_pos.x - world.x, player_pos.z - world.z);
-        let idle = player_still && to_player.length() < NPC_IDLE_DISTANCE;
-        if !idle {
-            let pos = tf.translation.xz();
-            let to_target = npc.target - pos;
-            let step = NPC_SPEED * dt;
-            let mut new_pos = if to_target.length() > step {
-                pos + to_target.normalize() * step
-            } else {
-                npc.target
-            };
-            let mut hit = false;
-            if let Some(c) = npc.colliders.as_deref() {
-                let feet =
-                terrain_height(&npc.samples, new_pos.x / CELL_SIZE, -new_pos.y / CELL_SIZE);
-                let fixed = c.resolve(new_pos, feet, NPC_RADIUS);
-                hit = fixed.distance(new_pos) > 0.01;
-                new_pos = fixed;
-            }
-            tf.translation.x = new_pos.x;
-            tf.translation.z = new_pos.y;
-            if hit || (npc.target - new_pos).length() < 0.1 {
-                let blocked = |p: Vec2| npc_blocked(npc.colliders.as_deref(), &npc.samples, p);
-                npc.target = pick_target(
-                    new_pos,
-                    &mut npc.heading,
-                    npc.bounds,
-                    &mut npc.rng,
-                    hit,
-                    &blocked,
-                );
-            }
-            npc.frame_timer += dt;
-            if npc.frame_timer >= NPC_FRAME_SECONDS {
-                npc.frame_timer -= NPC_FRAME_SECONDS;
-                npc.frame = (npc.frame + 1) % npc.sprites.walk[0].len();
-            }
-        }
-        let (record, flip, frame, handle, size) = if idle {
-            (5, false, 0, &npc.sprites.idle[0], npc.sprites.idle_size)
-        } else {
-            let (record, flip) = ORIENTATIONS[orientation_index(npc.heading, to_player)];
-            let frames = &npc.sprites.walk[record];
-            let frame = npc.frame % frames.len();
-            (record, flip, frame, &frames[frame], npc.sprites.walk_size[record])
-        };
-        if npc.shown != Some((record, flip, frame)) {
-            *material = MeshMaterial3d(handle.clone());
-            npc.shown = Some((record, flip, frame));
-        }
-        tf.scale = Vec3::new(if flip { -size.x } else { size.x }, size.y, 1.0);
-        let gx = (tf.translation.x / CELL_SIZE).clamp(0.0, 128.0);
-        let gy = (-tf.translation.z / CELL_SIZE).clamp(0.0, 128.0);
-        tf.translation.y = terrain_height(&npc.samples, gx, gy) + size.y * 0.5;
-        if let Some(yaw) = yaw {
-            tf.rotation = Quat::from_rotation_y(yaw);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Follower: insegue il giocatore (dentro e fuori)
-// ---------------------------------------------------------------------------
-
 pub fn update_followers(
     mut commands: Commands,
     time: Res<Time>,
     origin: Res<Origin>,
     field: Res<HeightField>,
     interior: Res<InteriorState>,
+    dungeon: Res<crate::dungeon::DungeonState>,
     player: Query<&Transform, (With<Player>, Without<Follower>)>,
                         mut followers: Query<(
                             Entity,
@@ -1786,30 +1790,96 @@ pub fn update_followers(
                             Option<&FollowerWait>,
                             &mut Visibility,
                         )>,
+                        mut last_env: Local<Option<u8>>,
+                        mut formation_forward: Local<Option<Vec2>>,
+                        mut last_player_pos: Local<Option<Vec3>>,
 ) {
     let dt = time.delta_secs().min(0.1);
     let Ok(player_tf) = player.get_single() else { return };
     let player_pos = player_tf.translation;
-    let inside = interior.is_inside();
+    let in_dungeon = dungeon.is_inside();
+    let inside = interior.is_inside() || in_dungeon;
+
+    let env: u8 = if in_dungeon { 2 } else if interior.is_inside() { 1 } else { 0 };
+    let entered_new_env = match *last_env {
+        Some(e) => e != env,
+        None => false,
+    };
+    *last_env = Some(env);
+
+    let move_delta = match *last_player_pos {
+        Some(prev) => Vec2::new(player_pos.x - prev.x, player_pos.z - prev.z),
+        None => Vec2::ZERO,
+    };
+    let player_moving = move_delta.length() / dt.max(1e-4) > PLAYER_MOVING_SPEED;
+    *last_player_pos = Some(player_pos);
 
     let cam_forward = player_tf.forward();
     let cam_forward_xz = Vec2::new(cam_forward.x, cam_forward.z).normalize_or_zero();
     let yaw = (cam_forward_xz != Vec2::ZERO).then(|| (-cam_forward_xz.x).atan2(-cam_forward_xz.y));
-    let behind = if cam_forward_xz != Vec2::ZERO { -cam_forward_xz } else { Vec2::NEG_X };
+
+    let smooth = match (*formation_forward, player_moving) {
+        (None, _) => {
+            if cam_forward_xz != Vec2::ZERO { cam_forward_xz } else { Vec2::NEG_Y }
+        }
+        (Some(prev), false) => prev,
+        (Some(prev), true) if prev != Vec2::ZERO => {
+            let movement_dir = move_delta.normalize_or_zero();
+            if movement_dir == Vec2::ZERO {
+                prev
+            } else {
+                let prev_angle = prev.y.atan2(prev.x);
+                let target_angle = movement_dir.y.atan2(movement_dir.x);
+                let mut delta = target_angle - prev_angle;
+                while delta > std::f32::consts::PI {
+                    delta -= std::f32::consts::TAU;
+                }
+                while delta < -std::f32::consts::PI {
+                    delta += std::f32::consts::TAU;
+                }
+                let step = (dt * FORMATION_ROT_SPEED).min(1.0);
+                let new_angle = prev_angle + delta * step;
+                Vec2::new(new_angle.cos(), new_angle.sin())
+            }
+        }
+        (Some(prev), true) => prev,
+    };
+    *formation_forward = Some(smooth);
+
+    let behind = -smooth;
+    let right = Vec2::new(-smooth.y, smooth.x);
+    let teleport_dist = if in_dungeon { FOLLOW_TELEPORT_DIST_DUNGEON } else { FOLLOW_TELEPORT_DIST };
+
+    let mut active: Vec<(u32, Entity)> = followers
+    .iter()
+    .filter_map(|(e, fol, _, _, wait, _)| {
+        if !fol.moves {
+            return None;
+        }
+        if let Some(w) = wait {
+            if !w.pending {
+                return None;
+            }
+        }
+        Some((e.index(), e))
+    })
+    .collect();
+    active.sort_by_key(|(idx, _)| *idx);
+    let slot_of: HashMap<Entity, u32> = active
+    .into_iter()
+    .enumerate()
+    .map(|(slot, (_, e))| (e, slot as u32))
+    .collect();
 
     for (entity, mut fol, mut tf, mut material, wait, mut visibility) in &mut followers {
         let fol = &mut *fol;
-
-        // Statici (marker interni): non li muoviamo mai, non tocchiamo nulla.
         if !fol.moves {
             continue;
         }
 
-        // Attesa ("Aspettami qui"): persistente tra interni ed esterni.
         let mut waiting = false;
         if let Some(w) = wait {
             if w.pending {
-                // Primo frame dopo l'ordine: registro dove e' stato dato.
                 let (building, local) = match (interior.building(), interior.origin()) {
                     (Some(b), Some(o)) => (Some(b), tf.translation - o),
                     _ => (None, Vec3::ZERO),
@@ -1818,19 +1888,15 @@ pub fn update_followers(
                 waiting = true;
             } else {
                 match (&w.building, interior.building()) {
-                    // ordine dato fuori, siamo fuori: fermo dov'e'
-                    (None, None) => waiting = true,
-                    // ordine dato in questo edificio: ricompare dov'era (l'origine
-                    // dell'interno cambia a ogni ingresso, quindi uso la posizione locale)
+                    (None, None) if !in_dungeon => waiting = true,
                     (Some(id), Some(cur)) if *id == cur => {
                         waiting = true;
                         if let Some(o) = interior.origin() {
                             tf.translation = o + w.local;
                         }
                     }
-                    // altro ambiente: congelato (nascosto se e' dentro un edificio)
                     _ => {
-                        if w.building.is_some() && *visibility != Visibility::Hidden {
+                        if *visibility != Visibility::Hidden {
                             *visibility = Visibility::Hidden;
                         }
                         continue;
@@ -1838,63 +1904,169 @@ pub fn update_followers(
                 }
             }
         }
-        // Visibile quando e' attivo (dopo un periodo congelato in un altro edificio).
         if *visibility == Visibility::Hidden {
             *visibility = Visibility::Inherited;
+        }
+
+        let slot = slot_of.get(&entity).copied().unwrap_or(0);
+        let offset = formation_offset(slot, behind, right);
+        let target = player_pos + offset;
+
+        if entered_new_env && !waiting {
+            tf.translation = target;
+            tf.translation.y = 0.0;
+            fol.shown = None;
         }
 
         let sprites_opt = fol.sprites.clone();
         let sprites = sprites_opt.as_deref();
 
-        let mut pos = Vec2::new(tf.translation.x, tf.translation.z);
-        let mut to_player = Vec2::new(player_pos.x - pos.x, player_pos.z - pos.y);
-        let mut dist = to_player.length();
+        let dist_player = Vec2::new(
+            player_pos.x - tf.translation.x,
+            player_pos.z - tf.translation.z,
+        )
+        .length();
 
-        // Teleport di recupero: cambio edificio / rebase.
-        if !waiting && dist > FOLLOW_TELEPORT_DIST {
-            let newpos = player_pos + Vec3::new(behind.x, 0.0, behind.y) * 1.5;
-            tf.translation = newpos;
+        if !waiting && !entered_new_env && dist_player > teleport_dist {
+            tf.translation = target;
             tf.translation.y = 0.0;
-            pos = Vec2::new(newpos.x, newpos.z);
-            to_player = Vec2::new(player_pos.x - pos.x, player_pos.z - pos.y);
-            dist = to_player.length();
             fol.shown = None;
         }
 
-        // --- Movimento verso il player ---
-        let moving = !waiting && dist > FOLLOW_STOP;
+        let to_target_xz = Vec2::new(
+            target.x - tf.translation.x,
+            target.z - tf.translation.z,
+        );
+        let dist_to_target = to_target_xz.length();
+
+        let arrive_threshold = FOLLOW_ARRIVE_THRESHOLD.max(0.15);
+        let moving = !waiting && dist_to_target > arrive_threshold;
+
         if moving {
-            let dir = to_player / dist.max(0.01);
-            let speed = if dist > FOLLOW_CATCHUP_DIST { FOLLOW_CATCHUP_SPEED } else { FOLLOW_SPEED };
-            let move_dist = (dist - FOLLOW_STOP).min(speed * dt).max(0.0);
-            tf.translation.x += dir.x * move_dist;
-            tf.translation.z += dir.y * move_dist;
+            let dir = to_target_xz / dist_to_target;
+            let speed = if dist_to_target > FOLLOW_CATCHUP_DIST {
+                FOLLOW_CATCHUP_SPEED
+            } else {
+                FOLLOW_SPEED
+            };
+            let step = (speed * dt).min(dist_to_target);
+            tf.translation.x += dir.x * step;
+            tf.translation.z += dir.y * step;
         }
 
-        // --- Animazione frame (solo per sprite animati) ---
-        if moving && sprites.is_some() {
-            let sp = sprites.unwrap();
-            fol.frame_timer += dt;
-            if fol.frame_timer >= NPC_FRAME_SECONDS {
-                fol.frame_timer -= NPC_FRAME_SECONDS;
-                fol.frame = (fol.frame + 1) % sp.walk[0].len();
+        if !waiting {
+            let to_player_xz = Vec2::new(
+                player_pos.x - tf.translation.x,
+                player_pos.z - tf.translation.z,
+            );
+            let dist_now = to_player_xz.length();
+            if dist_now < MIN_FOLLOWER_DIST && dist_now > 1e-3 {
+                let push = to_player_xz / dist_now * (MIN_FOLLOWER_DIST - dist_now);
+                tf.translation.x -= push.x;
+                tf.translation.z -= push.y;
             }
         }
 
-        // --- Rendering ---
-        let heading = if dist > 0.01 { to_player / dist } else { Vec2::X };
-        let feet_half;
+        // --- Ciclo animazioni ---
+        // Mentre si muove: resetta l'idle e azzera il timer (così al prossimo
+        // stop riparte l'attesa pulita).
+        if moving {
+            if matches!(fol.idle_cycle, IdleCycle::Animated) {
+                fol.idle_cycle = IdleCycle::Still;
+                fol.frame = 0;
+                fol.frame_timer = 0.0;
+            }
+            fol.idle_timer = 0.0;
+        }
+
+        // Avanzamento animazione di camminata.
+        if moving {
+            if let Some(sp) = sprites {
+                fol.frame_timer += dt;
+                if fol.frame_timer >= NPC_FRAME_SECONDS {
+                    fol.frame_timer -= NPC_FRAME_SECONDS;
+                    fol.frame = (fol.frame + 1) % sp.walk[0].len().max(1);
+                }
+            } else if let Some(w) = fol.custom_walk.as_ref() {
+                fol.frame_timer += dt;
+                let period = 1.0 / w.fps.max(1.0);
+                while fol.frame_timer >= period {
+                    fol.frame_timer -= period;
+                    fol.frame = (fol.frame + 1) % w.frames.len().max(1);
+                }
+            }
+        }
+
+        // Idle da fermo (solo se mood == 0; se mood > 0 il rendering mostra
+        // staticamente idle[mood] e il timer resta fermo).
+        if !moving && fol.mood == 0 {
+            if matches!(fol.idle_cycle, IdleCycle::Still) {
+                fol.idle_timer += dt;
+                if fol.idle_timer >= IDLE_START_DELAY {
+                    fol.idle_cycle = IdleCycle::Animated;
+                    fol.frame = 0;
+                    fol.frame_timer = 0.0;
+                    fol.idle_timer = 0.0;
+                }
+            } else if matches!(fol.idle_cycle, IdleCycle::Animated) {
+                fol.frame_timer += dt;
+
+                // Frame count e period uniformati a IDLE_FRAME_SECONDS: gli
+                // idle sono pose/espressioni, non animazioni reali.
+                let frame_count = if let Some(sp) = sprites {
+                    sp.idle.len().max(1)
+                } else if let Some(idle) = fol.custom_idle.as_ref() {
+                    idle.frames.len().max(1)
+                } else {
+                    1
+                };
+
+                while fol.frame_timer >= IDLE_FRAME_SECONDS {
+                    fol.frame_timer -= IDLE_FRAME_SECONDS;
+                    fol.frame += 1;
+
+                    if fol.frame >= frame_count {
+                        fol.frame = 0;
+                        fol.idle_cycle = IdleCycle::Still;
+                        fol.idle_timer = 0.0;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let to_player_xz = Vec2::new(
+            player_pos.x - tf.translation.x,
+            player_pos.z - tf.translation.z,
+        );
+        let dist_player_now = to_player_xz.length();
+        let heading = if dist_player_now > 0.01 {
+            to_player_xz / dist_player_now
+        } else {
+            Vec2::X
+        };
+
+        let mut feet_half = 0.0f32;
 
         if let Some(sp) = sprites {
-            // Animato (esterno o copia mobile): 8 direzioni + flip
             let (record, flip, frame, handle, size) = if moving {
-                let (record, flip) = ORIENTATIONS[orientation_index(heading, to_player)];
+                let (record, flip) = ORIENTATIONS[orientation_index(heading, to_player_xz)];
                 let frames = &sp.walk[record];
-                let frame = fol.frame % frames.len();
+                let frame = fol.frame % frames.len().max(1);
                 (record, flip, frame, &frames[frame], sp.walk_size[record])
+            } else if fol.mood > 0 {
+                // Mood su sprite vanilla: usa `idle[mood % len]` (non è
+                // personalizzato per gli NPC flat, ma mantiene coerenza).
+                let idx = (fol.mood as usize) % sp.idle.len().max(1);
+                (5, false, idx, &sp.idle[idx], sp.idle_size)
             } else {
-                (5, false, 0, &sp.idle[0], sp.idle_size)
+                let idle_frame = match fol.idle_cycle {
+                    IdleCycle::Animated => fol.frame % sp.idle.len().max(1),
+                    IdleCycle::Still => 0,
+                };
+                (5, false, idle_frame, &sp.idle[idle_frame], sp.idle_size)
             };
+
             if fol.shown != Some((record, flip, frame)) {
                 *material = MeshMaterial3d(handle.clone());
                 fol.shown = Some((record, flip, frame));
@@ -1902,24 +2074,52 @@ pub fn update_followers(
             tf.scale = Vec3::new(if flip { -size.x } else { size.x }, size.y, 1.0);
             feet_half = size.y;
         } else if let Some(sm) = &fol.static_material {
-            // Immagine fissa (copia mobile di un interno): stesso materiale sempre
-            if fol.shown.is_none() {
-                *material = MeshMaterial3d(sm.clone());
-                fol.shown = Some((0, false, 0));
+            let (handle, frame_key, size) = if moving {
+                if let Some(w) = fol.custom_walk.as_ref() {
+                    let idx = fol.frame % w.frames.len().max(1);
+                    (w.frames[idx].clone(), idx, w.sizes[idx])
+                } else {
+                    (sm.clone(), 0, fol.static_size)
+                }
+            } else if let Some(idle) = fol.custom_idle.as_ref() {
+                if fol.mood > 0 {
+                    // Mood attiva: frame statico `idle[mood]` (clamped).
+                    let idx = (fol.mood as usize).min(idle.frames.len().saturating_sub(1));
+                    (idle.frames[idx].clone(), 20000 + idx, idle.sizes[idx])
+                } else {
+                    match fol.idle_cycle {
+                        IdleCycle::Animated => {
+                            let idx = fol.frame % idle.frames.len().max(1);
+                            (idle.frames[idx].clone(), 10000 + idx, idle.sizes[idx])
+                        }
+                        IdleCycle::Still => {
+                            if let Some(w) = fol.custom_walk.as_ref() {
+                                (w.frames[0].clone(), 0, w.sizes[0])
+                            } else {
+                                (sm.clone(), 0, fol.static_size)
+                            }
+                        }
+                    }
+                }
+            } else if let Some(w) = fol.custom_walk.as_ref() {
+                (w.frames[0].clone(), 0, w.sizes[0])
+            } else {
+                (sm.clone(), 0, fol.static_size)
+            };
+
+            if fol.shown != Some((frame_key, false, 0)) {
+                *material = MeshMaterial3d(handle);
+                fol.shown = Some((frame_key, false, 0));
             }
-            tf.scale = Vec3::new(fol.static_size.x, fol.static_size.y, 1.0);
-            feet_half = fol.static_size.y;
+            tf.scale = Vec3::new(size.x, size.y, 1.0);
+            feet_half = size.y;
         } else {
             continue;
         }
 
-        // --- Altezza ---
         if inside {
-            // Dentro un edificio: non c'è HeightField. Usiamo la Y del player
-            // come riferimento (il pavimento interno è piatto alla quota camera).
             tf.translation.y = player_pos.y - EYE_OFFSET + feet_half * 0.5;
         } else {
-            // Fuori: campiona il terreno dal tile corrente.
             let (mx, my) = map_pixel_of(&origin, tf.translation);
             if let Some(samples) = field.tiles.get(&(mx, my)) {
                 let tile_org = tile_translation(&origin, mx, my);
@@ -1927,8 +2127,6 @@ pub fn update_followers(
                 let gy = (-(tf.translation.z - tile_org.z) / CELL_SIZE).clamp(0.0, 128.0);
                 tf.translation.y = terrain_height(samples, gx, gy) + feet_half * 0.5;
             } else {
-                // Fallback: tile non ancora caricato, usa i piedi del player.
-                // Evita che il follower resti in cielo o sottoterra.
                 tf.translation.y = player_pos.y - EYE_OFFSET + feet_half * 0.5;
             }
         }
@@ -2058,6 +2256,50 @@ pub fn update_enemies(
         tf.translation.y = terrain_height(&e.samples, gx, gy) + size.y * 0.5 + hover;
         if let Some(yaw) = yaw {
             tf.rotation = Quat::from_rotation_y(yaw);
+        }
+    }
+}
+
+// =============================================================================
+// Mood dei follower
+// =============================================================================
+
+/// Evento emesso da `dialog::dialog_menu` quando una risposta LLM contiene una
+/// mood. Il sistema `apply_follower_mood` aggiorna il `Follower` corrispondente.
+#[derive(Event)]
+pub struct FollowerMoodEvent {
+    pub entity: Entity,
+    /// 0 = neutro (ciclo Still/Animated di default), 1+ = frame idle statico.
+    pub mood: u8,
+}
+
+pub struct FollowerMoodPlugin;
+
+impl Plugin for FollowerMoodPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_event::<FollowerMoodEvent>()
+        .add_systems(Update, apply_follower_mood);
+    }
+}
+
+fn apply_follower_mood(
+    mut events: EventReader<FollowerMoodEvent>,
+    mut followers: Query<&mut Follower>,
+) {
+    for ev in events.read() {
+        if let Ok(mut fol) = followers.get_mut(ev.entity) {
+            // Reset del ciclo idle quando il mood cambia: evitiamo che il
+            // timer di Still/Animated riparta con un valore vecchio.
+            if fol.mood != ev.mood {
+                fol.idle_cycle = IdleCycle::Still;
+                fol.idle_timer = 0.0;
+                fol.frame = 0;
+                fol.frame_timer = 0.0;
+            }
+            fol.mood = ev.mood;
+            // Forza il refresh del materiale al prossimo frame.
+            fol.shown = None;
+            info!("FOLLOWER MOOD: {:?} -> {}", ev.entity, ev.mood);
         }
     }
 }

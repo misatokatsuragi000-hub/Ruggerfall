@@ -19,12 +19,15 @@
 mod torch;
 mod data;
 mod equipment;
+mod npc_home;
 mod grass;
+mod npc_anim;
 mod fps_weapon;
 mod dungeon_enemies;
 mod interior;
 mod local_map;
 mod dialog;
+mod classic_npc;
 mod map;
 mod mod_textures;
 mod music;
@@ -439,8 +442,10 @@ fn main() {
     .add_plugins(dialog::DialogPlugin)
     .add_plugins(quest_llm::QuestPlugin)
     .add_plugins(tts::TtsPlugin)
+    .add_plugins(npc_home::NpcHomePlugin)
     .add_plugins(fps_weapon::FpsWeaponPlugin)
     .add_plugins(compass::CompassPlugin)
+    .add_plugins(tiles::FollowerMoodPlugin)
     .add_plugins(vitals::VitalsPlugin)
     .add_plugins(tuning_menu::TuningMenuPlugin)
     .add_plugins(dungeon_enemies::DungeonEnemyPlugin)
@@ -508,7 +513,7 @@ fn main() {
          interior::interior_enter_exit,
          interior::interior_move,
          interior::face_flats,
-         tiles::update_npcs,
+         npc_anim::update_npcs, // 6
          tiles::update_followers, // ← aggiunto
          tiles::update_enemies,
          player::player_move,

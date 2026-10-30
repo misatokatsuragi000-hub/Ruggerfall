@@ -254,6 +254,7 @@ fn apply_menu_state(
     // Menu aperto: forza cursore libero e visibile OGNI frame.
     if menu.open {
         dialog.open = true;
+        dialog.forced_by_menu = true;
         window.cursor_options.grab_mode = CursorGrabMode::None;
         window.cursor_options.visible = true;
         return;
@@ -266,6 +267,7 @@ fn apply_menu_state(
 
     // Era aperto, ora è chiuso: ripristina.
     dialog.open = menu.was_dialog_open_before_menu;
+    dialog.forced_by_menu = false;
     window.cursor_options.grab_mode = CursorGrabMode::Locked;
     window.cursor_options.visible = false;
 }

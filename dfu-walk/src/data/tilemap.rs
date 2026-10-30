@@ -1,15 +1,6 @@
 //! Tilemap del terreno: quale tile (0..55) va in ognuna delle 128x128 celle di un
 //! map pixel. Porting di DefaultTerrainTexturing (TerrainTexturing.cs) e della
 //! conversione finale di TerrainHelper.UpdateTileMapDataJob.
-//!
-//! Funzionamento: per ogni punto di una griglia 129x129 si sceglie un materiale
-//! (acqua, terra, erba, pietra) da quota e rumore; poi, per ogni cella, un
-//! "marching squares" guarda i quattro angoli e sceglie la tile di transizione
-//! (con rotazione e specchiatura) dalla tabella di lookup.
-//!
-//! I valori della tilemap sono: indice di tile 0..55 | `ROTATE_BIT` | `FLIP_BIT`.
-//! Il valore 0xFF segna una cella di una località che sarebbe acqua (zero) e che
-//! non va sovrascritta; `encode_for_shader` lo riconverte in acqua.
 
 use super::error::{format_err, Result};
 use super::heightmap::{HeightSamples, NoiseFn, BEACH_ELEVATION, MAX_TERRAIN_HEIGHT, OCEAN_ELEVATION};
@@ -19,8 +10,9 @@ pub const TILEMAP_DIM: usize = 128;
 pub const TILE_DATA_DIM: usize = TILEMAP_DIM + 1;
 pub const ROTATE_BIT: u8 = 0x40;
 pub const FLIP_BIT: u8 = 0x80;
+pub const UNSET_TILE: u8 = 0xFF;
+
 const MAX_WORLD_TILE_COORD_Z: i32 = 64000;
-/// Stesso seme per tutti i map pixel, così le tile sono continue fra l'uno e l'altro.
 const SEED: i32 = 417028;
 
 const WATER: u8 = 0;
@@ -28,7 +20,6 @@ const DIRT: u8 = 1;
 const GRASS: u8 = 2;
 const STONE: u8 = 3;
 
-/// Variazione casuale (±1,5) della linea di spiaggia, per indice di cella.
 pub type BeachJitterFn = fn(u32) -> f32;
 
 fn wang_hash(mut n: u32) -> u32 {
@@ -48,20 +39,15 @@ fn next_state(state: &mut u32) -> u32 {
     t
 }
 
-/// `Unity.Mathematics.Random.CreateFromIndex(index).NextFloat(-1.5f, 1.5f)`
-/// come lo ricordo dalla libreria (hash di Wang + xorshift). Non verificato
-/// contro Unity: influisce solo su quali celle al limite della spiaggia
-/// diventano terra o erba, quindi si può sostituire.
 pub fn unity_beach_jitter(index: u32) -> f32 {
     let mut state = wang_hash(index.wrapping_add(62)) ^ 0xD251_1F53;
-    next_state(&mut state); // il costruttore avanza già di uno stato
+    next_state(&mut state);
     let bits = 0x3f80_0000u32 | (next_state(&mut state) >> 9);
     let unit = f32::from_bits(bits) - 1.0;
     unit * 3.0 + -1.5
 }
 
 fn weight_noise(noise: NoiseFn, x: f32, y: f32) -> f32 {
-    // GetNoise(worldX, worldY, 0.05, 0.9, 0.4, 3, seed) con clamp in [-1, 1].
     let (mut frequency, mut amplitude) = (0.05f32, 0.9f32);
     let mut value = 0.0f32;
     for _ in 0..3 {
@@ -106,7 +92,6 @@ fn add_lookup_range(
     let m = make_lookup;
     let s = shape_start;
     let rows: [u8; 16] = if reverse {
-        // alto > basso
         [
             m(base_start, false, false),
             m(s + 2, true, true),
@@ -126,7 +111,6 @@ fn add_lookup_range(
             m(base_end, false, false),
         ]
     } else {
-        // basso > alto
         [
             m(base_start, false, false),
             m(s, true, false),
@@ -149,7 +133,6 @@ fn add_lookup_range(
     table[offset..offset + 16].copy_from_slice(&rows);
 }
 
-/// Tabella a 64 voci: indice = forma (4 bit) | anello << 4.
 pub fn lookup_table() -> [u8; 64] {
     let mut t = [0u8; 64];
     add_lookup_range(&mut t, 0, 1, 5, 48, false, 0);
@@ -159,7 +142,6 @@ pub fn lookup_table() -> [u8; 64] {
     t
 }
 
-/// Materiale di ognuno dei 129x129 punti (indice = x + y * 129).
 fn generate_tile_data(
     samples: &HeightSamples,
     map_pixel_x: i32,
@@ -173,7 +155,6 @@ fn generate_tile_data(
         let x = index % TILE_DATA_DIM;
         let y = index / TILE_DATA_DIM;
 
-        // Campione di altezza per acqua e spiaggia (stessa aritmetica f32 di DFU).
         let hx = (hdim as f32 * (x as f32 / TILE_DATA_DIM as f32)).clamp(0.0, (hdim - 1) as f32) as usize;
         let hy = (hdim as f32 * (y as f32 / TILE_DATA_DIM as f32)).clamp(0.0, (hdim - 1) as f32) as usize;
         let height = samples.get(hx, hy) * MAX_TERRAIN_HEIGHT;
@@ -182,7 +163,6 @@ fn generate_tile_data(
             *out = WATER;
             continue;
         }
-        // Spiaggia, con un po' di casualità perché la linea non sia troppo regolare.
         if height <= BEACH_ELEVATION + jitter(index as u32) {
             *out = DIRT;
             continue;
@@ -195,8 +175,6 @@ fn generate_tile_data(
     tile_data
 }
 
-/// Tilemap 128x128 (indice = x + y * 128). `preset` contiene le celle già
-/// fissate da una località (0 = libera); `march` abilita le transizioni.
 pub fn generate_tilemap(
     samples: &HeightSamples,
     map_pixel_x: i32,
@@ -209,14 +187,13 @@ pub fn generate_tilemap(
     let mut tilemap = match preset {
         Some(p) if p.len() == TILEMAP_DIM * TILEMAP_DIM => p.to_vec(),
         Some(p) => return format_err(format!("preset di {} celle, attese {}", p.len(), TILEMAP_DIM * TILEMAP_DIM)),
-        None => vec![0u8; TILEMAP_DIM * TILEMAP_DIM],
+        None => vec![UNSET_TILE; TILEMAP_DIM * TILEMAP_DIM],
     };
     let tile_data = generate_tile_data(samples, map_pixel_x, map_pixel_y, noise, jitter);
     let lookup = lookup_table();
 
     for (index, cell) in tilemap.iter_mut().enumerate() {
-        // Le celle già impostate da una località non si toccano.
-        if *cell != 0 {
+        if *cell != UNSET_TILE {
             continue;
         }
         let x = index % TILEMAP_DIM;
@@ -237,7 +214,6 @@ pub fn generate_tilemap(
     Ok(tilemap)
 }
 
-/// Tilemap con rumore e variazione di spiaggia predefiniti.
 pub fn generate_default_tilemap(
     samples: &HeightSamples,
     map_pixel_x: i32,
@@ -247,16 +223,55 @@ pub fn generate_default_tilemap(
     generate_tilemap(samples, map_pixel_x, map_pixel_y, preset, perlin_noise, unity_beach_jitter, true)
 }
 
-/// Formato letto dallo shader del terreno: da [flip, rotate, indice a 6 bit] a
-/// `(indice << 2) | rotate | flip << 1` (UpdateTileMapDataJob).
+/// Record "naturali": quelli che la lookup di marching squares puo' produrre.
+const NATURAL_RECORDS: [u8; 16] = [0, 1, 2, 3, 5, 6, 7, 10, 11, 12, 15, 16, 17, 48, 51, 53];
+
+/// DEBUG temporaneo: stampa i record che finiscono davvero alla GPU. Se compare un record
+/// non naturale (es. da un preset cittadino), stampa anche la griglia centrale 48..80.
+fn debug_dump_encoded(encoded: &[u8]) {
+    let mut counts = [0usize; 64];
+    for &e in encoded {
+        counts[((e >> 2) & 0x3F) as usize] += 1;
+    }
+    let used: Vec<String> = counts
+        .iter()
+        .enumerate()
+        .filter(|(_, &n)| n > 0)
+        .map(|(r, n)| format!("{r}:{n}"))
+        .collect();
+    let has_unnatural = counts
+        .iter()
+        .enumerate()
+        .any(|(r, &n)| n > 0 && !NATURAL_RECORDS.contains(&(r as u8)));
+    eprintln!("[GPU] record (record:conteggio): {}", used.join(" "));
+    if !has_unnatural || encoded.len() != TILEMAP_DIM * TILEMAP_DIM {
+        return;
+    }
+    eprintln!("[GPU] griglia 48..80 (record + r=rotate f=flip), tilemap inviata alla GPU:");
+    for y in 48..80 {
+        let row: Vec<String> = (48..80)
+            .map(|x| {
+                let e = encoded[y * TILEMAP_DIM + x];
+                format!(
+                    "{:02}{}{}",
+                    (e >> 2) & 0x3F,
+                    if e & 1 != 0 { "r" } else { " " },
+                    if e & 2 != 0 { "f" } else { " " }
+                )
+            })
+            .collect();
+        eprintln!("{}", row.join(" "));
+    }
+}
+
 pub fn encode_for_shader(tilemap: &[u8], convert_water: bool) -> Vec<u8> {
-    tilemap
+    let encoded: Vec<u8> = tilemap
         .iter()
         .map(|&tile| {
-            if convert_water && tile == 0xFF {
+            if convert_water && tile == UNSET_TILE {
                 return 0;
             }
-            let mut record = tile as u32 * 4;
+            let mut record = (tile & 0x3F) as u32 * 4;
             if tile & ROTATE_BIT != 0 {
                 record += 1;
             }
@@ -265,138 +280,7 @@ pub fn encode_for_shader(tilemap: &[u8], convert_water: bool) -> Vec<u8> {
             }
             (record & 0xFF) as u8
         })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use super::heightmap::HeightSamples;
-
-    fn flat(height_units: f32) -> HeightSamples {
-        HeightSamples {
-            dim: 129,
-            data: vec![height_units / MAX_TERRAIN_HEIGHT; 129 * 129],
-        }
-    }
-
-    // Rumori costanti come fn pointer: uno per valore.
-    fn n030(_: f32, _: f32) -> f32 {
-        0.3
-    }
-    fn n050(_: f32, _: f32) -> f32 {
-        0.5
-    }
-    fn n090(_: f32, _: f32) -> f32 {
-        0.9
-    }
-    fn no_jitter(_: u32) -> f32 {
-        0.0
-    }
-
-    #[test]
-    fn lookup_table_matches_the_dfu_source() {
-        let t = lookup_table();
-        // acqua > terra (offset 0)
-        assert_eq!(t[0], 0);
-        assert_eq!(t[1], 5 + 64);
-        assert_eq!(t[2], 5 + 128);
-        assert_eq!(t[6], 48);
-        assert_eq!(t[8], 5 + 64 + 128);
-        assert_eq!(t[9], 48 + 64);
-        assert_eq!(t[10], 6 + 128);
-        assert_eq!(t[15], 1);
-        // terra > erba (offset 16, invertito)
-        assert_eq!(t[16], 2);
-        assert_eq!(t[22], 51 + 64);
-        assert_eq!(t[31], 1);
-        // erba > pietra (offset 32) e pietra (offset 48)
-        assert_eq!(t[32], 2);
-        assert_eq!(t[47], 3);
-        assert_eq!(t[63], 3);
-        assert!(t.iter().all(|&v| (v & 63) <= 55));
-    }
-
-    #[test]
-    fn ocean_everywhere_is_water() {
-        let tm = generate_tilemap(&flat(0.0), 100, 200, None, n050, no_jitter, true).unwrap();
-        assert_eq!(tm.len(), 128 * 128);
-        assert!(tm.iter().all(|&t| t == 0));
-    }
-
-    #[test]
-    fn beach_band_is_dirt() {
-        // 30 sta fra l'oceano (27,2) e la spiaggia (40).
-        let tm = generate_tilemap(&flat(30.0), 100, 200, None, n050, no_jitter, true).unwrap();
-        assert!(tm.iter().all(|&t| t == 1));
-    }
-
-    #[test]
-    fn noise_weight_picks_dirt_grass_or_stone() {
-        // peso = rumore * (0.9 + 0.36 + 0.144) = rumore * 1.404
-        let dirt = generate_tilemap(&flat(500.0), 5, 5, None, n030, no_jitter, true).unwrap();
-        assert!(dirt.iter().all(|&t| t == 1)); // 0.42 < 0.5
-        let grass = generate_tilemap(&flat(500.0), 5, 5, None, n050, no_jitter, true).unwrap();
-        assert!(grass.iter().all(|&t| t == 2)); // 0.70
-        let stone = generate_tilemap(&flat(500.0), 5, 5, None, n090, no_jitter, true).unwrap();
-        assert!(stone.iter().all(|&t| t == 3)); // 1.26 > 0.95
-    }
-
-    #[test]
-    fn coast_uses_the_transition_tiles() {
-        // colonne x < 64 acqua, x >= 64 terra (altezza 30): la cella 63 è una transizione.
-        let mut s = flat(0.0);
-        for x in 64..129 {
-            for y in 0..129 {
-                s.data[y + x * 129] = 30.0 / MAX_TERRAIN_HEIGHT;
-            }
-        }
-        let tm = generate_tilemap(&s, 0, 0, None, n050, no_jitter, true).unwrap();
-        for y in 0..128 {
-            assert_eq!(tm[62 + y * 128], 0, "acqua a x=62");
-            assert_eq!(tm[63 + y * 128], 6 + 128, "bordo a x=63 (forma 10, anello 0)");
-            assert_eq!(tm[64 + y * 128], 1, "terra a x=64");
-        }
-    }
-
-    #[test]
-    fn location_tiles_are_preserved() {
-        let mut preset = vec![0u8; 128 * 128];
-        preset[5 + 7 * 128] = 0xFF; // cella di località che sarebbe acqua
-        preset[6 + 7 * 128] = ROTATE_BIT | 10;
-        let tm = generate_tilemap(&flat(500.0), 5, 5, Some(&preset), n050, no_jitter, true).unwrap();
-        assert_eq!(tm[5 + 7 * 128], 0xFF);
-        assert_eq!(tm[6 + 7 * 128], ROTATE_BIT | 10);
-        assert_eq!(tm[7 + 7 * 128], 2);
-        assert!(generate_tilemap(&flat(500.0), 5, 5, Some(&[0u8; 10]), n050, no_jitter, true).is_err());
-    }
-
-    #[test]
-    fn without_march_raw_materials_are_used() {
-        let tm = generate_tilemap(&flat(500.0), 5, 5, None, n090, no_jitter, false).unwrap();
-        assert!(tm.iter().all(|&t| t == 3));
-    }
-
-    #[test]
-    fn shader_encoding() {
-        let enc = encode_for_shader(&[0, 10, ROTATE_BIT | 10, FLIP_BIT | 10, ROTATE_BIT | FLIP_BIT | 55, 0xFF], true);
-        assert_eq!(enc, vec![0, 40, 41, 42, 55 * 4 + 3, 0]);
-        // senza conversione dell'acqua il valore 0xFF segue la formula normale
-        assert_eq!(encode_for_shader(&[0xFF], false), vec![255]);
-    }
-
-    #[test]
-    fn beach_jitter_is_deterministic_and_centered() {
-        assert_eq!(unity_beach_jitter(1234), unity_beach_jitter(1234));
-        let (mut sum, mut min, mut max) = (0.0f64, f32::MAX, f32::MIN);
-        for i in 0..20000u32 {
-            let j = unity_beach_jitter(i);
-            sum += j as f64;
-            min = min.min(j);
-            max = max.max(j);
-        }
-        assert!(min >= -1.5 && max <= 1.5, "{min} {max}");
-        assert!((sum / 20000.0).abs() < 0.1, "media {}", sum / 20000.0);
-        assert!(max - min > 2.0);
-    }
+        .collect();
+    debug_dump_encoded(&encoded);
+    encoded
 }

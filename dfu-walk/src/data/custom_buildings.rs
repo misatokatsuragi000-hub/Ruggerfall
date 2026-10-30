@@ -4,7 +4,30 @@
 //! - Torre della Gilda dei Maghi (cilindro solido senza forature, portale ad arco su facciata Sud piana).
 //! - Fighters Hall / Maschio dei Guerrieri (torrette, feritoie e portale monumentale).
 //! - Thieves Guild & Hall generica (architettura fortificata con portale ad arco).
-
+//!
+//! ## Finestre arricchite (fix)
+//!
+//! Prima di questa fix, `generate_fighters_hall` e `generate_generic_hall` disegnavano
+//! le finestre come semplici box piatti (un quadrato nero per le feritoie, un quadrato
+//! blu per il vetro). Il risultato era "rozzo": nessuna cornice, nessuna inferriata,
+//! nessun davanzale.
+//!
+//! Ora entrambe usano `push_rich_window`, che disegna:
+//! - cornice in pietra (in `wall`, quindi eredita la stessa texture del muro);
+//! - architrave sporgente in cima e davanzale in fondo;
+//! - vetro blu (in `windows`);
+//! - due inferriate incrociate (in `trim`).
+//!
+//! Ispirata alle finestre del Palazzo Reale (`palace_gen.rs`), che hanno cornice
+//! in pietra, gradiente nel vetro e inferriate incrociate.
+//!
+//! ## Cornicione in pietra (fix)
+//!
+//! La sporgenza a metà del secondo piano era un `push_box(trim, ...)` con colore
+//! fisso marrone scuro (`trim_c`). L'utente la vedeva come "senza texture": era
+//! un blocco di colore uniforme, privo della texture del muro. Ora è in `wall`
+//! (`stone`), quindi eredita la stessa texture del muro circostante (pietra,
+//! mattoni, legno, a seconda dell'edificio).
 use super::arch3d::BuildingTextures;
 use super::building_gen::{BuildingMesh, Footprint, MeshPart, Side};
 use std::f32::consts::{PI, TAU};
@@ -88,6 +111,232 @@ fn push_box(part: &mut MeshPart, a: V3, b: V3, col: [f32; 4], s: f32) {
     ] {
         push_face(part, &[p[f[0]], p[f[1]], p[f[2]], p[f[3]]], col, s, ins);
     }
+}
+
+/// Come `push_box`, ma prende gli 8 corner già calcolati (per box orientati
+/// arbitrariamente). L'ordine dei corner deve essere lo stesso di `push_box`:
+/// `corner[i]` con bit 0 = max u, bit 1 = max v, bit 2 = max n.
+fn push_box_from_corners(part: &mut MeshPart, corners: [V3; 8], color: [f32; 4], s: f32) {
+    let mut ins = [0.0f32; 3];
+    for corner in &corners {
+        for k in 0..3 {
+            ins[k] += corner[k] / 8.0;
+        }
+    }
+    let faces: [[usize; 4]; 6] = [
+        [0, 2, 3, 1],
+        [5, 7, 6, 4],
+        [4, 6, 2, 0],
+        [1, 3, 7, 5],
+        [2, 6, 7, 3],
+        [4, 0, 1, 5],
+    ];
+    for f in faces {
+        push_face(
+            part,
+            &[corners[f[0]], corners[f[1]], corners[f[2]], corners[f[3]]],
+            color,
+            s,
+            ins,
+        );
+    }
+}
+
+/// Normale di un muro: quale asse è "fuori".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WallAxis {
+    /// Muro frontale, la cui normale punta verso -Z (il giocatore vede il muro venendogli incontro).
+    FrontNegZ,
+    /// Muro posteriore, normale +Z.
+    BackPosZ,
+    /// Muro laterale sinistro, normale +X.
+    LeftNegX,
+    /// Muro laterale destro, normale -X.
+    RightPosX,
+}
+
+/// Sistema di coordinate locali a un muro: `u` (orizzontale lungo il muro),
+/// `v` (verticale, sempre su), `n` (normale verso l'esterno del muro).
+struct AxisFrame {
+    u: V3,
+    v: V3,
+    n: V3,
+}
+
+impl AxisFrame {
+    fn from_wall_axis(axis: WallAxis) -> Self {
+        let (u, n) = match axis {
+            WallAxis::FrontNegZ => ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+            WallAxis::BackPosZ => ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            WallAxis::LeftNegX => ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+            WallAxis::RightPosX => ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0]),
+        };
+        Self { u, v: [0.0, 1.0, 0.0], n }
+    }
+
+    fn local_to_world(&self, center: V3, u: f32, v: f32, n: f32) -> V3 {
+        [
+            center[0] + self.u[0] * u + self.v[0] * v + self.n[0] * n,
+            center[1] + self.u[1] * u + self.v[1] * v + self.n[1] * n,
+            center[2] + self.u[2] * u + self.v[2] * v + self.n[2] * n,
+        ]
+    }
+
+    /// Box allineato al muro: (u_min..u_max, v_min..v_max, n_min..n_max)
+    /// rispetto al `center`.
+    fn push_box_local(
+        &self,
+        part: &mut MeshPart,
+        center: V3,
+        u: (f32, f32),
+                      v: (f32, f32),
+                      n: (f32, f32),
+                      color: [f32; 4],
+                      s: f32,
+    ) {
+        let mut corners = [[0.0f32; 3]; 8];
+        for (i, c) in corners.iter_mut().enumerate() {
+            let uu = if i & 1 == 0 { u.0 } else { u.1 };
+            let vv = if i & 2 == 0 { v.0 } else { v.1 };
+            let nn = if i & 4 == 0 { n.0 } else { n.1 };
+            *c = self.local_to_world(center, uu, vv, nn);
+        }
+        push_box_from_corners(part, corners, color, s);
+    }
+}
+
+/// Disegna una finestra "ricca":
+/// - cornice in pietra in `wall` (eredita la texture del muro);
+/// - vetro colorato in `windows`;
+/// - due inferriate incrociate in `trim`.
+///
+/// Ispirata alle finestre del Palazzo Reale: cornice rettangolare, architrave
+/// e davanzale sporgenti, vetro con colore fisso, inferriate quasi nere.
+///
+/// # Parametri
+/// * `center` — punto di ancoraggio sulla superficie esterna del muro
+/// * `axis` — normale del muro (quale direzione è "fuori")
+/// * `width`, `height` — dimensioni del VETRO (la cornice sporge oltre)
+/// * `stone`, `glass`, `iron` — colori dei tre materiali
+pub fn push_rich_window(
+    wall: &mut MeshPart,
+    windows: &mut MeshPart,
+    trim: &mut MeshPart,
+    center: V3,
+    axis: WallAxis,
+    width: f32,
+    height: f32,
+    stone: [f32; 4],
+    glass: [f32; 4],
+    iron: [f32; 4],
+) {
+    let frame = AxisFrame::from_wall_axis(axis);
+    let hw = width * 0.5;
+    let hh = height * 0.5;
+
+    // Parametri del vetro e della cornice.
+    let frame_w = 0.22;
+    let frame_depth = 0.10;
+    let glass_n = 0.02;
+    let glass_depth = 0.02;
+    let wall_scale = 4.0;
+    let glass_scale = 1.0;
+    let iron_scale = 1.0;
+
+    // Vetro (colore fisso, leggermente fuori dal muro per evitare z-fighting).
+    frame.push_box_local(
+        windows,
+        center,
+        (-hw, hw),
+                         (-hh, hh),
+                         (glass_n, glass_n + glass_depth),
+                         glass,
+                         glass_scale,
+    );
+
+    // Cornice in pietra: 4 lati attorno al vetro.
+    frame.push_box_local(
+        wall,
+        center,
+        (-hw - frame_w, -hw),
+                         (-hh - frame_w, hh + frame_w),
+                         (0.0, frame_depth),
+                         stone,
+                         wall_scale,
+    );
+    frame.push_box_local(
+        wall,
+        center,
+        (hw, hw + frame_w),
+                         (-hh - frame_w, hh + frame_w),
+                         (0.0, frame_depth),
+                         stone,
+                         wall_scale,
+    );
+    frame.push_box_local(
+        wall,
+        center,
+        (-hw, hw),
+                         (-hh - frame_w, -hh),
+                         (0.0, frame_depth),
+                         stone,
+                         wall_scale,
+    );
+    frame.push_box_local(
+        wall,
+        center,
+        (-hw, hw),
+                         (hh, hh + frame_w),
+                         (0.0, frame_depth),
+                         stone,
+                         wall_scale,
+    );
+
+    // Architrave in cima (sporge di più, come un piccolo cornicione locale).
+    frame.push_box_local(
+        wall,
+        center,
+        (-hw - frame_w - 0.04, hw + frame_w + 0.04),
+                         (hh + frame_w, hh + frame_w + 0.08),
+                         (0.0, frame_depth + 0.04),
+                         stone,
+                         wall_scale,
+    );
+
+    // Davanzale in fondo (sporge di più, come un piccolo ripiano).
+    frame.push_box_local(
+        wall,
+        center,
+        (-hw - frame_w - 0.04, hw + frame_w + 0.04),
+                         (-hh - frame_w - 0.08, -hh - frame_w),
+                         (0.0, frame_depth + 0.04),
+                         stone,
+                         wall_scale,
+    );
+
+    // Inferriate incrociate: una barra verticale al centro, una orizzontale.
+    let bar_n0 = glass_n + glass_depth;
+    let bar_n1 = bar_n0 + 0.02;
+    let bar_w = 0.04;
+
+    frame.push_box_local(
+        trim,
+        center,
+        (-bar_w * 0.5, bar_w * 0.5),
+                         (-hh, hh),
+                         (bar_n0, bar_n1),
+                         iron,
+                         iron_scale,
+    );
+    frame.push_box_local(
+        trim,
+        center,
+        (-hw, hw),
+                         (-bar_w * 0.5, bar_w * 0.5),
+                         (bar_n0, bar_n1),
+                         iron,
+                         iron_scale,
+    );
 }
 
 fn push_pyr(
@@ -201,9 +450,9 @@ fn push_ring(
             part,
             &[
                 [cx + a0.cos() * r_outer, y1, cz + a0.sin() * r_outer],
-                [cx + a1.cos() * r_outer, y1, cz + a1.sin() * r_outer],
-                [cx + a1.cos() * r_inner, y1, cz + a1.sin() * r_inner],
-                [cx + a0.cos() * r_inner, y1, cz + a0.sin() * r_inner],
+                  [cx + a1.cos() * r_outer, y1, cz + a1.sin() * r_outer],
+                  [cx + a1.cos() * r_inner, y1, cz + a1.sin() * r_inner],
+                  [cx + a0.cos() * r_inner, y1, cz + a0.sin() * r_inner],
             ],
             color,
             s,
@@ -214,9 +463,9 @@ fn push_ring(
             part,
             &[
                 [cx + a0.cos() * r_outer, y0, cz + a0.sin() * r_outer],
-                [cx + a1.cos() * r_outer, y0, cz + a1.sin() * r_outer],
-                [cx + a1.cos() * r_inner, y0, cz + a1.sin() * r_inner],
-                [cx + a0.cos() * r_inner, y0, cz + a0.sin() * r_inner],
+                  [cx + a1.cos() * r_outer, y0, cz + a1.sin() * r_outer],
+                  [cx + a1.cos() * r_inner, y0, cz + a1.sin() * r_inner],
+                  [cx + a0.cos() * r_inner, y0, cz + a0.sin() * r_inner],
             ],
             color,
             s,
@@ -546,7 +795,7 @@ pub fn generate_pagan_temple(fp: &Footprint, btex: BuildingTextures) -> Building
 
     // 2. Cella sacra chiusa (il santuario interno)
     let cella_hw = hw * 0.70;
-    let cella_front = -hd + 5.5; // lascia spazio al pronao con colonnato
+    let cella_front = -hd + 5.5;
     let cella_back = hd - 1.2;
     let y_architrave = total_h * 0.65;
 
@@ -649,7 +898,7 @@ pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMe
 
     let BuildingMesh { parts: [wall, roof, trim, _], doors, windows, .. } = &mut mesh;
 
-    let angle_offset = PI / sides as f32; // 9 gradi: allinea una faccia piana esattamente a Sud (-Z)
+    let angle_offset = PI / sides as f32;
     let door_side_idx = 14usize;
     let wall_front_z = -r * angle_offset.cos();
 
@@ -734,7 +983,9 @@ pub fn generate_fighters_hall(fp: &Footprint, btex: BuildingTextures) -> Buildin
 
     let stone = [1.0, 1.0, 1.0, 1.0];
     let trim_c = [0.25, 0.22, 0.20, 1.0];
-    let iron_grille = [0.10, 0.10, 0.12, 1.0];
+    // Vetro e inferriate delle finestre: colori ereditati dal Palazzo Reale.
+    let guild_glass = [0.10, 0.28, 0.55, 1.0];
+    let guild_iron = [0.03, 0.03, 0.035, 1.0];
 
     let BuildingMesh { parts: [wall, _roof, trim, _], doors, windows, .. } = &mut mesh;
 
@@ -749,7 +1000,15 @@ pub fn generate_fighters_hall(fp: &Footprint, btex: BuildingTextures) -> Buildin
     push_box(wall, [-hw, y_floor, -hd], [hw, y1, hd], stone, 4.0);
     push_box(wall, [-hw, y1, -hd], [hw, y2, hd], stone, 4.0);
 
-    push_box(trim, [-hw - 0.25, y1 - 0.15, -hd - 0.25], [hw + 0.25, y1 + 0.15, hd + 0.25], trim_c, 2.0);
+    // Cornicione in pietra (prima era in `trim` con colore fisso, "senza texture":
+    // ora è in `wall` e eredita la texture del muro).
+    push_box(
+        wall,
+        [-hw - 0.25, y1 - 0.15, -hd - 0.25],
+        [hw + 0.25, y1 + 0.15, hd + 0.25],
+        stone,
+        4.0,
+    );
 
     merlon_row(wall, true, hd, hw, y2, stone);
     merlon_row(wall, true, -hd, hw, y2, stone);
@@ -758,13 +1017,40 @@ pub fn generate_fighters_hall(fp: &Footprint, btex: BuildingTextures) -> Buildin
 
     build_arched_guild_portal(wall, doors, trim, stone, 0.0, -hd, y_floor);
 
+    // Finestre arricchite (piano terra + secondo piano).
     for &wx in &[-hw * 0.6, hw * 0.6] {
-        push_box(windows, [wx - 0.25, y_floor + 1.6, -hd - 0.01], [wx + 0.25, y_floor + 2.6, -hd + 0.02], iron_grille, 1.0);
-        push_box(windows, [wx - 0.25, y1 + 1.2, -hd - 0.01], [wx + 0.25, y1 + 2.4, -hd + 0.02], iron_grille, 1.0);
+        // Fronte (normale -Z)
+        push_rich_window(
+            wall, windows, trim,
+            [wx, y_floor + 1.6, -hd],
+            WallAxis::FrontNegZ,
+            0.5, 1.0,
+            stone, guild_glass, guild_iron,
+        );
+        push_rich_window(
+            wall, windows, trim,
+            [wx, y1 + 1.2, -hd],
+            WallAxis::FrontNegZ,
+            0.5, 1.2,
+            stone, guild_glass, guild_iron,
+        );
     }
     for &wz in &[-hd * 0.5, hd * 0.5] {
-        push_box(windows, [-hw - 0.01, y_floor + 1.6, wz - 0.25], [-hw + 0.02, y_floor + 2.6, wz + 0.25], iron_grille, 1.0);
-        push_box(windows, [hw - 0.01, y_floor + 1.6, wz - 0.25], [hw + 0.02, y_floor + 2.6, wz + 0.25], iron_grille, 1.0);
+        // Lati sinistro/destro (normale ±X)
+        push_rich_window(
+            wall, windows, trim,
+            [-hw, y_floor + 1.6, wz],
+            WallAxis::LeftNegX,
+            0.5, 1.0,
+            stone, guild_glass, guild_iron,
+        );
+        push_rich_window(
+            wall, windows, trim,
+            [hw, y_floor + 1.6, wz],
+            WallAxis::RightPosX,
+            0.5, 1.0,
+            stone, guild_glass, guild_iron,
+        );
     }
 
     let tx = hw;
@@ -789,8 +1075,8 @@ pub fn generate_generic_hall(fp: &Footprint, btex: BuildingTextures) -> Building
     mesh.window_texture = None;
 
     let stone = [1.0, 1.0, 1.0, 1.0];
-    let trim_c = [0.25, 0.22, 0.20, 1.0];
-    let window_glass = [0.10, 0.28, 0.55, 1.0];
+    let guild_glass = [0.10, 0.28, 0.55, 1.0];
+    let guild_iron = [0.03, 0.03, 0.035, 1.0];
 
     let BuildingMesh { parts: [wall, _roof, trim, _], doors, windows, .. } = &mut mesh;
 
@@ -805,16 +1091,37 @@ pub fn generate_generic_hall(fp: &Footprint, btex: BuildingTextures) -> Building
     push_box(wall, [-hw, y_floor, -hd], [hw, y1, hd], stone, 4.0);
     push_box(wall, [-hw, y1, -hd], [hw, y2, hd], stone, 4.0);
 
-    push_box(trim, [-hw - 0.25, y1 - 0.15, -hd - 0.25], [hw + 0.25, y1 + 0.15, hd + 0.25], trim_c, 2.0);
+    // Cornicione in pietra (prima in `trim` con colore fisso).
+    push_box(
+        wall,
+        [-hw - 0.25, y1 - 0.15, -hd - 0.25],
+        [hw + 0.25, y1 + 0.15, hd + 0.25],
+        stone,
+        4.0,
+    );
+
     merlon_row(wall, true, hd, hw, y2, stone);
     merlon_row(wall, true, -hd, hw, y2, stone);
 
     build_arched_guild_portal(wall, doors, trim, stone, 0.0, -hd, y_floor);
 
+    // Finestre arricchite su fronte e retro (prima erano box blu piatti).
     for (fy, fh) in [(y_floor + 1.6, 1.0f32), (y1 + 1.2, 1.2)] {
         for &wx in &[-hw * 0.6, hw * 0.6] {
-            push_box(windows, [wx - 0.4, fy, -hd - 0.01], [wx + 0.4, fy + fh, -hd + 0.02], window_glass, 1.5);
-            push_box(windows, [wx - 0.4, fy, hd - 0.01], [wx + 0.4, fy + fh, hd + 0.02], window_glass, 1.5);
+            push_rich_window(
+                wall, windows, trim,
+                [wx, fy + fh * 0.5, -hd],
+                WallAxis::FrontNegZ,
+                0.8, fh,
+                stone, guild_glass, guild_iron,
+            );
+            push_rich_window(
+                wall, windows, trim,
+                [wx, fy + fh * 0.5, hd],
+                WallAxis::BackPosZ,
+                0.8, fh,
+                stone, guild_glass, guild_iron,
+            );
         }
     }
 

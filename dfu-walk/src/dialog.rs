@@ -27,8 +27,8 @@
 //! ## Reclutamento follower via LLM
 //!
 //! Il giocatore può convincere un NPC a seguirlo tramite la conversazione libera.
-//! L'LLM decide se l'NPC è stato persuaso e risponde `{"text": "...", "follow": true}`.
-//! Il gioco intercetta il flag:
+//! L'LLM decide se l'NPC è stato persuaso e risponde `{"text": "...", "follow": true,
+//! "mood": N}`. Il gioco intercetta i flag:
 //!  - NPC esterno : l'entità `NpcWalker` diventa `Follower` in-place, staccata dal
 //!    chunk (sopravvive allo scarico dei tile) e cammina animata dietro al giocatore.
 //!  - NPC interno : l'entità originale viene despawnata e spawnata una nuova
@@ -38,6 +38,30 @@
 //!    L'NPC viene anche segnato in `InteriorState::recruited`, così al rientro
 //!    nell'edificio non viene ri-spawnato (niente doppie copie).
 //!
+//!    **NPC custom con walk / idle multiframe**: se il `CustomNpcData` ha dei
+//!    `walk_stems` (`npc_<nome>_walk_0.png`, `_1.png`, ...) o `idle_stems`
+//!    (`npc_<nome>_idle_0.png`, `_1.png`, ...), vengono caricati con
+//!    `load_custom_walk_frames` / `load_custom_idle_frames` e agganciati al
+//!    `Follower` con `with_walk` / `with_idle`. Ogni frame conserva il proprio
+//!    aspect ratio: le dimensioni in metri sono calcolate in proporzione all'idle
+//!    base (`base_size_px` = pixel dell'idle, `base_size_m` = metri dell'idle).
+//!
+//!    **NPC flat normali con idle**: anche per i flat vanilla è possibile
+//!    aggiungere `<archive>_<record>-0_idle_N.png` (es. `182_11-0_idle_0.png`)
+//!    accanto all'idle base (`182_11-0.png`). Se presenti, vengono caricati con
+//!    `load_flat_idle_frames` e agganciati al `Follower` con `with_idle`.
+//!    Stessa convenzione dei custom: dimensione a metà dell'idle base.
+//!
+//! ## Mood (stato emotivo)
+//!
+//! Il campo `mood` (0-7) prodotto dall'LLM viene applicato al `Follower` tramite:
+//!  - `RecruitFollowerEvent { entity, initial_mood }` al momento del reclutamento;
+//!  - `FollowerMoodEvent { entity, mood }` per i follower già attivi.
+//!
+//! In entrambi i casi `tiles::update_followers` mostra staticamente il frame
+//! `idle[mood]` (clamped) quando `mood > 0`; con `mood == 0` resta il ciclo
+//! Still/Animated di default. Funziona sia per i custom sia per i flat normali.
+//!
 //! ## Comandi con i follower (durante il dialogo)
 //!
 //! * **W** = "Aspetta qui": aggiunge `FollowerWait::new()`. Il follower resta fermo
@@ -45,23 +69,21 @@
 //!   l'hai lasciato se esci e rientri.
 //! * **F** = "Seguimi": rimuove `FollowerWait`. Il follower riprende a inseguirti.
 //!
-//! Funzionano sia con follower esterni (animati) che interni (immagine fissa).
-//!
 //! ## Fix B0001 (Visibility)
 //!
 //! `DialogRoot` ha `Visibility`. `portrait` ha `ImageNode`, che in Bevy 0.15
-//! richiede `Visibility`. Se un'entità può essere contemporaneamente
-//! `DialogRoot` e `DialogPortrait`, Bevy non riesce a dimostrare che le due
-//! query sono disgiunte e panica con B0001. Per questo `portrait` ha
-//! `Without<DialogRoot>`. Stesso motivo per `followers`: `&GlobalTransform`
-//! non accede a `Visibility`, ma tenerlo disgiunto da `DialogRoot` è
-//! comunque più sicuro e previene futuri conflitti.
+//! richiede `Visibility`. Per questo `portrait` ha `Without<DialogRoot>`. Stesso
+//! motivo per `followers`.
 
+use crate::classic_npc::{self, ClassicNpc};
 use crate::data::city_map::PoiKind;
 use crate::data::flats::FlatCatalog;
 use crate::data::{find_file_ci, Palette};
 use crate::dfquest::{knowledge_block, KnowledgeOptions, Library, QuestStates};
-use crate::interior::{CustomNpcCache, CustomNpcName, InteriorNpc, InteriorState};
+use crate::interior::{
+    load_custom_idle_frames, load_custom_walk_frames, load_flat_idle_frames, CustomNpcCache,
+    CustomNpcName, InteriorNpc, InteriorState,
+};
 use crate::mod_textures::ModTextures;
 use crate::player::Player;
 use crate::quest_llm::QuestWorker;
@@ -69,7 +91,7 @@ use crate::quests::{
     clean_question, describe_npc, face_key, flat_key, temperament_for, tone_for_npc, walker_key,
     walker_look, Hint, QuestBook, Tone, VoiceState, QUESTION_MAX_CHARS,
 };
-use crate::tiles::{Follower, FollowerWait, NpcWalker};
+use crate::tiles::{Follower, FollowerMoodEvent, FollowerWait, NpcWalker};
 use crate::tts::{gender_from_caption, gender_from_look, Gender, SpeakEvent, Speaker};
 use crate::world::{map_pixel_of, GameData, Origin};
 use crate::{QuestLibRes, QuestStatesRes};
@@ -90,14 +112,8 @@ const DIALOG_FONT_SIZE: f32 = 44.0;
 const DIALOG_TEXT_COLOR: Color = Color::srgb(1.0, 0.9, 0.0);
 const DIALOG_BACKGROUND: Color = Color::srgba(0.0, 0.0, 0.0, 0.75);
 const DIALOG_DISTANCE: f32 = 2.4;
-/// Raggio per parlare a un compagno: un po' piu' largo, perche' quando
-/// recupera terreno puo' restare qualche metro indietro.
 const FOLLOWER_DIALOG_DISTANCE: f32 = 3.5;
-/// Per parlare a un compagno bisogna GUARDARLO: coseno dell'angolo massimo
-/// (orizzontale) tra la direzione dello sguardo e il compagno (~30 gradi).
-/// Cosi' E resta libero per porte e ingressi quando si guarda altrove.
 const FOLLOWER_LOOK_DOT: f32 = 0.87;
-/// Sotto questa distanza (m) il controllo dello sguardo e' ignorato.
 const FOLLOWER_LOOK_MIN_DIST: f32 = 0.8;
 const FACE_DISPLAY_SIZE: f32 = 256.0;
 const FACES_FILE: &str = "TFAC00I0.RCI";
@@ -106,15 +122,10 @@ const FACE_PX: usize = 64;
 const FACE_BYTES: usize = FACE_PX * FACE_PX;
 const PORTRAIT_WIDTH: f32 = 260.0;
 const PORTRAIT_CROP: f32 = 0.45;
-// Menu e campo di testo
 const DIALOG_TEXT_MAX_WIDTH: f32 = 760.0;
-/// Altezza minima del box di testo per mostrare almeno 8-9 righe contemporaneamente.
 const DIALOG_TEXT_MIN_HEIGHT: f32 = 280.0;
-/// Altezza massima visibile del testo prima di richiedere lo scroll.
 const DIALOG_TEXT_MAX_HEIGHT: f32 = 360.0;
 const MENU_TEXT: &str = "[1] Ascolta rumori      [E] Congeda";
-/// Menu mostrato quando si parla con un follower: oltre ad ascoltare e congedare,
-/// si può ordinare di aspettare (W) o di seguire (F).
 const MENU_FOLLOWER: &str =
 "[1] Ascolta rumori   [2] Parla   [W] Aspetta qui   [F] Seguimi   [E] Congeda";
 const OFFER_MENU: &str = "[A] Accetta      [R] Rifiuta";
@@ -128,33 +139,27 @@ const INPUT_BG: Color = Color::srgba(0.05, 0.05, 0.08, 0.7);
 const INPUT_BORDER: Color = Color::srgb(0.6, 0.5, 0.2);
 const INPUT_MIN_HEIGHT: f32 = 44.0;
 const RUMOR_FONT: &str = "fonts/Sherwood.ttf";
-// Scroll
 const WHEEL_STEP: f32 = 40.0;
 const SCROLLBAR_WIDTH: f32 = 8.0;
 const SCROLLBAR_MIN_HANDLE: f32 = 30.0;
 const SCRIPTED_QUEST_ID: &str = "N0B00Y16";
-// Messaggio di reclutamento (verde)
 const FOLLOWER_MSG_COLOR: Color = Color::srgb(0.2, 0.95, 0.4);
 const FOLLOWER_MSG: &str = "★ is now following you! ★";
+/// Moltiplicatore dimensionale per gli idle (custom e flat). 1.0 = identico
+/// all'idle base, 0.5 = metà.
+const IDLE_SIZE_SCALE: f32 = 0.5;
 
-// =============================================================================
-// Evento di reclutamento
-// =============================================================================
 #[derive(Event)]
 pub struct RecruitFollowerEvent {
     pub entity: Entity,
+    /// Mood iniziale (0 = neutro), propagato al `Follower` in `apply_recruit`.
+    pub initial_mood: u8,
 }
 
-// =============================================================================
-// Risorse e tipi
-// =============================================================================
-/// Bundle `SystemParam` per raggruppare le due risorse `dfquest` (con wrapper):
-/// riduce il numero di parametri di `update_dialog` sotto il limite di 16 di Bevy.
 #[derive(SystemParam)]
 pub struct QuestResources<'w> {
-    /// Cache degli NPC custom (serve a trovare il ritratto `por_*.png`).
-    /// Sta qui per non superare il limite di 16 parametri dei sistemi.
     pub custom: Res<'w, CustomNpcCache>,
+    pub materials: Res<'w, Assets<StandardMaterial>>,
     pub lib: Res<'w, QuestLibRes>,
     pub states: Res<'w, QuestStatesRes>,
 }
@@ -162,6 +167,11 @@ pub struct QuestResources<'w> {
 #[derive(Resource, Default)]
 pub struct DialogState {
     pub open: bool,
+    /// Se `true`, `open` è attivo solo per bloccare l'input mentre un menu
+    /// egui (F1 tuning / F2 save) è aperto. `dialog_menu` e
+    /// `dialog_input_click` devono ignorarlo per non triggerare reazioni
+    /// (es. W/F follower) su input che appartiene ad altri menu.
+    pub forced_by_menu: bool,
 }
 
 #[derive(Resource, Default)]
@@ -250,9 +260,6 @@ impl FacePortraits {
     }
 }
 
-// =============================================================================
-// Componenti UI
-// =============================================================================
 #[derive(Component)]
 pub struct DialogRoot;
 #[derive(Component)]
@@ -263,18 +270,13 @@ struct DialogOptions;
 struct DialogInput;
 #[derive(Component)]
 struct DialogInputText;
-/// Container scrollabile che ospita `DialogLine`.
 #[derive(Component)]
 struct DialogScroll;
-/// Maniglia visiva della barra di scorrimento.
 #[derive(Component)]
 struct DialogScrollBar;
 #[derive(Component)]
 pub(crate) struct DialogPortrait;
 
-// =============================================================================
-// Offerte scriptate
-// =============================================================================
 #[derive(Clone)]
 pub struct ScriptedOffer {
     pub quest_id: String,
@@ -289,9 +291,6 @@ pub enum ScriptedQuestState {
     Offering,
 }
 
-// =============================================================================
-// Contesto del dialogo
-// =============================================================================
 #[derive(Resource, Default)]
 pub struct DialogContext {
     tone: Tone,
@@ -310,9 +309,7 @@ pub struct DialogContext {
     pub scripted_offer: Option<ScriptedOffer>,
     pub scripted_state: ScriptedQuestState,
     scripted_response: Option<String>,
-    /// Entità dell'NPC con cui si sta parlando (per il reclutamento).
     npc_entity: Option<Entity>,
-    /// True se l'NPC con cui si parla e' gia' un compagno (niente nuovo reclutamento).
     npc_is_follower: bool,
 }
 
@@ -324,7 +321,6 @@ struct NpcVoiceInfo {
     gender: Option<Gender>,
     role: Option<Tone>,
     temperament: &'static str,
-    /// Voce TTS imposta (campo `voice=` del .txt di un NPC custom).
     voice_override: Option<String>,
 }
 
@@ -393,9 +389,6 @@ impl DialogContext {
     }
 }
 
-// =============================================================================
-// Utility testo
-// =============================================================================
 fn ascii_punctuation(text: &str) -> String {
     text.chars()
     .map(|c| match c {
@@ -479,16 +472,14 @@ fn hint_message(book: &QuestBook, city: Option<(i32, i32)>, tone: Tone) -> Strin
 }
 
 /// Formatta la risposta LLM per la visualizzazione.
-fn answer_message(label: &str, result: &Result<(String, bool), ()>) -> String {
+/// Il terzo campo (`mood`) viene ignorato qui: viene gestito separatamente.
+fn answer_message(label: &str, result: &Result<(String, bool, u8), ()>) -> String {
     match result {
-        Ok((text, _)) => format!("{}: \"{}\"", label, ascii_punctuation(text)),
+        Ok((text, _, _)) => format!("{}: \"{}\"", label, ascii_punctuation(text)),
         Err(()) => format!("{label} says nothing."),
     }
 }
 
-// =============================================================================
-// Plugin
-// =============================================================================
 pub struct DialogPlugin;
 impl Plugin for DialogPlugin {
     fn build(&self, app: &mut App) {
@@ -517,9 +508,6 @@ impl Plugin for DialogPlugin {
     }
 }
 
-// =============================================================================
-// Setup UI
-// =============================================================================
 fn setup_dialog_ui(mut commands: Commands, assets: Res<AssetServer>) {
     let font: Handle<Font> = assets.load(DIALOG_FONT);
     commands
@@ -632,19 +620,14 @@ fn setup_dialog_ui(mut commands: Commands, assets: Res<AssetServer>) {
     });
 }
 
-// =============================================================================
-// Chiusura dialogo
-// =============================================================================
 fn close_dialog(state: &mut DialogState, root: &mut Query<&mut Visibility, With<DialogRoot>>) {
     state.open = false;
+    state.forced_by_menu = false;
     for mut visibility in root.iter_mut() {
         *visibility = Visibility::Hidden;
     }
 }
 
-// =============================================================================
-// Scroll
-// =============================================================================
 fn dialog_scroll_wheel(
     state: Res<DialogState>,
     mut wheel: EventReader<MouseWheel>,
@@ -715,9 +698,6 @@ fn dialog_scroll_bar_update(
     *bar_bg = BackgroundColor(Color::srgba(0.85, 0.8, 0.55, 0.7));
 }
 
-// =============================================================================
-// Offerte scriptate
-// =============================================================================
 #[allow(dead_code)]
 fn player_race_label(race: u8) -> &'static str {
     match race % 8 {
@@ -750,9 +730,6 @@ fn find_quest_offer(
     })
 }
 
-// =============================================================================
-// Apertura dialogo (E)
-// =============================================================================
 #[allow(clippy::too_many_arguments)]
 pub fn update_dialog(
     mut keys: ResMut<ButtonInput<KeyCode>>,
@@ -767,11 +744,8 @@ pub fn update_dialog(
     mut ctx: ResMut<DialogContext>,
     player: Query<&Transform, With<Player>>,
     exterior_npcs: Query<(Entity, &NpcWalker, &GlobalTransform), Without<Follower>>,
-                     interior_npcs: Query<(Entity, &InteriorNpc, &GlobalTransform, Option<&CustomNpcName>), Without<Follower>>,
+                     interior_npcs: Query<(Entity, &InteriorNpc, &GlobalTransform, Option<&CustomNpcName>, &MeshMaterial3d<StandardMaterial>), Without<Follower>>,
                      mut root: Query<&mut Visibility, With<DialogRoot>>,
-                     // FIX B0001: `ImageNode` (qui dentro) richiede `Visibility` in
-                     // Bevy 0.15; senza `Without<DialogRoot>` il compilatore non
-                     // riesce a dimostrare che le due query sono disgiunte.
                      mut portrait: Query<
                      (&mut ImageNode, &mut Node),
                      (With<DialogPortrait>, Without<DialogRoot>),
@@ -791,18 +765,17 @@ pub fn update_dialog(
     let Ok(player_tf) = player.get_single() else { return };
     let player_pos = player_tf.translation;
 
-    // --- NPC interni ---
     if interior.is_inside() {
-        let mut nearest_int: Option<(f32, Entity, &InteriorNpc, Option<&CustomNpcName>)> = None;
-        for (entity, npc, gtf, custom_name) in &interior_npcs {
+        let mut nearest_int: Option<(f32, Entity, &InteriorNpc, Option<&CustomNpcName>, &MeshMaterial3d<StandardMaterial>)> = None;
+        for (entity, npc, gtf, custom_name, mat) in &interior_npcs {
             let pos = gtf.translation();
             if (pos.y - player_pos.y).abs() > 4.0 { continue; }
             let distance = Vec2::new(pos.x - player_pos.x, pos.z - player_pos.z).length();
-            if distance <= DIALOG_DISTANCE && nearest_int.map_or(true, |(d, _, _, _)| distance < d) {
-                nearest_int = Some((distance, entity, npc, custom_name));
+            if distance <= DIALOG_DISTANCE && nearest_int.map_or(true, |(d, _, _, _, _)| distance < d) {
+                nearest_int = Some((distance, entity, npc, custom_name, mat));
             }
         }
-        if let Some((_, npc_entity, npc, custom_name_opt)) = nearest_int {
+        if let Some((_, npc_entity, npc, custom_name_opt, npc_mat)) = nearest_int {
             let npc_name = if let Some(custom) = custom_name_opt {
                 custom.name.clone()
             } else {
@@ -883,12 +856,40 @@ pub fn update_dialog(
 
                 let knowledge = knowledge_block(&quests.lib.0, &quests.states.0, "", &key, &KnowledgeOptions::default());
 
+                // NPC classico: nome/descrizione/voce dal file `classic_*.txt`
+                // (creato con i valori automatici la prima volta).
+                let mut who = who;
+                let mut description = description;
+                let mut npc_caption = npc_caption;
+                let mut voice_override = custom_name_opt.and_then(|c| custom_voice(&c.name, &quests.custom));
+                if custom_name_opt.is_none() {
+                    let sprite = quests.materials.get(&npc_mat.0)
+                        .and_then(|m| m.base_color_texture.clone())
+                        .map(|h| { let f = mods.needs_v_flip(&h); (h, f) });
+                    let ov = classic_npc::resolve(&quests.custom.dir, &ClassicNpc {
+                        city,
+                        city_name: &city_name,
+                        key: &key,
+                        label: &who,
+                        description: &description,
+                        place,
+                        sprite,
+                        portrait: Some((face.clone(), is_hd)),
+                    }, &images, &mods);
+                    if let Some(n) = ov.name {
+                        if npc_caption.is_some() { npc_caption = Some(n.clone()); }
+                        who = n;
+                    }
+                    if let Some(d) = ov.description { description = d; }
+                    voice_override = ov.voice;
+                }
+
                 *ctx = DialogContext::new(dialog_key, city, place, npc_flat, npc_caption)
                 .with_voice(key, who, description)
                 .with_speaker(gender, role.map(|_| tone), temperament)
                 .with_city_name(city_name)
                 .with_knowledge(knowledge)
-                .with_voice_override(custom_name_opt.and_then(|c| custom_voice(&c.name, &quests.custom)));
+                .with_voice_override(voice_override);
 
                 ctx.npc_entity = Some(npc_entity);
                 ctx.npc_is_follower = false;
@@ -906,6 +907,7 @@ pub fn update_dialog(
                     node.height = Val::Px(face_size.map_or(FACE_DISPLAY_SIZE, |d| d.y));
                 }
                 state.open = true;
+                state.forced_by_menu = false;
                 for mut visibility in root.iter_mut() { *visibility = Visibility::Visible; }
                 keys.clear_just_pressed(KeyCode::KeyE);
             }
@@ -913,7 +915,6 @@ pub fn update_dialog(
         return;
     }
 
-    // --- NPC esterni ---
     let mut nearest_ext: Option<(f32, Entity, &NpcWalker)> = None;
     for (entity, npc, gtf) in &exterior_npcs {
         let pos = gtf.translation();
@@ -931,17 +932,37 @@ pub fn update_dialog(
     let look = walker_look(face);
     let key = walker_key(face);
     let temperament = temperament_for(&key, city);
-    let description = describe_npc(look, Some(tone.role()), None, temperament);
+    let mut label = format!("{look} ({})", tone.role());
+    let mut description = describe_npc(look, Some(tone.role()), None, temperament);
+    let face_img = npc.face_record().and_then(|r| faces.get(r, &data, &mut mods, &mut images));
+    let sprite = {
+        let (h, _) = npc.portrait();
+        let f = mods.needs_v_flip(&h);
+        Some((h, f))
+    };
+    let ov = classic_npc::resolve(&quests.custom.dir, &ClassicNpc {
+        city,
+        city_name: &city_name,
+        key: &key,
+        label: &label,
+        description: &description,
+        place: None,
+        sprite,
+        portrait: face_img.clone(),
+    }, &images, &mods);
+    if let Some(n) = ov.name { label = n; }
+    if let Some(d) = ov.description { description = d; }
     let knowledge = knowledge_block(&quests.lib.0, &quests.states.0, "", &key, &KnowledgeOptions::default());
     *ctx = DialogContext::new(face as u64, city, None, None, None)
-    .with_voice(key, format!("{look} ({})", tone.role()), description)
+    .with_voice(key, label, description)
     .with_speaker(gender_from_look(look), Some(tone), temperament)
     .with_city_name(city_name)
-    .with_knowledge(knowledge);
+    .with_knowledge(knowledge)
+    .with_voice_override(ov.voice);
     ctx.npc_entity = Some(npc_entity);
     ctx.npc_is_follower = false;
     let (image, crop, width, height, is_hd) =
-    match npc.face_record().and_then(|r| faces.get(r, &data, &mut mods, &mut images)) {
+    match face_img {
         Some((face, is_hd)) => (face, None, FACE_DISPLAY_SIZE, FACE_DISPLAY_SIZE, is_hd),
         None => {
             let (sprite, size) = npc.portrait();
@@ -963,20 +984,11 @@ pub fn update_dialog(
         node.height = Val::Px(height);
     }
     state.open = true;
+    state.forced_by_menu = false;
     for mut visibility in root.iter_mut() { *visibility = Visibility::Visible; }
     keys.clear_just_pressed(KeyCode::KeyE);
 }
 
-// =============================================================================
-// Apertura dialogo con i COMPAGNI (E)
-// =============================================================================
-/// Se il giocatore preme E vicino a un `Follower`, apre il dialogo con lui
-/// (priorita' sugli NPC non reclutati). Identita', chiave LLM, descrizione e
-/// ritratto sono gli stessi che aveva prima del reclutamento, cosi' voce e
-/// personalita' restano coerenti. Funziona dentro e fuori dagli edifici.
-///
-/// Durante il dialogo con un follower, `dialog_menu` abilita anche i comandi
-/// `[W] Aspetta qui` e `[F] Seguimi` (vedi `MENU_FOLLOWER`).
 #[allow(clippy::too_many_arguments)]
 pub fn update_dialog_followers(
     mut keys: ResMut<ButtonInput<KeyCode>>,
@@ -990,16 +1002,11 @@ pub fn update_dialog_followers(
     quests: QuestResources,
     mut ctx: ResMut<DialogContext>,
     player: Query<&Transform, With<Player>>,
-    // FIX B0001: `Without<DialogRoot>` rende questa query disgiunta da
-    // `root: Query<&mut Visibility, With<DialogRoot>>` più sotto.
     followers: Query<
     (Entity, &Follower, &GlobalTransform, Option<&CustomNpcName>),
                                Without<DialogRoot>,
                                >,
                                mut root: Query<&mut Visibility, With<DialogRoot>>,
-                               // FIX B0001: `ImageNode` (qui dentro) richiede `Visibility` in Bevy 0.15;
-                               // senza `Without<DialogRoot>` il compilatore non riesce a dimostrare
-                               // che le due query sono disgiunte.
                                mut portrait: Query<
                                (&mut ImageNode, &mut Node),
                                (With<DialogPortrait>, Without<DialogRoot>),
@@ -1030,7 +1037,6 @@ pub fn update_dialog_followers(
     let city = map_pixel_of(&origin, player_pos);
     let city_name = data.locations.get(&city).map(|l| l.name.clone()).unwrap_or_default();
 
-    // ---- Compagno nato da un NPC interno (billboard statico) ----
     if let Some(id) = fol.interior_identity() {
         let custom_por = custom
         .and_then(|c| custom_portrait(&c.name, &quests.custom, &mut mods, &mut images));
@@ -1071,12 +1077,38 @@ pub fn update_dialog_followers(
             .or_else(|| npc_caption.as_deref().and_then(gender_from_caption))
         };
         let knowledge = knowledge_block(&quests.lib.0, &quests.states.0, "", &key, &KnowledgeOptions::default());
+
+        // NPC classico: nome/descrizione/voce dal file `classic_*.txt`.
+        let mut who = who;
+        let mut description = description;
+        let mut npc_caption = npc_caption;
+        let mut voice_override = custom.and_then(|c| custom_voice(&c.name, &quests.custom));
+        if custom.is_none() {
+            let sprite = fol.portrait().map(|(h, _)| { let f = mods.needs_v_flip(&h); (h, f) });
+            let ov = classic_npc::resolve(&quests.custom.dir, &ClassicNpc {
+                city,
+                city_name: &city_name,
+                key: &key,
+                label: &who,
+                description: &description,
+                place,
+                sprite,
+                portrait: Some((face.clone(), is_hd)),
+            }, &images, &mods);
+            if let Some(n) = ov.name {
+                if npc_caption.is_some() { npc_caption = Some(n.clone()); }
+                who = n;
+            }
+            if let Some(d) = ov.description { description = d; }
+            voice_override = ov.voice;
+        }
+
         *ctx = DialogContext::new(dialog_key, city, place, npc_flat, npc_caption)
         .with_voice(key, who, description)
         .with_speaker(gender, role.map(|_| tone), temperament)
         .with_city_name(city_name)
         .with_knowledge(knowledge)
-        .with_voice_override(custom.and_then(|c| custom_voice(&c.name, &quests.custom)));
+        .with_voice_override(voice_override);
         if let Ok((mut image_node, mut node)) = portrait.get_single_mut() {
             image_node.image = face;
             image_node.rect = None;
@@ -1085,21 +1117,36 @@ pub fn update_dialog_followers(
             node.height = Val::Px(face_size.map_or(FACE_DISPLAY_SIZE, |d| d.y));
         }
     } else {
-        // ---- Compagno nato da un NpcWalker esterno (animato) ----
         let face = fol.face_record().unwrap_or(0);
         let tone = tone_for_npc(face as u64, city, None);
         let look = walker_look(face);
         let key = walker_key(face);
         let temperament = temperament_for(&key, city);
-        let description = describe_npc(look, Some(tone.role()), None, temperament);
+        let mut label = format!("{look} ({})", tone.role());
+        let mut description = describe_npc(look, Some(tone.role()), None, temperament);
+        let face_img = fol.face_record().and_then(|r| faces.get(r, &data, &mut mods, &mut images));
+        let sprite = fol.portrait().map(|(h, _)| { let f = mods.needs_v_flip(&h); (h, f) });
+        let ov = classic_npc::resolve(&quests.custom.dir, &ClassicNpc {
+            city,
+            city_name: &city_name,
+            key: &key,
+            label: &label,
+            description: &description,
+            place: None,
+            sprite,
+            portrait: face_img.clone(),
+        }, &images, &mods);
+        if let Some(n) = ov.name { label = n; }
+        if let Some(d) = ov.description { description = d; }
         let knowledge = knowledge_block(&quests.lib.0, &quests.states.0, "", &key, &KnowledgeOptions::default());
         *ctx = DialogContext::new(face as u64, city, None, None, None)
-        .with_voice(key, format!("{look} ({})", tone.role()), description)
+        .with_voice(key, label, description)
         .with_speaker(gender_from_look(look), Some(tone), temperament)
         .with_city_name(city_name)
-        .with_knowledge(knowledge);
+        .with_knowledge(knowledge)
+        .with_voice_override(ov.voice);
         let (image, crop, width, height, is_hd) =
-        match fol.face_record().and_then(|r| faces.get(r, &data, &mut mods, &mut images)) {
+        match face_img {
             Some((face, is_hd)) => (face, None, FACE_DISPLAY_SIZE, FACE_DISPLAY_SIZE, is_hd),
             None => {
                 let Some((sprite, size)) = fol.portrait() else { return };
@@ -1125,16 +1172,11 @@ pub fn update_dialog_followers(
     ctx.npc_entity = Some(npc_entity);
     ctx.npc_is_follower = true;
     state.open = true;
+    state.forced_by_menu = false;
     for mut visibility in root.iter_mut() { *visibility = Visibility::Visible; }
     keys.clear_just_pressed(KeyCode::KeyE);
 }
 
-/// Ritratto dedicato di un NPC custom: `por_<nome>.png` nella cartella delle
-/// texture. `<nome>` e' il nome della texture dell'NPC senza il prefisso `npc_`
-/// (`npc_bartolo.png` -> `por_bartolo.png`); in seconda battuta si prova col nome
-/// del `.txt` in minuscolo con gli spazi sostituiti da `_`.
-/// Ritorna (immagine, serve flip verticale, dimensione da mostrare in px).
-/// Voce TTS imposta per l'NPC custom (riga `voice=` del .txt), se presente.
 fn custom_voice(name: &str, cache: &CustomNpcCache) -> Option<String> {
     cache
     .npcs
@@ -1143,7 +1185,6 @@ fn custom_voice(name: &str, cache: &CustomNpcCache) -> Option<String> {
     .and_then(|n| n.voice.clone())
 }
 
-/// Descrizione dell'NPC custom (riga `description=` del .txt), se presente.
 fn custom_description(name: &str, cache: &CustomNpcCache) -> Option<String> {
     cache
     .npcs
@@ -1184,9 +1225,6 @@ fn reset_keys_when_dialog_open(state: Res<DialogState>, mut keys: ResMut<ButtonI
     if state.open { keys.reset_all(); }
 }
 
-// =============================================================================
-// Input testo
-// =============================================================================
 fn push_typed(buffer: &mut String, c: char) {
     if !c.is_control() && buffer.chars().count() < QUESTION_MAX_CHARS {
         buffer.push(c);
@@ -1198,7 +1236,9 @@ fn dialog_input_click(
     mut ctx: ResMut<DialogContext>,
     interactions: Query<&Interaction, (Changed<Interaction>, With<DialogInput>)>,
 ) {
-    if !state.open || ctx.typing { return; }
+    if !state.open || state.forced_by_menu || ctx.typing {
+        return;
+    }
     for interaction in &interactions {
         if *interaction == Interaction::Pressed {
             ctx.typing = true;
@@ -1211,9 +1251,6 @@ fn set_input_text<F: QueryFilter>(texts: &mut Query<&mut Text, F>, s: String) {
     for mut text in texts.iter_mut() { text.0 = s.clone(); }
 }
 
-// =============================================================================
-// Offerta scriptata (A/R)
-// =============================================================================
 fn handle_scripted_offer(
     keys: &ButtonInput<KeyCode>,
     ctx: &mut DialogContext,
@@ -1256,9 +1293,6 @@ fn handle_scripted_offer(
     true
 }
 
-// =============================================================================
-// Menu dialogo principale
-// =============================================================================
 #[allow(clippy::too_many_arguments)]
 fn dialog_menu(
     mut commands: Commands,
@@ -1272,12 +1306,22 @@ fn dialog_menu(
     mut speak: EventWriter<SpeakEvent>,
     mut typed: EventReader<KeyboardInput>,
     mut recruit_events: EventWriter<RecruitFollowerEvent>,
+    mut mood_events: EventWriter<FollowerMoodEvent>,
     assets: Res<AssetServer>,
     mut line: Query<(&mut Text, &mut TextFont, &mut TextColor), (With<DialogLine>, Without<DialogOptions>, Without<DialogInputText>)>,
                mut options: Query<&mut Text, (With<DialogOptions>, Without<DialogLine>, Without<DialogInputText>)>,
                mut input_text: Query<&mut Text, (With<DialogInputText>, Without<DialogLine>, Without<DialogOptions>)>,
 ) {
-    if !state.open { typed.clear(); return; }
+    if !state.open {
+        typed.clear();
+        return;
+    }
+    if state.forced_by_menu {
+        // Il dialogo è "aperto" solo per via di un menu egui (F1/F2):
+        // non processare W/F, Digit1/Digit2, né input tastiera.
+        typed.clear();
+        return;
+    }
     if ctx.dirty {
         ctx.dirty = false;
         ctx.awaiting = false;
@@ -1293,7 +1337,6 @@ fn dialog_menu(
             font.font_size = DIALOG_FONT_SIZE;
             *color = TextColor(DIALOG_TEXT_COLOR);
         }
-        // Menu contestuale: con un follower mostra anche W/F.
         let menu = if ctx.npc_is_follower { MENU_FOLLOWER } else { MENU_TEXT };
         for mut text in &mut options { text.0 = menu.to_string(); }
         set_input_text(&mut input_text, INPUT_PLACEHOLDER.to_string());
@@ -1370,8 +1413,6 @@ fn dialog_menu(
         let idle = ctx.asking.is_none();
         let pressed = |a: KeyCode, b: KeyCode| keys.just_pressed(a) || keys.just_pressed(b);
 
-        // Comandi per i follower (solo se stiamo parlando con un compagno):
-        // W = aspetta qui, F = seguimi.
         if idle && ctx.npc_is_follower {
             if let Some(entity) = ctx.npc_entity {
                 if keys.just_pressed(KeyCode::KeyW) {
@@ -1407,26 +1448,39 @@ fn dialog_menu(
                 shown = Some(message);
             }
         }
-        // --- Risposta LLM (con eventuale reclutamento) ---
+        // --- Risposta LLM (con reclutamento e mood) ---
         if let Some(id) = ctx.asking {
             if let Some(result) = book.take_answer(id) {
                 ctx.asking = None;
                 let mut recruited = false;
+                let mut mood: u8 = 0;
                 match &result {
-                    Ok((text, follow)) => {
+                    Ok((text, follow, m)) => {
                         ctx.conversation.push(("npc".to_string(), text.clone()));
+                        mood = *m;
                         if *follow && !ctx.npc_is_follower {
                             if let Some(entity) = ctx.npc_entity {
-                                recruit_events.send(RecruitFollowerEvent { entity });
+                                recruit_events.send(RecruitFollowerEvent {
+                                    entity,
+                                    initial_mood: mood,
+                                });
                                 recruited = true;
-                                info!("RECRUIT: invio evento per {:?}", entity);
+                                info!("RECRUIT: invio evento per {:?} (mood={})", entity, mood);
                             }
                         }
                     }
                     Err(()) => {}
                 }
+                if !recruited && ctx.npc_is_follower {
+                    if let Some(entity) = ctx.npc_entity {
+                        mood_events.send(FollowerMoodEvent { entity, mood });
+                    }
+                }
                 if recruited {
-                    let npc_text = match &result { Ok((t, _)) => t.clone(), Err(()) => String::new() };
+                    let npc_text = match &result {
+                        Ok((t, _, _)) => t.clone(),
+                        Err(()) => String::new(),
+                    };
                     shown = Some(format!("{}: \"{}\"\n\n{}", label, ascii_punctuation(&npc_text), FOLLOWER_MSG));
                 } else {
                     shown = Some(answer_message(&label, &result));
@@ -1451,9 +1505,6 @@ fn dialog_menu(
     }
 }
 
-// =============================================================================
-// Conversione NPC → Follower
-// =============================================================================
 #[allow(clippy::too_many_arguments)]
 fn apply_recruit(
     mut commands: Commands,
@@ -1464,10 +1515,14 @@ fn apply_recruit(
                  mut interior: ResMut<InteriorState>,
                  mut meshes: ResMut<Assets<Mesh>>,
                  mut quad: Local<Option<Handle<Mesh>>>,
+                 custom_npcs: Res<CustomNpcCache>,
+                 mut mods: ResMut<ModTextures>,
+                 mut images: ResMut<Assets<Image>>,
+                 mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for ev in events.read() {
         if let Ok((walker, local_tf, gtf)) = walkers.get(ev.entity) {
-            let follower = Follower::from_walker(walker);
+            let follower = Follower::from_walker(walker).with_mood(ev.initial_mood);
             let world_pos = gtf.translation();
             let scale = local_tf.scale;
             commands.entity(ev.entity)
@@ -1475,7 +1530,10 @@ fn apply_recruit(
             .insert(follower)
             .insert(Transform::from_translation(world_pos).with_scale(scale))
             .remove_parent();
-            info!("RECRUIT: {:?} esterno -> follower animato", ev.entity);
+            info!(
+                "RECRUIT: {:?} esterno -> follower animato (mood={})",
+                  ev.entity, ev.initial_mood
+            );
             continue;
         }
         if let Ok((npc, mat, custom)) = interiors.get(ev.entity) {
@@ -1485,13 +1543,110 @@ fn apply_recruit(
                 Some(c) => interior.mark_recruited_custom(&c.name),
                 None => interior.mark_recruited(npc.flat_archive, npc.flat_record),
             }
-            let follower_copy = Follower::from_static_mobile_full(
+
+            // Follower base: statico, eredita il materiale del billboard originale.
+            let mut follower_copy = Follower::from_static_mobile_full(
                 mat.0.clone(),
-                                                                  size,
-                                                                  npc.flat_archive,
-                                                                  npc.flat_record,
-                                                                  npc.face_record,
+                                                                      size,
+                                                                      npc.flat_archive,
+                                                                      npc.flat_record,
+                                                                      npc.face_record,
             );
+
+            // Idle per flat normali: se l'utente ha aggiunto file
+            // `<archive>_<record>-0_idle_N.png` accanto all'idle base del flat
+            // (es. `182_11-0.png` → `182_11-0_idle_0.png`, `_idle_1.png`, ...),
+            // li usiamo per il ciclo idle e per il mood. Stessa convenzione
+            // dei custom, dimensione a metà dell'idle base.
+            if custom.is_none() {
+                let base_size_px = mods
+                .size_by_name(&format!("{:03}_{}-0", npc.flat_archive, npc.flat_record))
+                .or_else(|| {
+                    mods.size_by_name(&format!("{}_{}-0", npc.flat_archive, npc.flat_record))
+                })
+                .map(|(w, h)| Vec2::new(w as f32, h as f32))
+                .unwrap_or(size);
+                if let Some((idle_frames, idle_sizes)) = load_flat_idle_frames(
+                    npc.flat_archive,
+                    npc.flat_record,
+                    0,
+                    base_size_px,
+                    size ,
+                    &mut mods,
+                    &mut images,
+                    &mut materials,
+                ) {
+                    info!(
+                        "RECRUIT: flat {}:{} con {} frame idle",
+                        npc.flat_archive,
+                        npc.flat_record,
+                        idle_frames.len(),
+                    );
+                    follower_copy = follower_copy.with_idle(idle_frames, idle_sizes, 1.0);
+                }
+            }
+
+            // Walk + idle per NPC custom.
+            if let Some(c) = custom {
+                if let Some(d) = custom_npcs.npcs.iter().find(|n| n.name == c.name) {
+                    let base_size_px = mods
+                    .image_by_name(&d.texture_stem, &mut images)
+                    .and_then(|h| {
+                        mods.image_size(&h)
+                        .or_else(|| images.get(&h).map(|i| i.size_f32()))
+                    })
+                    .unwrap_or(size);
+
+                    if let Some((frames, sizes)) = load_custom_walk_frames(
+                        d,
+                        base_size_px,
+                        size,
+                        &mut mods,
+                        &mut images,
+                        &mut materials,
+                    ) {
+                        info!(
+                            "RECRUIT: NPC custom '{}' con {} frame walk @ {} fps",
+                            d.name, frames.len(), d.walk_fps,
+                        );
+                        follower_copy = follower_copy.with_walk(frames, sizes, d.walk_fps);
+                    } else if !d.walk_stems.is_empty() {
+                        warn!(
+                            "RECRUIT: NPC custom '{}' con walk_stems={:?} ma i frame non si caricano",
+                            d.name, d.walk_stems,
+                        );
+                    }
+
+                    if let Some((idle_frames, idle_sizes)) = load_custom_idle_frames(
+                        d,
+                        base_size_px,
+                        size * IDLE_SIZE_SCALE,
+                        &mut mods,
+                        &mut images,
+                        &mut materials,
+                    ) {
+                        info!(
+                            "RECRUIT: NPC custom '{}' con {} frame idle @ {} fps",
+                            d.name, idle_frames.len(), d.idle_fps,
+                        );
+                        follower_copy = follower_copy.with_idle(idle_frames, idle_sizes, d.idle_fps);
+                    } else if !d.idle_stems.is_empty() {
+                        warn!(
+                            "RECRUIT: NPC custom '{}' con idle_stems={:?} ma i frame non si caricano",
+                            d.name, d.idle_stems,
+                        );
+                    }
+                } else {
+                    warn!(
+                        "RECRUIT: NPC custom '{}' non trovato nel CustomNpcCache",
+                        c.name,
+                    );
+                }
+            }
+
+            // Applica il mood iniziale (0 = neutro).
+            follower_copy = follower_copy.with_mood(ev.initial_mood);
+
             let spawn = match player.get_single() {
                 Ok(tf) => {
                     let fwd = tf.forward();
@@ -1513,8 +1668,8 @@ fn apply_recruit(
                 e.insert(CustomNpcName { name: c.name.clone() });
             }
             info!(
-                "RECRUIT: {:?} interno -> despawn + copia mobile arch={} rec={} face={}",
-                ev.entity, npc.flat_archive, npc.flat_record, npc.face_record
+                "RECRUIT: {:?} interno -> despawn + copia mobile arch={} rec={} face={} mood={}",
+                ev.entity, npc.flat_archive, npc.flat_record, npc.face_record, ev.initial_mood
             );
             continue;
         }
@@ -1522,9 +1677,6 @@ fn apply_recruit(
     }
 }
 
-// =============================================================================
-// Test
-// =============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1574,7 +1726,7 @@ mod tests {
 
     #[test]
     fn answer_message_is_spoken_only_when_there_is_an_answer() {
-        let ok = answer_message("old beggar", &Ok(("Daggerfall, friend.".to_string(), false)));
+        let ok = answer_message("old beggar", &Ok(("Daggerfall, friend.".to_string(), false, 0)));
         assert_eq!(ok, "old beggar: \"Daggerfall, friend.\"");
         assert_eq!(spoken_part(&ok).as_deref(), Some("Daggerfall, friend."));
         let fail = answer_message("old beggar", &Err(()));
@@ -1584,7 +1736,7 @@ mod tests {
 
     #[test]
     fn answer_message_with_follow_true() {
-        let ok = answer_message("barmaid", &Ok(("I'll follow you!".to_string(), true)));
+        let ok = answer_message("barmaid", &Ok(("I'll follow you!".to_string(), true, 1)));
         assert_eq!(ok, "barmaid: \"I'll follow you!\"");
     }
 

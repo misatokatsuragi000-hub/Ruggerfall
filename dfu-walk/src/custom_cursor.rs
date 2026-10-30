@@ -8,12 +8,22 @@
 //! La texture viene letta da `<textures_dir>/cursor.png` (PNG con alpha).
 //! Se il file manca o non si legge, si usa una freccia bianca procedurale.
 //!
-//! ## Menu di tuning (F1)
+//! ## Menu egui (F1 tuning, F2 salvataggio)
 //!
-//! Con il menu aperto il cursore custom non serve: bevy_egui disegna la sua
-//! finestra *dopo* Bevy UI, quindi coprirebbe il nostro `ImageNode`. In quel
-//! caso lasciamo il cursore di sistema visibile (lo gestisce
-//! `tuning_menu::apply_menu_state`) e nascondiamo il nostro.
+//! Con un menu egui aperto il cursore custom non serve: bevy_egui disegna la
+//! sua finestra *dopo* Bevy UI, quindi coprirebbe il nostro `ImageNode`. In
+//! quel caso lasciamo il cursore di sistema visibile (lo gestiscono
+//! `tuning_menu::apply_menu_state` e `savegame::apply_save_menu_state`) e
+//! nascondiamo il nostro.
+//!
+//! Il controllo è doppio:
+//! - `menu: Option<Res<TuningMenuState>>` — se il plugin del tuning menu non è
+//!   caricato, il gioco funziona come prima.
+//! - `save_menu: Option<Res<SaveMenuState>>` — se il plugin del salvataggio
+//!   non è caricato, stessa cosa.
+//!
+//! Se uno dei due è `Some` e ha `open == true`, `want_custom` diventa false e
+//! non tocchiamo `window.cursor_options.visible` (lo gestisce il menu stesso).
 
 use std::path::PathBuf;
 
@@ -148,21 +158,27 @@ fn setup_custom_cursor(
 fn update_custom_cursor(
     dialog: Res<crate::dialog::DialogState>,
     equipment: Res<crate::equipment::EquipmentState>,
-    // Opzionale: se il plugin del menu non è caricato, il gioco funziona come prima.
+    // Opzionale: se il plugin del menu F1 non è caricato, il gioco funziona come prima.
     menu: Option<Res<crate::tuning_menu::TuningMenuState>>,
+    // Anche la finestra Salva/Carica (F2) usa egui, quindi ha gli stessi
+    // problemi del menu F1: cursore custom coperto, cursore di sistema da
+    // lasciare visibile.
+    save_menu: Option<Res<crate::savegame::SaveMenuState>>,
     // Un'unica query mutabile sulla finestra: `cursor_position()` ritorna
     // `Option<Vec2>` per valore, quindi il borrow finisce subito e possiamo
     // scrivere `cursor_options.visible` sullo stesso handle senza conflitti.
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut cursor_q: Query<(&CustomCursor, &mut Node, &mut Visibility)>,
 ) {
-    // Il cursore custom non va mostrato quando c'è il menu F1 aperto:
-    // bevy_egui disegna la sua finestra *dopo* Bevy UI, quindi coprirebbe
-    // il nostro `ImageNode` e resteremmo senza cursore visibile. In quel
-    // caso lasciamo il cursore di sistema visibile (gestito da
-    // `tuning_menu::apply_menu_state`).
-    let menu_open = menu.as_ref().is_some_and(|m| m.open);
-    let want_custom = (dialog.open || equipment.open) && !menu_open;
+    // Il cursore custom non va mostrato quando c'è un menu egui aperto
+    // (F1 tuning o F2 salvataggio): bevy_egui disegna la sua finestra *dopo*
+    // Bevy UI, quindi coprirebbe il nostro `ImageNode` e resteremmo senza
+    // cursore visibile. In quel caso lasciamo il cursore di sistema visibile
+    // (gestito da `tuning_menu::apply_menu_state` o `savegame::apply_save_menu_state`).
+    let tuning_open = menu.as_ref().is_some_and(|m| m.open);
+    let save_open = save_menu.as_ref().is_some_and(|m| m.open);
+    let egui_open = tuning_open || save_open;
+    let want_custom = (dialog.open || equipment.open) && !egui_open;
 
     let Ok(mut window) = windows.get_single_mut() else { return };
     let mouse = window.cursor_position();
@@ -188,7 +204,8 @@ fn update_custom_cursor(
     }
     // Se `want_custom` è false NON tocchiamo `visible`: lo gestisce chi di
     // dovere — `player::grab_cursor` nel gioco normale, `tuning_menu` con il
-    // menu aperto. Questo evita che i due sistemi si combattano a vicenda.
+    // menu F1 aperto, `savegame` con la finestra F2 aperta. Questo evita che
+    // i sistemi si combattano a vicenda.
 }
 
 // =============================================================================

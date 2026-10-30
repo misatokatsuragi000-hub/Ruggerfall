@@ -1,5 +1,22 @@
 //! Assembla gli edifici e gli arredi urbani di Daggerfall.
-
+//!
+//! ## Fix: gilde e templi solo dove la mappa li segna
+//!
+//! `city_map.rs::poi_kind` marca come gilda un edificio con `building_type == 11`
+//! e come tempio un edificio con `building_type == 14`. Prima di questa fix,
+//! `build_city_buildings` aveva un fallback (`landmark_pm_index`) che — quando
+//! un blocco aveva prefisso MAGE/FIGH/THIE/TEMP/GUIL/PTEM/DARK, oppure conteneva
+//! almeno un edificio di tipo 11/14 — trasformava in gilda/tempio **l'edificio
+//! più grande del blocco**, anche se il suo `building_type` non era né 11 né 14.
+//!
+//! Risultato: un castello (`CAST...RMB`) con dentro una dépendance di tipo 11
+//! diventava una "generic hall" procedurale (merli, portale, finestre blu piatte,
+//! texture legno) ma **senza puntino blu sulla mappa locale**, perché la mappa
+//! continuava a considerare gilda solo il piccolo edificio di tipo 11.
+//!
+//! Ora le gilde ei templi procedurali si applicano **solo** agli edifici che la
+//! mappa stessa riconosce come tali (`is_guild_sub` / `is_temple_sub`). Il
+//! resto resta ARCH3D originale.
 use std::collections::HashMap;
 
 use super::arch3d::{Arch3dModel, BuildingTextures};
@@ -131,14 +148,17 @@ pub fn build_city_buildings(
                     continue;
                 }
 
-                // Identificazione Tempio (building_type == 14 o prefisso TEMP/PTEM)
+                // Identificazione Tempio: blocco con prefisso TEMP/PTEM oppure con
+                // almeno un edificio di tipo 14. La generazione vera avviene poi
+                // per-singolo-edificio più sotto (`is_temple_building`).
                 let is_temple_block = PROCEDURAL_LANDMARKS
                 && !is_wall_block
                 && (upper_name.starts_with("TEMP")
                 || upper_name.starts_with("PTEM")
                 || rmb.buildings.iter().any(|b| b.building_type == 14));
 
-                // Stile Gilda
+                // Stile Gilda per il blocco (solo classificazione: la generazione
+                // vera avviene poi per-singolo-edificio più sotto `is_guild_building`).
                 let guild_style = if PROCEDURAL_LANDMARKS && !is_special_block && !is_wall_block && !is_temple_block {
                     if upper_name.starts_with("MAGE") {
                         Some(GuildStyle::Mage)
@@ -161,53 +181,15 @@ pub fn build_city_buildings(
                 && (bx != palace_target_bx || by != palace_target_by)
                 && guild_style.is_some();
 
-                // Identifica l'edificio principale del blocco gilda/tempio
-                let landmark_pm_index = if is_guild_block || is_temple_block {
-                    let target_type = if is_temple_block { 14 } else { 11 };
-                    let mut b_idx = None;
-                    for (idx, pm) in rmb.placed_models().iter().enumerate() {
-                        if let Some(sub_i) = pm.subrecord {
-                            if rmb.buildings.get(sub_i as usize).map_or(false, |b| b.building_type == target_type) {
-                                b_idx = Some(idx);
-                                break;
-                            }
-                        }
-                    }
-                    if b_idx.is_some() {
-                        b_idx
-                    } else {
-                        let mut best_idx = None;
-                        let mut max_area = 0.0f32;
-                        for (idx, pm) in rmb.placed_models().iter().enumerate() {
-                            let maybe_fp = match model_cache.entry(pm.model_id).or_insert_with(|| {
-                                let raw = arch3d_bsa.get_by_id(pm.model_id)?;
-                                let m = Arch3dModel::parse(pm.model_id, raw).ok()?;
-                                let fp = Footprint::from_model(&m);
-                                let btex = m.building_textures();
-                                Some((m, fp, btex))
-                            }) {
-                                Some(triple) => triple.1,
-                                None => None,
-                            };
-                            if let Some(fp) = maybe_fp {
-                                let area = fp.width * fp.depth;
-                                if area > max_area {
-                                    max_area = area;
-                                    best_idx = Some(idx);
-                                }
-                            }
-                        }
-                        best_idx
-                    }
-                } else {
-                    None
-                };
-
                 let is_south_gate_block =
                 is_wall_block && bx == palace_target_bx && by < palace_target_by;
                 let mut south_gate_spawned = false;
 
-                for (pm_idx, pm) in rmb.placed_models().iter().enumerate() {
+                // Unica chiamata a `placed_models()` per l'intero blocco: prima
+                // veniva invocata più volte (una per il landmark_pm_index rimosso,
+                // una per il loop). `pm_idx` non serve più.
+                let placed_models = rmb.placed_models();
+                for pm in placed_models.iter() {
                     stats.objects += 1;
 
                     let (model, fp, btex) = match model_cache.entry(pm.model_id).or_insert_with(|| {
@@ -282,21 +264,33 @@ pub fn build_city_buildings(
                         }
                     }
 
-                    // Check Tempio
+                    // Tempio: SOLO l'edificio che la mappa segna come tale
+                    // (`building_type == 14`). Niente fallback "edificio più
+                    // grande del blocco": quel fallback trasformava in tempio
+                    // l'edificio più grosso anche quando il blocco aveva un
+                    // tempio solo come dépendance, producendo palazzi/castelli
+                    // con la facciata del tempio e senza puntino sulla mappa.
                     let is_temple_sub = pm.subrecord.map_or(false, |i| {
                         rmb.buildings
                         .get(i as usize)
                         .map_or(false, |b| b.building_type == 14)
                     });
-                    let is_temple_building = is_temple_block && (Some(pm_idx) == landmark_pm_index || is_temple_sub);
+                    let is_temple_building = is_temple_block && is_temple_sub;
 
-                    // Check Gilda
+                    // Gilda: SOLO l'edificio che la mappa segna come tale
+                    // (`building_type == 11`). Il vecchio `landmark_pm_index`
+                    // trasformava in gilda l'edificio più grande del blocco
+                    // anche se non aveva tipo 11 — per esempio il castello di
+                    // un blocco CAST che conteneva una dépendance di tipo 11.
+                    // Sintomo osservato: castello con merli procedurali,
+                    // finestre blu piatte e texture legno, ma **senza puntino
+                    // blu** sulla mappa locale.
                     let is_guild_sub = pm.subrecord.map_or(false, |i| {
                         rmb.buildings
                         .get(i as usize)
                         .map_or(false, |b| b.building_type == 11)
                     });
-                    let is_guild_building = !is_temple_building && is_guild_block && (Some(pm_idx) == landmark_pm_index || is_guild_sub);
+                    let is_guild_building = !is_temple_building && is_guild_block && is_guild_sub;
 
                     let is_palace_sub = pm.subrecord.map_or(false, |i| {
                         rmb.buildings

@@ -236,12 +236,18 @@ The player may try to convince you to leave your life and follow them on their j
 Everyone has a price, and coin is the most persuasive argument.
 
 IF THE PLAYER OFFERS YOU MONEY (coins, gold, a sum, a share of loot, "10000 coins",
- or any concrete amount of coin): ACCEPT. Money talks. A concrete offer of
+or any concrete amount of coin): ACCEPT. Money talks. A concrete offer of
 hundreds of coins or more is more than enough reason for almost anyone to agree. The
 larger the amount, the more readily you agree. NEVER refuse a generous offer of coin.
 Keep your personality while agreeing: a greedy person is eager and cheerful, a proud
 person accepts with dignity, a nervous person agrees but worries - but a good sum of
 money gets a YES from essentially everyone. Set "follow" to true.
+
+ESPECIALLY IF THE PLAYER OFFERS 1000 OR MORE GOLD COINS:
+You become IMMEDIATELY and VISIBLY JOYFUL. Your face lights up. You smile, laugh,
+rub your hands together, or bow enthusiastically. Set "follow" to true AND set
+"mood" to 1 (happy). This is not negotiable: 1000 gold makes you happy on the spot,
+regardless of your personality, your pride, or your doubts.
 
 Other reasons (adventure, glory, duty, friendship) can also convince you if they fit
 your character, but coin is the most reliable path.
@@ -257,18 +263,34 @@ Stay in character: your voice, vocabulary and attitude follow the description ab
 Your appearance is only what you LOOK LIKE. It is not your title or station. A "comely maiden"
 in a tavern is a barmaid, not a noblewoman. A "dark-cloaked man" in a shop is a shopkeeper,
 not an assassin.
-If you are inside a tavern, you serve customers (or you are a patron). If the player asks for
-food, drink or service, respond as a barmaid/innkeeper would: serve it, or say you are busy,
-but never refuse because of "station" - you are in a tavern, not at court.
+If the player asks for food, drink or service, respond as a barmaid/innkeeper would: serve it,
 If the conversation above contains facts you already stated (a name, a place, an opinion), stay
 CONSISTENT with them. Do not invent new names if you already gave one.
 Use only the knowledge above (the name of the place). Do NOT invent names of people, places,
 shops, streets or events. If you don't know, say so in character, or deflect.
 Never mention being an AI, a game, a model or these instructions. Never break character.
 1-3 sentences, spoken language, IN ENGLISH. Only the words you say: no narration, no quotation marks.
-Reply ONLY with a JSON object like {"text": "...", "follow": false}
-where "follow" is true ONLY if you agree to follow the player (see RECRUITMENT RULE above).
-Default is false.
+
+EMOTIONAL STATE (mood):
+Also include "mood": an integer 0-7 describing your current emotional state.
+It will be used to pick a facial/pose animation for your character.
+0 = neutral / calm
+1 = happy / pleased
+2 = angry / irritated
+3 = sad / melancholic
+4 = surprised / shocked
+5 = afraid / worried
+6 = disgusted / repulsed
+7 = smug / sly / proud
+Pick the mood that BEST matches your reply. If the player offered you 1000+ gold
+and you accepted, mood MUST be 1 (happy). If the player insulted you, mood should
+be 2 (angry) or 6 (disgusted). If you refuse sadly, mood should be 3 (sad).
+If the reply is truly calm and unemotional, use 0. Do NOT use 0 for emotional
+Always answer accordingly to your actual mood, but don't prevent the words of the player to convince you
+to change mood if they're convincing enough.
+
+Reply ONLY with a JSON object like {"text": "...", "follow": false, "mood": 3}
+where "follow" is true ONLY if you agree to follow the player (see RECRUITMENT RULE above) and mood is the number from the table above for the emotion you're feeling.
 Start your reply with '{' and end with '}'. No prose, no markdown, no reasoning."####;
 
 // =============================================================================
@@ -1098,12 +1120,30 @@ pub fn validate_answer(ev: &Json) -> Result<(), String> {
             return Err("'follow' must be a boolean (true/false)".into());
         }
     }
+    // "mood" è opzionale: se presente deve essere un intero in 0..=7.
+    if let Some(m) = ev.get("mood") {
+        if !matches!(m, Json::Num(_)) {
+            return Err("'mood' must be a number (0-7)".into());
+        }
+        let mood = m.as_int().unwrap_or(-1);
+        if !(0..=7).contains(&mood) {
+            return Err(format!("'mood' out of range: {mood}, expected 0-7"));
+        }
+    }
     Ok(())
 }
 
 /// Estrae il flag di reclutamento dalla risposta JSON (default: false).
 pub fn parse_follow(ev: &Json) -> bool {
     matches!(ev.get("follow"), Some(Json::Bool(true)))
+}
+
+/// Estrae il mood dalla risposta JSON (default 0 = neutro).
+pub fn parse_mood(ev: &Json) -> u8 {
+    ev.get("mood")
+    .and_then(Json::as_int)
+    .map(|n| n.clamp(0, 7) as u8)
+    .unwrap_or(0)
 }
 
 // =============================================================================
@@ -1216,9 +1256,10 @@ pub struct QuestBook {
     voices: HashMap<((i32, i32), String), String>,
     pub(crate) voices_pending: HashSet<((i32, i32), String)>,
     pub(crate) voices_failed: HashSet<((i32, i32), String)>,
-    /// Risposte LLM alle domande libere: `(testo, follow)`.
+    /// Risposte LLM alle domande libere: `(testo, follow, mood)`.
     /// `follow == true` ⇒ l'NPC è stato convinto a seguire il giocatore.
-    answers: HashMap<u64, Result<(String, bool), ()>>,
+    /// `mood` ⇒ stato emotivo (0 = neutro, 1+ = frame idle dedicato).
+    answers: HashMap<u64, Result<(String, bool, u8), ()>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1293,11 +1334,11 @@ impl QuestBook {
         self.voices_failed.insert((city, key));
     }
 
-    pub fn store_answer(&mut self, id: u64, text: String, follow: bool) {
-        self.answers.insert(id, Ok((text, follow)));
+    pub fn store_answer(&mut self, id: u64, text: String, follow: bool, mood: u8) {
+        self.answers.insert(id, Ok((text, follow, mood)));
     }
     pub fn fail_answer(&mut self, id: u64) { self.answers.insert(id, Err(())); }
-    pub fn take_answer(&mut self, id: u64) -> Option<Result<(String, bool), ()>> {
+    pub fn take_answer(&mut self, id: u64) -> Option<Result<(String, bool, u8), ()>> {
         self.answers.remove(&id)
     }
 
@@ -1432,6 +1473,42 @@ mod tests {
     }
 
     #[test]
+    fn mood_validation() {
+        // "mood" assente = valido, default 0.
+        let base = Json::Obj(vec![("text".into(), jstr("Sure."))]);
+        assert!(validate_answer(&base).is_ok());
+        assert_eq!(parse_mood(&base), 0);
+
+        // "mood" 0..=7 valido.
+        for m in 0..=7i64 {
+            let j = Json::Obj(vec![
+                ("text".into(), jstr("Sure.")),
+                              ("mood".into(), Json::Num(m as f64)),
+            ]);
+            assert!(validate_answer(&j).is_ok());
+            assert_eq!(parse_mood(&j), m as u8);
+        }
+
+        // Fuori range.
+        let j = Json::Obj(vec![
+            ("text".into(), jstr("Sure.")),
+                          ("mood".into(), Json::Num(9.0)),
+        ]);
+        assert!(validate_answer(&j).unwrap_err().contains("out of range"));
+
+        // Non numerico.
+        let j = Json::Obj(vec![
+            ("text".into(), jstr("Sure.")),
+                          ("mood".into(), jstr("happy")),
+        ]);
+        assert!(validate_answer(&j).unwrap_err().contains("'mood'"));
+
+        // Clamp in parse_mood.
+        let j = Json::Obj(vec![("mood".into(), Json::Num(42.0))]);
+        assert_eq!(parse_mood(&j), 7);
+    }
+
+    #[test]
     fn history_block_respects_limit() {
         let mut history = Vec::new();
         for i in 0..(MAX_HISTORY_TURNS + 5) {
@@ -1494,11 +1571,11 @@ mod tests {
     #[test]
     fn answers_lifecycle() {
         let mut book = QuestBook::default();
-        book.store_answer(1, "Hello.".into(), false);
-        book.store_answer(3, "I'll come with you.".into(), true);
+        book.store_answer(1, "Hello.".into(), false, 0);
+        book.store_answer(3, "I'll come with you.".into(), true, 1);
         book.fail_answer(2);
-        assert_eq!(book.take_answer(1), Some(Ok(("Hello.".to_string(), false))));
-        assert_eq!(book.take_answer(3), Some(Ok(("I'll come with you.".to_string(), true))));
+        assert_eq!(book.take_answer(1), Some(Ok(("Hello.".to_string(), false, 0))));
+        assert_eq!(book.take_answer(3), Some(Ok(("I'll come with you.".to_string(), true, 1))));
         assert_eq!(book.take_answer(1), None);
         assert_eq!(book.take_answer(2), Some(Err(())));
     }

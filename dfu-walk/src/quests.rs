@@ -1,5 +1,22 @@
 //! Quest data model, prompt builders, validators, in-memory archive, config.
 //! Nessuna chiamata di rete né processo: tutto il runtime LLM è in `quest_llm.rs`.
+//!
+//! ## Profilo degli NPC (nome + description)
+//!
+//! Oltre a `text` (la voce), il prompt `NPC_VOICE` chiede all'LLM di produrre
+//! per ogni NPC:
+//!
+//! - `name`: un nome proprio coerente con descrizione, genere, ruolo e
+//!   temperamento;
+//! - `description`: una descrizione completa in terza persona ("You are
+//!   Matthew, a member of the Temple. ..."), che sostituisce quella
+//!   automatica di `describe_npc_in` quando mostrata al modello `NPC_ASK`.
+//!
+//! `QuestBook` conserva i profili accanto alle voci (`names`, `descriptions`),
+//! e `quest_llm::quest_poll` li passa anche a
+//! `classic_npc::apply_llm_background` per scriverli nel `.txt` condiviso
+//! (solo se il `.txt` è ancora "auto"). Così al riavvio il nome e la
+//! description sopravvivono senza dover rigenerare.
 use crate::data::city_map::PoiKind;
 use crate::data::maps::DFLocation;
 use bevy::prelude::*;
@@ -206,6 +223,18 @@ Reply ONLY with a JSON object:
 where "index" matches the NPC number. Start with '{{' and end with '}}'.
 No prose, no markdown, no reasoning."####;
 
+/// Prompt per generare, **in un solo giro LLM**, il profilo di un NPC (nome +
+/// description + voce del quest).
+///
+/// Prima del giro attuale, `NPC_VOICE` generava solo il testo della voce. Ora
+/// genera anche `name` e `description` (background) perché il flusso reale è:
+///
+/// 1. entri in un interno → `interior_enter_exit` emette `InteriorEntered` con
+///    `(voice_key, description_auto)` per ogni NPC;
+/// 2. `prefetch_interior_voices` chiama `request_voice` per ognuno;
+/// 3. il worker genera (name, description, text) in un solo prompt;
+/// 4. `quest_poll` salva tutto in `QuestBook` **e** chiama
+///    `classic_npc::apply_llm_background` per scriverlo nel `.txt` condiviso.
 pub const DEFAULT_NPC_VOICE_PROMPT: &str = r####"You are writing what ONE specific person says in a Daggerfall town: a rumor about a quest.
 The quest seed (ground truth):
 {seed_json}
@@ -213,6 +242,47 @@ The person who is speaking:
 {npc}
 Write the rumor AS SPOKEN BY THIS PERSON. Their description decides their voice, vocabulary,
 attitude, and what they know or care about. Make it sound like them and nobody else.
+
+YOU ALSO PRODUCE THE PERSON'S PROFILE: a proper name, a short background and a speaking voice.
+
+1) NAME
+The name is not in the description: the description only says what they look
+like ("blonde woman", "guard", "old beggar"), not who they are. Invent a
+fitting first name (or first + short family name) that matches:
+- the gender implied by the description ("woman"/"maiden"/"lady" → female,
+"man"/"guard"/"lord" → male; if ambiguous, pick either);
+- their social standing and temperament (a noble has a different name than
+a drunk, a foreigner than a local);
+- the setting (Daggerfall, medieval dark fantasy, Breton/Redguard/Nord/Elf names).
+The name must be ONE name (first name, or first name plus family name). It must
+differ from any name already in the seed (tomb_name, artifact_name,
+quest_giver_name, and any proper name mentioned in `lore`).
+
+2) DESCRIPTION
+Write a single-line paragraph in English, IN THE THIRD PERSON, starting
+with "You are <Name>." followed by the person's role, attitude and what
+they know about the local situation. Preserve the meaningful facts from the
+input `{npc}` field:
+- the appearance is given verbatim ("Appearance (...): <descriptor>");
+- the occupation and location are given;
+- the temperament is given.
+The output description MUST be a single line (no line breaks), 1 to 3
+sentences, at most 400 characters, in ENGLISH, and must read like a
+"who you are" block for another AI to roleplay. Do NOT narrate, do NOT
+include quotes around it, do NOT include markdown. It replaces the input
+description when shown to the roleplay model.
+Example: "You are Matthew, a member of the Temple. You serve the faithful
+with quiet devotion, and you have heard of the Mages Guild's plan to recover
+the Tear of Thalamor. Temperament: cheerful."
+
+3) VOICE
+Pick the text-to-speech voice that best fits this person (the gender of the name you chose, their
+age, temperament and social standing) from this list:
+{voices}
+Reply with ONE voice id (e.g. "bm_george") or a blend of two or three voices of the SAME gender with
+weights that sum to 1 (e.g. "af_kore:0.7,af_sky:0.3"). Use only ids from the list. If nothing fits,
+use an empty string.
+
 RULES:
 Use only facts from the seed (tomb_name, artifact_name, quest-giver, region, distance).
 INSIDERS: if the person's description says they belong to the very organization named in the seed
@@ -222,9 +292,11 @@ about the quest-giver as an outsider would.
 Do NOT use the generic dungeon name; say tomb_name, or a vague reference
 ("that place", "the crypt", "those ruins").
 The artifact is still HIDDEN. Nobody has recovered it.
-1-2 sentences, spoken language, IN ENGLISH. Gossip, not a briefing.
-Only the words they say: no narration, no description of the person, no quotation marks.
-Reply ONLY with a JSON object like {"text": "..."}.
+The `text` field is 1-2 sentences, spoken language, IN ENGLISH. Gossip, not a
+briefing. Only the words they say: no narration, no description of the person,
+no quotation marks.
+
+Reply ONLY with a JSON object like {"name": "...", "description": "...", "text": "...", "voice": "..."}.
 Start your reply with '{' and end with '}'. No prose, no markdown, no reasoning."####;
 
 pub const DEFAULT_NPC_ASK_PROMPT: &str = r####"You are playing ONE character in a Daggerfall town. Answer the player's question IN CHARACTER.
@@ -1098,7 +1170,104 @@ pub fn build_npc_flavor_prompt(template: &str, seed: &Seed, npc_list: &str) -> S
 }
 
 pub fn build_npc_voice_prompt(template: &str, seed: &Seed, npc: &str) -> String {
-    template.replace("{seed_json}", &seed.to_prompt_json().pretty()).replace("{npc}", npc)
+    template
+    .replace("{seed_json}", &seed.to_prompt_json().pretty())
+    .replace("{npc}", npc)
+    .replace("{voices}", &voice_menu())
+}
+
+/// Voci TTS tra cui l'LLM sceglie quella di un NPC (id, note per l'LLM).
+///
+/// Sono le voci inglesi di Kokoro. Se la tua installazione ne ha altre, o vuoi guidare
+/// la scelta, modifica questa tabella: la seconda colonna finisce nel prompt, quindi puoi
+/// aggiungere note di timbro ("deep, gravelly", "young, bright", ...).
+pub const NPC_VOICES: &[(&str, &str)] = &[
+    ("af_alloy", "American female"),
+    ("af_aoede", "American female"),
+    ("af_bella", "American female"),
+    ("af_heart", "American female"),
+    ("af_jessica", "American female"),
+    ("af_kore", "American female"),
+    ("af_nicole", "American female"),
+    ("af_nova", "American female"),
+    ("af_river", "American female"),
+    ("af_sarah", "American female"),
+    ("af_sky", "American female"),
+    ("am_adam", "American male"),
+    ("am_echo", "American male"),
+    ("am_eric", "American male"),
+    ("am_fenrir", "American male"),
+    ("am_liam", "American male"),
+    ("am_michael", "American male"),
+    ("am_onyx", "American male"),
+    ("am_puck", "American male"),
+    ("am_santa", "American male"),
+    ("bf_alice", "British female"),
+    ("bf_emma", "British female"),
+    ("bf_isabella", "British female"),
+    ("bf_lily", "British female"),
+    ("bm_daniel", "British male"),
+    ("bm_fable", "British male"),
+    ("bm_george", "British male"),
+    ("bm_lewis", "British male"),
+];
+
+/// Elenco `- id: note` per il segnaposto `{voices}` del prompt.
+pub fn voice_menu() -> String {
+    NPC_VOICES.iter().map(|(id, note)| format!("- {id}: {note}")).collect::<Vec<_>>().join("\n")
+}
+
+/// Normalizza la voce scelta dall'LLM (`"af_kore:0.7, af_sky:0.3"`, `"bm_george"`).
+///
+/// `None` se e' vuota o non valida: id fuori elenco, piu' di 3 voci, generi misti o pesi
+/// non positivi. In quel caso l'NPC resta con la voce automatica. Restituisce il formato
+/// del campo `voice =` dei txt (`id` oppure `id:peso,id:peso` con pesi che sommano a 1).
+pub fn sanitize_voice(raw: &str) -> Option<String> {
+    let mut parts: Vec<(&'static str, f32)> = Vec::new();
+    let mut weighted = false;
+    for piece in raw.split(',') {
+        let piece = piece.trim().trim_matches('"').trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (id, weight) = match piece.split_once(':') {
+            Some((id, w)) => {
+                weighted = true;
+                (id.trim(), w.trim().parse::<f32>().ok()?)
+            }
+            None => (piece, 1.0),
+        };
+        if !weight.is_finite() || weight <= 0.0 {
+            return None;
+        }
+        let id = id.to_ascii_lowercase();
+        let (known, _) = NPC_VOICES.iter().find(|(v, _)| *v == id)?;
+        if parts.iter().any(|(v, _)| v == known) {
+            return None;
+        }
+        parts.push((known, weight));
+    }
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    // Stesso genere (secondo carattere dell'id: `f` / `m`).
+    let gender = parts[0].0.as_bytes()[1];
+    if parts.iter().any(|(v, _)| v.as_bytes()[1] != gender) {
+        return None;
+    }
+    if parts.len() == 1 && !weighted {
+        return Some(parts[0].0.to_string());
+    }
+    let total: f32 = parts.iter().map(|(_, w)| w).sum();
+    let blend = parts
+        .iter()
+        .map(|(v, w)| {
+            let n = format!("{:.2}", w / total);
+            format!("{v}:{}", n.trim_end_matches('0').trim_end_matches('.'))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(blend)
 }
 
 /// Costruisce il prompt per generare uno script QRC/QBN completo.
@@ -1249,6 +1418,17 @@ pub fn validate_npc_flavors(ev: &Json) -> Result<(), String> {
     Ok(())
 }
 
+/// Valida la risposta al prompt `NPC_VOICE`.
+///
+/// Il prompt chiede tre campi:
+/// - `text` (obbligatorio): la voce del quest;
+/// - `name` (opzionale): il nome proprio dell'NPC;
+/// - `description` (opzionale): un background in terza persona, "You are
+///   <Name>, ...", che sostituisce `describe_npc_in` nel prompt `NPC_ASK`.
+///
+/// Se `name` o `description` sono presenti, vengono validati ma **non
+/// diventano obbligatori**: i modelli vecchi che non li producono continuano
+/// a funzionare (fallback al descrittore visivo e alla description auto).
 pub fn validate_voice(ev: &Json, seed: &Seed) -> Result<(), String> {
     let text = ev.get("text").and_then(Json::as_str).ok_or("missing 'text' field")?.trim();
     if text.is_empty() { return Err("empty text".into()); }
@@ -1269,6 +1449,43 @@ pub fn validate_voice(ev: &Json, seed: &Seed) -> Result<(), String> {
             return Err(format!("implies the artifact was already recovered ('{hint}'): it is still hidden"));
         }
     }
+
+    // --- Validazione del nome proprio (opzionale) ---
+    if let Some(raw) = ev.get("name").and_then(Json::as_str) {
+        let name = raw.trim();
+        if !name.is_empty() {
+            let nlen = name.chars().count();
+            if nlen > 60 {
+                return Err(format!("name too long ({nlen} chars, max 60)"));
+            }
+            let name_low = name.to_lowercase();
+            for forbidden in [&seed.tomb_name, &seed.artifact_name, &seed.quest_giver_name] {
+                let f_low = forbidden.to_lowercase();
+                if name_low == f_low || name_low.contains(&f_low) {
+                    return Err(format!("name '{name}' conflicts with quest term '{forbidden}'"));
+                }
+            }
+        }
+    }
+
+    // --- Validazione della description (opzionale) ---
+    if let Some(raw) = ev.get("description").and_then(Json::as_str) {
+        let desc = raw.trim();
+        if !desc.is_empty() {
+            let dlen = desc.chars().count();
+            if dlen > 400 {
+                return Err(format!("description too long ({dlen} chars, max 400)"));
+            }
+            if desc.contains('\n') {
+                return Err("description must be a single line".into());
+            }
+            let dlow = desc.to_lowercase();
+            if dlow.contains("as an ai") || dlow.contains("language model") {
+                return Err("description breaks character".into());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1471,6 +1688,17 @@ pub struct QuestBook {
     pub(crate) pending: HashSet<(i32, i32)>,
     pub(crate) failed: HashSet<(i32, i32)>,
     voices: HashMap<((i32, i32), String), String>,
+    /// Nomi propri generati dall'LLM per ogni NPC (stessa chiave delle voci).
+    /// Il nome è **opzionale**: se il modello non lo produce, `voice_name`
+    /// ritorna `None` e il chiamante usa il descrittore visivo.
+    names: HashMap<((i32, i32), String), String>,
+    /// Background (description) generati dall'LLM per ogni NPC. Stessa chiave
+    /// delle voci. Opzionale: se il modello non lo produce, `voice_description`
+    /// ritorna `None` e il chiamante usa la description automatica.
+    ///
+    /// In `quest_npc_voices.txt` questo campo si chiama `background` per non
+    /// confonderlo con la `description` di input del prompt (`{npc}`).
+    descriptions: HashMap<((i32, i32), String), String>,
     pub(crate) voices_pending: HashSet<((i32, i32), String)>,
     pub(crate) voices_failed: HashSet<((i32, i32), String)>,
     answers: HashMap<u64, Result<(String, bool, u8), ()>>,
@@ -1534,7 +1762,24 @@ impl QuestBook {
                                                              j.get("key").and_then(Json::as_str),
                                                              j.get("text").and_then(Json::as_str),
             ) else { continue };
-            self.voices.insert(((x as i32, y as i32), key.to_string()), text.to_string());
+            let ck = ((x as i32, y as i32), key.to_string());
+            self.voices.insert(ck.clone(), text.to_string());
+            // Nome proprio: opzionale, presente solo per le voci generate dopo
+            // l'introduzione del campo `name`.
+            if let Some(name) = j.get("name").and_then(Json::as_str) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    self.names.insert(ck.clone(), name.to_string());
+                }
+            }
+            // Background LLM: opzionale, salvato con la chiave JSON `background`
+            // per non confondersi con la `description` di input del prompt.
+            if let Some(desc) = j.get("background").and_then(Json::as_str) {
+                let desc = desc.trim();
+                if !desc.is_empty() {
+                    self.descriptions.insert(ck, desc.to_string());
+                }
+            }
         }
     }
 
@@ -1549,6 +1794,45 @@ impl QuestBook {
     pub fn store_voice(&mut self, city: (i32, i32), key: String, text: String) {
         self.voices_pending.remove(&(city, key.clone()));
         self.voices.insert((city, key), text);
+    }
+
+    /// Salva la voce **e** i campi opzionali `name`/`description` generati
+    /// dall'LLM. Se uno dei due è `None` o vuoto, il valore precedente resta
+    /// invariato (`voice_name` / `voice_description` ritornano il vecchio o
+    /// `None`).
+    pub fn store_voice_full(
+        &mut self,
+        city: (i32, i32),
+                            key: String,
+                            text: String,
+                            name: Option<String>,
+                            description: Option<String>,
+    ) {
+        if let Some(n) = name {
+            let n = n.trim();
+            if !n.is_empty() {
+                self.names.insert((city, key.clone()), n.to_string());
+            }
+        }
+        if let Some(d) = description {
+            let d = d.trim();
+            if !d.is_empty() {
+                self.descriptions.insert((city, key.clone()), d.to_string());
+            }
+        }
+        self.voices_pending.remove(&(city, key.clone()));
+        self.voices.insert((city, key), text);
+    }
+
+    /// Nome proprio generato dall'LLM per la voce `key` in `city`, se disponibile.
+    pub fn voice_name(&self, city: (i32, i32), key: &str) -> Option<&str> {
+        self.names.get(&(city, key.to_string())).map(String::as_str)
+    }
+
+    /// Background (description) generato dall'LLM per la voce `key` in `city`,
+    /// se disponibile.
+    pub fn voice_description(&self, city: (i32, i32), key: &str) -> Option<&str> {
+        self.descriptions.get(&(city, key.to_string())).map(String::as_str)
     }
 
     pub fn fail_voice(&mut self, city: (i32, i32), key: String) {
@@ -1672,6 +1956,48 @@ mod tests {
     }
 
     #[test]
+    fn voice_validation_with_name_and_description() {
+        let s = seed();
+        // Nome + description validi.
+        let j = Json::Obj(vec![
+            ("name".into(), jstr("Matthew")),
+                          ("description".into(), jstr("You are Matthew, a member of the Temple.")),
+                          ("text".into(), jstr("The mages are moving on Nekhar-Zul.")),
+        ]);
+        assert!(validate_voice(&j, &s).is_ok());
+
+        // Nome che coincide con il dungeon: rifiutato.
+        let j = Json::Obj(vec![
+            ("name".into(), jstr("Nekhar-Zul")),
+                          ("text".into(), jstr("The mages are moving.")),
+        ]);
+        assert!(validate_voice(&j, &s).unwrap_err().contains("conflicts with quest term"));
+
+        // Description con newline: rifiutata.
+        let j = Json::Obj(vec![
+            ("name".into(), jstr("Matthew")),
+                          ("description".into(), jstr("You are Matthew.\nServant of the Temple.")),
+                          ("text".into(), jstr("The mages are moving.")),
+        ]);
+        assert!(validate_voice(&j, &s).unwrap_err().contains("single line"));
+
+        // Description troppo lunga: rifiutata.
+        let long = "a".repeat(500);
+        let j = Json::Obj(vec![
+            ("description".into(), jstr(&long)),
+                          ("text".into(), jstr("The mages are moving.")),
+        ]);
+        assert!(validate_voice(&j, &s).unwrap_err().contains("description too long"));
+
+        // Description che rompe il personaggio: rifiutata.
+        let j = Json::Obj(vec![
+            ("description".into(), jstr("As an AI, I cannot describe this person.")),
+                          ("text".into(), jstr("The mages are moving.")),
+        ]);
+        assert!(validate_voice(&j, &s).unwrap_err().contains("breaks character"));
+    }
+
+    #[test]
     fn question_cleaning() {
         assert_eq!(clean_question("  Where   is\tthe\ninn?  ").as_deref(), Some("Where is the inn?"));
         assert_eq!(clean_question("   \n "), None);
@@ -1782,6 +2108,41 @@ mod tests {
         assert_eq!(book.voice_state((1, 1), "walker:1"), VoiceState::Pending);
         book.store_voice((1, 1), "walker:1".into(), "Hush.".into());
         assert_eq!(book.voice_state((1, 1), "walker:1"), VoiceState::Ready("Hush."));
+    }
+
+    #[test]
+    fn voice_full_stores_name_and_description() {
+        let mut book = QuestBook::default();
+        book.store_voice_full(
+            (207, 213),
+                              "flat:182:23@MAGE".into(),
+                              "The mages are moving.".into(),
+                              Some("Matthew".into()),
+                              Some("You are Matthew, a member of the Temple.".into()),
+        );
+        assert_eq!(book.voice_name((207, 213), "flat:182:23@MAGE"), Some("Matthew"));
+        assert_eq!(
+            book.voice_description((207, 213), "flat:182:23@MAGE"),
+                   Some("You are Matthew, a member of the Temple.")
+        );
+
+        // Se chiamato di nuovo senza name/description, i valori restano.
+        book.store_voice_full(
+            (207, 213),
+                              "flat:182:23@MAGE".into(),
+                              "The mages are moving faster.".into(),
+                              None,
+                              None,
+        );
+        assert_eq!(book.voice_name((207, 213), "flat:182:23@MAGE"), Some("Matthew"));
+        assert_eq!(
+            book.voice_description((207, 213), "flat:182:23@MAGE"),
+                   Some("You are Matthew, a member of the Temple.")
+        );
+
+        // Nessun nome per chiavi sconosciute.
+        assert_eq!(book.voice_name((1, 1), "walker:1"), None);
+        assert_eq!(book.voice_description((1, 1), "walker:1"), None);
     }
 
     #[test]
@@ -1930,6 +2291,48 @@ mod tests {
                 DEFAULT_QUEST_SCRIPT_PROMPT.contains(section),
                     "il prompt non menziona `{section}`"
             );
+        }
+    }
+
+    // -------------------------------------------------- voice prompt (nuovo)
+
+    #[test]
+    fn voice_prompt_asks_for_name_and_description() {
+        // Il prompt deve menzionare i due campi nuovi e la regola che la
+        // description inizia con "You are <Name>." (usata da
+        // `classic_npc::apply_llm_background` e da `dialog::apply_llm_profile`).
+        let p = DEFAULT_NPC_VOICE_PROMPT;
+        assert!(p.contains("\"name\":"), "il prompt deve richiedere `name` nel JSON");
+        assert!(p.contains("\"description\":"), "il prompt deve richiedere `description`");
+        assert!(p.contains("\"text\":"), "il prompt deve richiedere `text`");
+        assert!(p.contains("You are <Name>."), "la description deve iniziare con `You are <Name>.`");
+        // Non deve più dire "Only the words they say" come unica richiesta:
+        // la description è in terza persona.
+        assert!(p.contains("IN THE THIRD PERSON"));
+    }
+
+    #[test]
+    fn voice_prompt_asks_for_a_voice_from_the_menu() {
+        let p = DEFAULT_NPC_VOICE_PROMPT;
+        assert!(p.contains("{voices}"), "il prompt deve contenere il segnaposto {{voices}}");
+        assert!(p.contains("\"voice\":"), "il prompt deve richiedere `voice` nel JSON");
+        let menu = voice_menu();
+        assert!(menu.contains("- af_kore: American female") && menu.contains("- bm_george: British male"));
+        assert!(!menu.contains("{voices}"));
+    }
+
+    #[test]
+    fn sanitize_voice_accepts_only_known_same_gender_voices() {
+        assert_eq!(sanitize_voice("bm_george").as_deref(), Some("bm_george"));
+        assert_eq!(sanitize_voice(" \"AF_Kore\" ").as_deref(), Some("af_kore"));
+        assert_eq!(sanitize_voice("af_kore:0.9, af_sky:0.1").as_deref(), Some("af_kore:0.9,af_sky:0.1"));
+        // I pesi vengono normalizzati a somma 1.
+        assert_eq!(sanitize_voice("af_kore:3,af_sky:1").as_deref(), Some("af_kore:0.75,af_sky:0.25"));
+        assert_eq!(sanitize_voice("af_kore:1").as_deref(), Some("af_kore:1"));
+        // Non validi: vuota, sconosciuta, generi misti, doppioni, troppe voci, pesi assurdi.
+        for bad in ["", "  ", "robot_voice", "af_kore,am_adam", "af_kore,af_kore", "af_kore:0,af_sky:1",
+                    "af_kore:x", "af_alloy,af_aoede,af_bella,af_heart"] {
+            assert_eq!(sanitize_voice(bad), None, "{bad:?}");
         }
     }
 }

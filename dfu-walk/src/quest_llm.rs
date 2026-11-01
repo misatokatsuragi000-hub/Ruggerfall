@@ -1,6 +1,21 @@
 //! Infrastruttura LLM: HTTP, gestione llama-server, worker thread, plugin.
 //! Non contiene modelli di dominio: quelli sono in `crate::quests`.
 //!
+//! ## Profilo degli NPC (name + description + voice)
+//!
+//! Quando entri in un interno, `interior_enter_exit` emette `InteriorEntered`
+//! con `(voice_key, description, original_label, sprite_stem)` per ogni NPC
+//! che spawnerà. `prefetch_interior_voices` consuma l'evento e chiama
+//! `QuestWorker::request_voice` per ognuno: `NPC_VOICE` produce in un solo
+//! giro `{name, description, text}`, e `quest_poll`:
+//!
+//! - salva tutto in `QuestBook` con `store_voice_full`;
+//! - se `sprite_stem` è `Some`, chiama `classic_npc::apply_llm_background`
+//!   per scrivere nome+description nel `.txt` condiviso (solo se ancora "auto").
+//!
+//! Al riavvio `QuestBook::load_voices` legge `name` e `background` da
+//! `quest_npc_voices.txt`, quindi il profilo sopravvive senza rigenerare.
+//!
 //! ## Mood
 //!
 //! Oltre a `text` e `follow`, il prompt chiede al modello un campo `mood`
@@ -13,6 +28,7 @@ use crate::data::blocks::RmbBlock;
 use crate::data::bsa::BsaArchive;
 use crate::data::flats::FlatCatalog;
 use crate::data::maps::DFLocation;
+use crate::interior::{CustomNpcCache, InteriorEntered};
 use crate::player::Player;
 use crate::quests::{
     build_npc_ask_prompt, build_npc_flavor_prompt, build_npc_voice_prompt, build_rumors_prompt,
@@ -402,7 +418,19 @@ pub struct Job {
     pub arena_dir: PathBuf,
 }
 
-struct VoiceJob { city: (i32, i32), key: String, description: String, seed: Seed }
+struct VoiceJob {
+    city: (i32, i32),
+    key: String,
+    description: String,
+    /// Etichetta visiva originale (descrittore). Serve a capire se il `.txt`
+    /// di `classic_npc` è ancora "auto" (prima riga == descrittore) o è stato
+    /// personalizzato dall'utente.
+    original_label: String,
+    /// Stem dello sprite (`"181_3-0"`, `"walker_148"`, ...). `None` per i
+    /// custom (che non usano `classic_npc::resolve`).
+    sprite_stem: Option<String>,
+    seed: Seed,
+}
 
 struct AskJob {
     id: u64, city_name: String, description: String, question: String,
@@ -553,25 +581,73 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                         out
                                     }
 
-                                    fn generate_quest(cfg: &QuestConfig, tpl: &Templates, job: &Job,
-                                                      npc_flats: &[(u16, u8, String, Option<String>)]) -> Result<Quest, String>
-                                                      {
-                                                          let seed_json = try_json(cfg, &build_seed_prompt(&tpl.seed, job.theme), "SEED", validate_seed)?;
-                                                          let seed = enrich_seed(&seed_json)?;
-                                                          info!("Quest [SEED] '{}' | location: {} | artifact: {} | quest-giver: {}",
-                                                                seed.title, seed.tomb_name, seed.artifact_name, seed.quest_giver_name);
-                                                          let rumors_json = try_json(cfg, &build_rumors_prompt(&tpl.rumors, &seed), "RUMORS",
-                                                                                     |ev| validate_rumors(ev, &seed))?;
-                                                                                     let rumors = rumors_from_json(&rumors_json)?;
-                                                                                     let npc_flavors = generate_npc_flavors(cfg, tpl, &seed, npc_flats);
-                                                                                     Ok(Quest { city: job.city, city_name: job.city_name.clone(), seed, rumors, npc_flavors })
-                                                      }
+                                    fn generate_quest(
+                                        cfg: &QuestConfig,
+                                        tpl: &Templates,
+                                        job: &Job,
+                                        _npc_flats: &[(u16, u8, String, Option<String>)],
+                                    ) -> Result<Quest, String> {
+                                        let seed_json = try_json(cfg, &build_seed_prompt(&tpl.seed, job.theme), "SEED", validate_seed)?;
+                                        let seed = enrich_seed(&seed_json)?;
+                                        info!("Quest [SEED] '{}' | location: {} | artifact: {} | quest-giver: {}",
+                                              seed.title, seed.tomb_name, seed.artifact_name, seed.quest_giver_name);
+                                        let rumors_json = try_json(cfg, &build_rumors_prompt(&tpl.rumors, &seed), "RUMORS",
+                                                                   |ev| validate_rumors(ev, &seed))?;
+                                                                   let rumors = rumors_from_json(&rumors_json)?;
+                                                                   // NPC_FLAVORS: rimosso. Le risposte sono gestite da NPC_VOICE (prefetch
+                                                                   // all'ingresso nell'interno) e NPC_ASK (domande libere). Il flavor era
+                                                                   // solo un fallback mai raggiunto quando il prefetch funziona: risparmia
+                                                                   // 1 chiamata LLM per città.
+                                                                   Ok(Quest {
+                                                                       city: job.city,
+                                                                       city_name: job.city_name.clone(),
+                                                                      seed,
+                                                                      rumors,
+                                                                      npc_flavors: Vec::new(),
+                                                                   })
+                                    }
+                                                      fn generate_voice(
+    cfg: &QuestConfig,
+    tpl: &Templates,
+    seed: &Seed,
+    npc: &str,
+) -> Result<(String, Option<String>, Option<String>), String> {
+    generate_voice_full(cfg, tpl, seed, npc).map(|(text, name, description, _voice)| (text, name, description))
+}
 
-                                                      fn generate_voice(cfg: &QuestConfig, tpl: &Templates, seed: &Seed, npc: &str) -> Result<String, String> {
+/// Come `generate_voice`, piu' la voce TTS scelta dall'LLM (`None` se manca o non e' valida:
+/// l'NPC resta con la voce automatica).
+fn generate_voice_full(
+    cfg: &QuestConfig,
+    tpl: &Templates,
+    seed: &Seed,
+    npc: &str,
+) -> Result<(String, Option<String>, Option<String>, Option<String>), String> {
                                                           let prompt = build_npc_voice_prompt(&tpl.voice, seed, npc);
                                                           let ev = try_json(cfg, &prompt, "NPC_VOICE", |ev| validate_voice(ev, seed))?;
                                                           let text = ev.get("text").and_then(Json::as_str).unwrap_or(" ").trim();
-                                                          Ok(text.trim_matches('"').trim().to_string())
+                                                          let name = ev
+                                                          .get("name")
+                                                          .and_then(Json::as_str)
+                                                          .map(str::trim)
+                                                          .filter(|s| !s.is_empty())
+                                                          .map(str::to_string);
+                                                          let description = ev
+                                                          .get("description")
+                                                          .and_then(Json::as_str)
+                                                          .map(str::trim)
+                                                          .filter(|s| !s.is_empty())
+                                                          .map(str::to_string);
+                                                          let voice = ev
+                                                          .get("voice")
+                                                          .and_then(Json::as_str)
+                                                          .and_then(crate::quests::sanitize_voice);
+                                                          Ok((
+                                                              text.trim_matches('"').trim().to_string(),
+                                                              name,
+                                                              description,
+                                                              voice,
+                                                          ))
                                                       }
 
                                                       /// Genera la risposta a una domanda libera.
@@ -592,14 +668,31 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                                           writeln!(f, "{}", quest.to_json().compact())
                                                       }
 
-                                                      fn append_voice(path: &Path, city: (i32, i32), key: &str, description: &str, text: &str) -> std::io::Result<()> {
-                                                          let line = Json::Obj(vec![
+                                                      fn append_voice(
+                                                          path: &Path,
+                                                          city: (i32, i32),
+                                                                      key: &str,
+                                                                      description: &str,
+                                                                      text: &str,
+                                                                      name: Option<&str>,
+                                                                      llm_description: Option<&str>,
+                                                      ) -> std::io::Result<()> {
+                                                          let mut fields = vec![
                                                               ("city_x".into(), Json::Num(city.0 as f64)),
-                                                                               ("city_y".into(), Json::Num(city.1 as f64)),
-                                                                               ("key".into(), jstr(key)),
-                                                                               ("description".into(), jstr(description)),
-                                                                               ("text".into(), jstr(text)),
-                                                          ]).compact();
+                                                              ("city_y".into(), Json::Num(city.1 as f64)),
+                                                              ("key".into(), jstr(key)),
+                                                              ("description".into(), jstr(description)),
+                                                          ];
+                                                          if let Some(n) = name {
+                                                              fields.push(("name".into(), jstr(n)));
+                                                          }
+                                                          if let Some(d) = llm_description {
+                                                              // Nome del campo: "background" per non confonderlo con la
+                                                              // `description` del prompt (che è già `{npc}`).
+                                                              fields.push(("background".into(), jstr(d)));
+                                                          }
+                                                          fields.push(("text".into(), jstr(text)));
+                                                          let line = Json::Obj(fields).compact();
                                                           let mut f = OpenOptions::new().create(true).append(true).open(path)?;
                                                           writeln!(f, "{line}")
                                                       }
@@ -610,7 +703,20 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                                       enum QuestMsg {
                                                           Done(Quest),
                                                           Failed { city: (i32, i32), reason: String },
-                                                          Voice { city: (i32, i32), key: String, text: String },
+                                                          Voice {
+                                                              city: (i32, i32),
+                                                              key: String,
+                                                              text: String,
+                                                              name: Option<String>,
+                                                              description: Option<String>,
+                                                          /// Voce TTS scelta dall'LLM (gia' validata con `sanitize_voice`).
+                                                          voice: Option<String>,
+                                                              /// Etichetta visiva originale (descrittore) e stem dello
+                                                              /// sprite: servono a `classic_npc::apply_llm_background` per
+                                                              /// localizzare il `.txt` condiviso.
+                                                              original_label: String,
+                                                              sprite_stem: Option<String>,
+                                                          },
                                                           VoiceFailed { city: (i32, i32), key: String },
                                                           /// Risposta a una domanda libera. `follow` = true se l'NPC è stato
                                                           /// convinto a seguire il giocatore. `mood` = stato emotivo (0-7).
@@ -618,409 +724,604 @@ fn try_json(cfg: &QuestConfig, prompt: &str, label: &str,
                                                           AnswerFailed { id: u64 },
                                                       }
 
-                                                      fn run_voice(cfg: &QuestConfig, tpl: &Templates, server: &SharedServer,
-                                                                   voices_path: &Path, v: &VoiceJob) -> QuestMsg
-                                                                   {
-                                                                       let started = Instant::now();
-                                                                       let outcome = ensure_server(cfg, server)
-                                                                       .and_then(|_| generate_voice(cfg, tpl, &v.seed, &v.description))
-                                                                       .and_then(|text| {
-                                                                           append_voice(voices_path, v.city, &v.key, &v.description, &text)
-                                                                           .map_err(|e| format!("writing {}: {e}", voices_path.display()))?;
-                                                                           Ok(text)
-                                                                       });
-                                                                       match outcome {
-                                                                           Ok(text) => {
-                                                                               info!("Quest: voice '{}' ready in {:?}", v.key, started.elapsed());
-                                                                               QuestMsg::Voice { city: v.city, key: v.key.clone(), text }
-                                                                           }
-                                                                           Err(reason) => {
-                                                                               warn!("Quest: voice '{}': {reason}", v.key);
-                                                                               QuestMsg::VoiceFailed { city: v.city, key: v.key.clone() }
-                                                                           }
-                                                                       }
-                                                                   }
+                                                      fn run_voice(
+                                                          cfg: &QuestConfig,
+                                                          tpl: &Templates,
+                                                          server: &SharedServer,
+                                                          voices_path: &Path,
+                                                          v: &VoiceJob,
+                                                      ) -> QuestMsg {
+                                                          let started = Instant::now();
+                                                          let outcome = ensure_server(cfg, server)
+                                                          .and_then(|_| generate_voice_full(cfg, tpl, &v.seed, &v.description))
+                                                          .and_then(|(text, name, description, voice)| {
+                                                              append_voice(
+                                                                  voices_path,
+                                                                  v.city,
+                                                                  &v.key,
+                                                                  &v.description,
+                                                                  &text,
+                                                                  name.as_deref(),
+                                                                           description.as_deref(),
+                                                              )
+                                                              .map_err(|e| format!("writing {}: {e}", voices_path.display()))?;
+                                                              Ok((text, name, description, voice))
+                                                          });
+                                                          match outcome {
+                                                              Ok((text, name, description, voice)) => {
+                                                                  info!(
+                                                                      "Quest: voice '{}' ready in {:?} (name: {:?}, background: {}, voice: {:?})",
+                                                                        v.key,
+                                                                        started.elapsed(),
+                                                                        name,
+                                                                        if description.is_some() { "sì" } else { "no" },
+                                                                        voice,
+                                                                  );
+                                                                  QuestMsg::Voice {
+                                                                      city: v.city,
+                                                                      key: v.key.clone(),
+                                                                      text,
+                                                                      name,
+                                                                      description,
+                                                                      voice,
+                                                                      original_label: v.original_label.clone(),
+                                                                      sprite_stem: v.sprite_stem.clone(),
+                                                                  }
+                                                              }
+                                                              Err(reason) => {
+                                                                  warn!("Quest: voice '{}': {reason}", v.key);
+                                                                  QuestMsg::VoiceFailed { city: v.city, key: v.key.clone() }
+                                                              }
+                                                          }
+                                                      }
 
-                                                                   fn run_ask(cfg: &QuestConfig, tpl: &Templates, server: &SharedServer, a: &AskJob) -> QuestMsg {
-                                                                       let started = Instant::now();
-                                                                       match ensure_server(cfg, server).and_then(|_| generate_answer(cfg, tpl, a)) {
-                                                                           Ok((text, follow, mood)) => {
-                                                                               info!("Quest: answer #{} ready in {:?} ({} turns, follow={}, mood={})",
-                                                                                     a.id, started.elapsed(), a.history.len() / 2, follow, mood);
-                                                                               QuestMsg::Answer { id: a.id, text, follow, mood }
-                                                                           }
-                                                                           Err(reason) => {
-                                                                               warn!("Quest: answer #{}: {reason}", a.id);
-                                                                               QuestMsg::AnswerFailed { id: a.id }
-                                                                           }
-                                                                       }
-                                                                   }
+                                                      fn run_ask(cfg: &QuestConfig, tpl: &Templates, server: &SharedServer, a: &AskJob) -> QuestMsg {
+                                                          let started = Instant::now();
+                                                          match ensure_server(cfg, server).and_then(|_| generate_answer(cfg, tpl, a)) {
+                                                              Ok((text, follow, mood)) => {
+                                                                  info!("Quest: answer #{} ready in {:?} ({} turns, follow={}, mood={})",
+                                                                        a.id, started.elapsed(), a.history.len() / 2, follow, mood);
+                                                                  QuestMsg::Answer { id: a.id, text, follow, mood }
+                                                              }
+                                                              Err(reason) => {
+                                                                  warn!("Quest: answer #{}: {reason}", a.id);
+                                                                  QuestMsg::AnswerFailed { id: a.id }
+                                                              }
+                                                          }
+                                                      }
 
-                                                                   #[cfg(test)]
-                                                                   fn worker_main(cfg: QuestConfig, tpl: Templates, quests_path: PathBuf,
-                                                                                  jobs: Receiver<Job>, results: Sender<QuestMsg>, server: SharedServer)
-                                                                   {
-                                                                       let (_voice_tx, voice_rx) = mpsc::channel();
-                                                                       let (_ask_tx, ask_rx) = mpsc::channel();
-                                                                       worker_loop(cfg, tpl, quests_path, PathBuf::from("quest_npc_voices.test.txt"),
-                                                                                   jobs, voice_rx, ask_rx, results, server);
-                                                                   }
+                                                      #[cfg(test)]
+                                                      fn worker_main(cfg: QuestConfig, tpl: Templates, quests_path: PathBuf,
+                                                                     jobs: Receiver<Job>, results: Sender<QuestMsg>, server: SharedServer)
+                                                      {
+                                                          let (_voice_tx, voice_rx) = mpsc::channel();
+                                                          let (_ask_tx, ask_rx) = mpsc::channel();
+                                                          worker_loop(cfg, tpl, quests_path, PathBuf::from("quest_npc_voices.test.txt"),
+                                                                      jobs, voice_rx, ask_rx, results, server);
+                                                      }
 
-                                                                   #[allow(clippy::too_many_arguments)]
-                                                                   fn worker_loop(cfg: QuestConfig, tpl: Templates, quests_path: PathBuf, voices_path: PathBuf,
-                                                                                  jobs: Receiver<Job>, voice_jobs: Receiver<VoiceJob>, ask_jobs: Receiver<AskJob>,
-                                                                                  results: Sender<QuestMsg>, server: SharedServer)
-                                                                   {
-                                                                       let idle = Duration::from_secs(cfg.idle_stop_secs.max(1));
-                                                                       let mut catalog_cache: Option<FlatCatalog> = None;
-                                                                       let mut last_work = Instant::now();
-                                                                       loop {
-                                                                           match jobs.recv_timeout(WORKER_POLL) {
-                                                                               Ok(job) => {
-                                                                                   let started = Instant::now();
-                                                                                   let npc_flats = {
-                                                                                       let catalog = catalog_cache.get_or_insert_with(|| FlatCatalog::load(&job.arena_dir));
-                                                                                       collect_npc_flats(&job.location, &job.blocks_buf, catalog)
-                                                                                   };
-                                                                                   let outcome = ensure_server(&cfg, &server)
-                                                                                   .and_then(|_| generate_quest(&cfg, &tpl, &job, &npc_flats))
-                                                                                   .and_then(|quest| {
-                                                                                       append_quest(&quests_path, &quest)
-                                                                                       .map_err(|e| format!("writing {}: {e}", quests_path.display()))?;
-                                                                                       Ok(quest)
-                                                                                   });
-                                                                                   let msg = match outcome {
-                                                                                       Ok(quest) => {
-                                                                                           info!("Quest for {} generated in {:?} ({} NPC flavors)",
-                                                                                                 job.city_name, started.elapsed(), quest.npc_flavors.len());
-                                                                                           QuestMsg::Done(quest)
-                                                                                       }
-                                                                                       Err(reason) => {
-                                                                                           warn!("Quest for {}: {reason}", job.city_name);
-                                                                                           QuestMsg::Failed { city: job.city, reason }
-                                                                                       }
-                                                                                   };
-                                                                                   if results.send(msg).is_err() { break; }
-                                                                                   last_work = Instant::now();
-                                                                               }
-                                                                               Err(RecvTimeoutError::Timeout) => {}
-                                                                               Err(RecvTimeoutError::Disconnected) => break,
-                                                                           }
-                                                                           if let Ok(a) = ask_jobs.try_recv() {
-                                                                               let msg = run_ask(&cfg, &tpl, &server, &a);
-                                                                               if results.send(msg).is_err() { break; }
-                                                                               last_work = Instant::now();
-                                                                           } else if let Ok(v) = voice_jobs.try_recv() {
-                                                                               let msg = run_voice(&cfg, &tpl, &server, &voices_path, &v);
-                                                                               if results.send(msg).is_err() { break; }
-                                                                               last_work = Instant::now();
-                                                                           }
-                                                                           if last_work.elapsed() >= idle { stop_server(&server); last_work = Instant::now(); }
-                                                                       }
-                                                                       stop_server(&server);
-                                                                   }
+                                                      #[allow(clippy::too_many_arguments)]
+                                                      fn worker_loop(cfg: QuestConfig, tpl: Templates, quests_path: PathBuf, voices_path: PathBuf,
+                                                                     jobs: Receiver<Job>, voice_jobs: Receiver<VoiceJob>, ask_jobs: Receiver<AskJob>,
+                                                                     results: Sender<QuestMsg>, server: SharedServer)
+                                                      {
+                                                          let idle = Duration::from_secs(cfg.idle_stop_secs.max(1));
+                                                          let mut catalog_cache: Option<FlatCatalog> = None;
+                                                          let mut last_work = Instant::now();
+                                                          loop {
+                                                              match jobs.recv_timeout(WORKER_POLL) {
+                                                                  Ok(job) => {
+                                                                      let started = Instant::now();
+                                                                      let npc_flats = {
+                                                                          let catalog = catalog_cache.get_or_insert_with(|| FlatCatalog::load(&job.arena_dir));
+                                                                          collect_npc_flats(&job.location, &job.blocks_buf, catalog)
+                                                                      };
+                                                                      let outcome = ensure_server(&cfg, &server)
+                                                                      .and_then(|_| generate_quest(&cfg, &tpl, &job, &npc_flats))
+                                                                      .and_then(|quest| {
+                                                                          append_quest(&quests_path, &quest)
+                                                                          .map_err(|e| format!("writing {}: {e}", quests_path.display()))?;
+                                                                          Ok(quest)
+                                                                      });
+                                                                      let msg = match outcome {
+                                                                          Ok(quest) => {
+                                                                              info!("Quest for {} generated in {:?} ({} NPC flavors)",
+                                                                                    job.city_name, started.elapsed(), quest.npc_flavors.len());
+                                                                              QuestMsg::Done(quest)
+                                                                          }
+                                                                          Err(reason) => {
+                                                                              warn!("Quest for {}: {reason}", job.city_name);
+                                                                              QuestMsg::Failed { city: job.city, reason }
+                                                                          }
+                                                                      };
+                                                                      if results.send(msg).is_err() { break; }
+                                                                      last_work = Instant::now();
+                                                                  }
+                                                                  Err(RecvTimeoutError::Timeout) => {}
+                                                                  Err(RecvTimeoutError::Disconnected) => break,
+                                                              }
+                                                              if let Ok(a) = ask_jobs.try_recv() {
+                                                                  let msg = run_ask(&cfg, &tpl, &server, &a);
+                                                                  if results.send(msg).is_err() { break; }
+                                                                  last_work = Instant::now();
+                                                              } else if let Ok(v) = voice_jobs.try_recv() {
+                                                                  let msg = run_voice(&cfg, &tpl, &server, &voices_path, &v);
+                                                                  if results.send(msg).is_err() { break; }
+                                                                  last_work = Instant::now();
+                                                              }
+                                                              if last_work.elapsed() >= idle { stop_server(&server); last_work = Instant::now(); }
+                                                          }
+                                                          stop_server(&server);
+                                                      }
 
-                                                                   // =============================================================================
-                                                                   // Plugin
-                                                                   // =============================================================================
-                                                                   #[derive(Resource)]
-                                                                   pub struct QuestWorker {
-                                                                       jobs: Sender<Job>,
-                                                                       voice_jobs: Sender<VoiceJob>,
-                                                                       ask_jobs: Sender<AskJob>,
-                                                                       next_ask: AtomicU64,
-                                                                       results: Mutex<Receiver<QuestMsg>>,
-                                                                       server: SharedServer,
-                                                                   }
+                                                      // =============================================================================
+                                                      // Plugin
+                                                      // =============================================================================
+                                                      #[derive(Resource)]
+                                                      pub struct QuestWorker {
+                                                          jobs: Sender<Job>,
+                                                          voice_jobs: Sender<VoiceJob>,
+                                                          ask_jobs: Sender<AskJob>,
+                                                          next_ask: AtomicU64,
+                                                          results: Mutex<Receiver<QuestMsg>>,
+                                                          server: SharedServer,
+                                                      }
 
-                                                                   impl QuestWorker {
-                                                                       pub fn ask(&self, city_name: &str, description: &str, question: &str,
-                                                                                  history: Vec<(String, String)>) -> Option<u64>
-                                                                                  {
-                                                                                      let question = clean_question(question)?;
-                                                                                      let id = self.next_ask.fetch_add(1, Ordering::Relaxed);
-                                                                                      let max = MAX_HISTORY_TURNS * 2;
-                                                                                      let history = if history.len() > max { history[history.len() - max..].to_vec() } else { history };
-                                                                                      let job = AskJob { id, city_name: city_name.to_string(), description: description.to_string(),
-                                                                                          question, history };
-                                                                                          self.ask_jobs.send(job).is_ok().then_some(id)
-                                                                                  }
+                                                      impl QuestWorker {
+                                                          pub fn ask(&self, city_name: &str, description: &str, question: &str,
+                                                                     history: Vec<(String, String)>) -> Option<u64>
+                                                                     {
+                                                                         let question = clean_question(question)?;
+                                                                         let id = self.next_ask.fetch_add(1, Ordering::Relaxed);
+                                                                         let max = MAX_HISTORY_TURNS * 2;
+                                                                         let history = if history.len() > max { history[history.len() - max..].to_vec() } else { history };
+                                                                         let job = AskJob { id, city_name: city_name.to_string(), description: description.to_string(),
+                                                                             question, history };
+                                                                             self.ask_jobs.send(job).is_ok().then_some(id)
+                                                                     }
 
-                                                                                  pub fn request_voice(&self, book: &mut QuestBook, city: (i32, i32), key: &str, description: &str) -> bool {
-                                                                                      let Some(seed) = book.quest(city).map(|q| q.seed.clone()) else { return false };
-                                                                                      if !matches!(book.voice_state(city, key), VoiceState::Unknown) { return false; }
-                                                                                      let job = VoiceJob { city, key: key.to_string(), description: description.to_string(), seed };
-                                                                                      if self.voice_jobs.send(job).is_ok() {
-                                                                                          book.voices_pending.insert((city, key.to_string()));
-                                                                                          true
-                                                                                      } else { false }
-                                                                                  }
-                                                                   }
+                                                                     /// Chiede la voce + il profilo (name, description) di un NPC.
+                                                                     ///
+                                                                     /// `original_label` e `sprite_stem` vengono passati al worker e
+                                                                     /// propagati in `QuestMsg::Voice`: `quest_poll` li userà per
+                                                                     /// `classic_npc::apply_llm_background` (solo se `sprite_stem` è
+                                                                     /// `Some`).
+                                                                     ///
+                                                                     /// Idempotente: se `voice_state` non è `Unknown`, ritorna `false`.
+                                                                     pub fn request_voice(
+                                                                         &self,
+                                                                         book: &mut QuestBook,
+                                                                         city: (i32, i32),
+                                                                                          key: &str,
+                                                                                          description: &str,
+                                                                                          original_label: &str,
+                                                                                          sprite_stem: Option<&str>,
+                                                                     ) -> bool {
+                                                                         let Some(seed) = book.quest(city).map(|q| q.seed.clone()) else { return false };
+                                                                         if !matches!(book.voice_state(city, key), VoiceState::Unknown) { return false; }
+                                                                         let job = VoiceJob {
+                                                                             city,
+                                                                             key: key.to_string(),
+                                                                             description: description.to_string(),
+                                                                             original_label: original_label.to_string(),
+                                                                             sprite_stem: sprite_stem.map(str::to_string),
+                                                                             seed,
+                                                                         };
+                                                                         if self.voice_jobs.send(job).is_ok() {
+                                                                             book.voices_pending.insert((city, key.to_string()));
+                                                                             true
+                                                                         } else {
+                                                                             false
+                                                                         }
+                                                                     }
+                                                      }
 
-                                                                   impl Drop for QuestWorker {
-                                                                       fn drop(&mut self) { stop_server(&self.server); }
-                                                                   }
+                                                      impl Drop for QuestWorker {
+                                                          fn drop(&mut self) { stop_server(&self.server); }
+                                                      }
 
-                                                                   fn read_prompt(file: &str, default: &str) -> String {
-                                                                       match std::fs::read_to_string(file) {
-                                                                           Ok(t) if !t.trim().is_empty() => { info!("Quest: using prompt from {file}"); t }
-                                                                           _ => default.to_string(),
-                                                                       }
-                                                                   }
+                                                      fn read_prompt(file: &str, default: &str) -> String {
+                                                          match std::fs::read_to_string(file) {
+                                                              Ok(t) if !t.trim().is_empty() => { info!("Quest: using prompt from {file}"); t }
+                                                              _ => default.to_string(),
+                                                          }
+                                                      }
 
-                                                                   pub struct QuestPlugin;
+                                                      pub struct QuestPlugin;
 
-                                                                   impl Plugin for QuestPlugin {
-                                                                       fn build(&self, app: &mut App) {
-                                                                           let cfg = QuestConfig::load_or_create(Path::new(CONFIG_FILE));
-                                                                           let mut book = QuestBook::load(Path::new(QUESTS_FILE));
-                                                                           book.load_voices(Path::new(VOICES_FILE));
-                                                                           info!("Quest: {} already saved in {QUESTS_FILE} (+{} NPC voices), generator {}",
-                                                                                 book.len(), book.voice_count(), if cfg.enabled { "active" } else { "disabled" });
-                                                                           app.insert_resource(book);
-                                                                           if !cfg.enabled { return; }
-                                                                           let tpl = Templates {
-                                                                               seed: read_prompt(SEED_PROMPT_FILE, DEFAULT_SEED_PROMPT),
-                                                                               rumors: read_prompt(RUMORS_PROMPT_FILE, DEFAULT_RUMORS_PROMPT),
-                                                                               npc_flavor: read_prompt(NPC_FLAVOR_PROMPT_FILE, DEFAULT_NPC_FLAVOR_PROMPT),
-                                                                               voice: read_prompt(NPC_VOICE_PROMPT_FILE, DEFAULT_NPC_VOICE_PROMPT),
-                                                                               ask: read_prompt(NPC_ASK_PROMPT_FILE, DEFAULT_NPC_ASK_PROMPT),
-                                                                           };
-                                                                           let (job_tx, job_rx) = mpsc::channel();
-                                                                           let (voice_tx, voice_rx) = mpsc::channel();
-                                                                           let (ask_tx, ask_rx) = mpsc::channel();
-                                                                           let (res_tx, res_rx) = mpsc::channel();
-                                                                           let server: SharedServer = Arc::new(Mutex::new(None));
-                                                                           let thread_server = Arc::clone(&server);
-                                                                           let spawned = std::thread::Builder::new().name("quest-llm".into()).spawn(move || {
-                                                                               worker_loop(cfg, tpl, PathBuf::from(QUESTS_FILE), PathBuf::from(VOICES_FILE),
-                                                                                           job_rx, voice_rx, ask_rx, res_tx, thread_server)
-                                                                           });
-                                                                           if let Err(e) = spawned { warn!("Quest: cannot start generator thread: {e}"); return; }
-                                                                           app.insert_resource(QuestWorker {
-                                                                               jobs: job_tx, voice_jobs: voice_tx, ask_jobs: ask_tx,
-                                                                               next_ask: AtomicU64::new(1),
-                                                                                               results: Mutex::new(res_rx), server,
-                                                                           })
-                                                                           .add_systems(Update, (quest_trigger, quest_poll));
-                                                                       }
-                                                                   }
+                                                      impl Plugin for QuestPlugin {
+                                                          fn build(&self, app: &mut App) {
+                                                              let cfg = QuestConfig::load_or_create(Path::new(CONFIG_FILE));
+                                                              let mut book = QuestBook::load(Path::new(QUESTS_FILE));
+                                                              book.load_voices(Path::new(VOICES_FILE));
+                                                              info!("Quest: {} already saved in {QUESTS_FILE} (+{} NPC voices), generator {}",
+                                                                    book.len(), book.voice_count(), if cfg.enabled { "active" } else { "disabled" });
+                                                              app.insert_resource(book);
+                                                              if !cfg.enabled { return; }
+                                                              let tpl = Templates {
+                                                                  seed: read_prompt(SEED_PROMPT_FILE, DEFAULT_SEED_PROMPT),
+                                                                  rumors: read_prompt(RUMORS_PROMPT_FILE, DEFAULT_RUMORS_PROMPT),
+                                                                  npc_flavor: read_prompt(NPC_FLAVOR_PROMPT_FILE, DEFAULT_NPC_FLAVOR_PROMPT),
+                                                                  voice: read_prompt(NPC_VOICE_PROMPT_FILE, DEFAULT_NPC_VOICE_PROMPT),
+                                                                  ask: read_prompt(NPC_ASK_PROMPT_FILE, DEFAULT_NPC_ASK_PROMPT),
+                                                              };
+                                                              let (job_tx, job_rx) = mpsc::channel();
+                                                              let (voice_tx, voice_rx) = mpsc::channel();
+                                                              let (ask_tx, ask_rx) = mpsc::channel();
+                                                              let (res_tx, res_rx) = mpsc::channel();
+                                                              let server: SharedServer = Arc::new(Mutex::new(None));
+                                                              let thread_server = Arc::clone(&server);
+                                                              let spawned = std::thread::Builder::new().name("quest-llm".into()).spawn(move || {
+                                                                  worker_loop(cfg, tpl, PathBuf::from(QUESTS_FILE), PathBuf::from(VOICES_FILE),
+                                                                              job_rx, voice_rx, ask_rx, res_tx, thread_server)
+                                                              });
+                                                              if let Err(e) = spawned { warn!("Quest: cannot start generator thread: {e}"); return; }
+                                                              app.insert_resource(QuestWorker {
+                                                                  jobs: job_tx, voice_jobs: voice_tx, ask_jobs: ask_tx,
+                                                                  next_ask: AtomicU64::new(1),
+                                                                                  results: Mutex::new(res_rx), server,
+                                                              })
+                                                              .add_systems(
+                                                                  Update,
+                                                                  (
+                                                                      quest_trigger,
+                                                                   quest_poll,
+                                                                   // Prefetch delle voci degli NPC quando entri in un
+                                                                   // interno. `interior_enter_exit` emette
+                                                                   // `InteriorEntered`; qui consumiamo l'evento e
+                                                                   // mettiamo in coda le voci per ogni NPC presente.
+                                                                   // `request_voice` è idempotente, quindi non
+                                                                   // duplica voci già `Ready`/`Pending`.
+                                                                   prefetch_interior_voices
+                                                                   .after(crate::interior::interior_enter_exit),
+                                                                  ),
+                                                              );
+                                                          }
+                                                      }
 
-                                                                   fn quest_trigger(data: Res<GameData>, origin: Res<Origin>, player: Query<&Transform, With<Player>>,
-                                                                                    worker: Res<QuestWorker>, mut book: ResMut<QuestBook>, mut last: Local<Option<(i32, i32)>>)
-                                                                   {
-                                                                       let Ok(tf) = player.get_single() else { return };
-                                                                       let here = map_pixel_of(&origin, tf.translation);
-                                                                       if *last == Some(here) { return; }
-                                                                       *last = Some(here);
-                                                                       let Some(loc) = data.locations.get(&here) else { return };
-                                                                       if !is_town(loc) || book.knows(here) { return; }
-                                                                       let job = Job {
-                                                                           city: here, city_name: loc.name.clone(), theme: theme_for(here),
-                                                                           location: loc.clone(), blocks_buf: Arc::clone(&data.blocks_buf), arena_dir: data.dir.clone(),
-                                                                       };
-                                                                       if worker.jobs.send(job).is_ok() {
-                                                                           info!("Quest: generating quest for {} (map pixel {}, {})", loc.name, here.0, here.1);
-                                                                           book.mark_pending(here);
-                                                                       }
-                                                                   }
+                                                      fn quest_trigger(data: Res<GameData>, origin: Res<Origin>, player: Query<&Transform, With<Player>>,
+                                                                       worker: Res<QuestWorker>, mut book: ResMut<QuestBook>, mut last: Local<Option<(i32, i32)>>)
+                                                      {
+                                                          let Ok(tf) = player.get_single() else { return };
+                                                          let here = map_pixel_of(&origin, tf.translation);
+                                                          if *last == Some(here) { return; }
+                                                          *last = Some(here);
+                                                          let Some(loc) = data.locations.get(&here) else { return };
+                                                          if !is_town(loc) || book.knows(here) { return; }
+                                                          let job = Job {
+                                                              city: here, city_name: loc.name.clone(), theme: theme_for(here),
+                                                              location: loc.clone(), blocks_buf: Arc::clone(&data.blocks_buf), arena_dir: data.dir.clone(),
+                                                          };
+                                                          if worker.jobs.send(job).is_ok() {
+                                                              info!("Quest: generating quest for {} (map pixel {}, {})", loc.name, here.0, here.1);
+                                                              book.mark_pending(here);
+                                                          }
+                                                      }
 
-                                                                   fn quest_poll(worker: Res<QuestWorker>, mut book: ResMut<QuestBook>) {
-                                                                       let Ok(results) = worker.results.try_lock() else { return };
-                                                                       while let Ok(msg) = results.try_recv() {
-                                                                           match msg {
-                                                                               QuestMsg::Done(quest) => {
-                                                                                   book.clear_pending(quest.city);
-                                                                                   book.insert_quest(quest);
-                                                                               }
-                                                                               QuestMsg::Failed { city, reason } => {
-                                                                                   warn!("Quest: città {city:?} fallita: {reason}");
-                                                                                   book.mark_failed(city);
-                                                                               }
-                                                                               QuestMsg::Voice { city, key, text } => book.store_voice(city, key, text),
-                                                                               QuestMsg::VoiceFailed { city, key } => book.fail_voice(city, key),
-                                                                               QuestMsg::Answer { id, text, follow, mood } => book.store_answer(id, text, follow, mood),
-                                                                               QuestMsg::AnswerFailed { id } => book.fail_answer(id),
-                                                                           }
-                                                                       }
-                                                                   }
+                                                      fn quest_poll(
+                                                          worker: Res<QuestWorker>,
+                                                          mut book: ResMut<QuestBook>,
+                                                          custom_npcs: Res<CustomNpcCache>,
+                                                      ) {
+                                                          let Ok(results) = worker.results.try_lock() else { return };
+                                                          while let Ok(msg) = results.try_recv() {
+                                                              match msg {
+                                                                  QuestMsg::Done(quest) => {
+                                                                      book.clear_pending(quest.city);
+                                                                      book.insert_quest(quest);
+                                                                  }
+                                                                  QuestMsg::Failed { city, reason } => {
+                                                                      warn!("Quest: città {city:?} fallita: {reason}");
+                                                                      book.mark_failed(city);
+                                                                  }
+                                                                  QuestMsg::Voice { city, key, text, name, description, voice, original_label, sprite_stem } => {
+                                                                      book.store_voice_full(
+                                                                          city,
+                                                                          key.clone(),
+                                                                                            text,
+                                                                                            name.clone(),
+                                                                                            description.clone(),
+                                                                      );
+                                                                      // Scrivi nome+background nel `.txt` di `classic_npc`
+                                                                      // (solo se `sprite_stem` è `Some`: i custom non lo usano).
+                                                                      if let Some(stem) = sprite_stem.as_deref() {
+                                                                          crate::classic_npc::apply_llm_background(
+                                                                              custom_npcs.dir.as_path(),
+                                                                                                                   city,
+                                                                                                                   &key,
+                                                                                                                   stem,
+                                                                                                                   &original_label,
+                                                                                                                   name.as_deref(),
+                                                                                                                   description.as_deref(),
+                                                                          );
+                                                                          // Voce TTS: solo se nel `.txt` il campo `voice` e' ancora vuoto.
+                                                                          if let Some(v) = voice.as_deref() {
+                                                                              crate::classic_npc::apply_llm_voice(
+                                                                                  custom_npcs.dir.as_path(),
+                                                                                  city,
+                                                                                  &key,
+                                                                                  stem,
+                                                                                  v,
+                                                                              );
+                                                                          }
+                                                                      }
+                                                                  }
+                                                                  QuestMsg::VoiceFailed { city, key } => book.fail_voice(city, key),
+                                                                  QuestMsg::Answer { id, text, follow, mood } => book.store_answer(id, text, follow, mood),
+                                                                  QuestMsg::AnswerFailed { id } => book.fail_answer(id),
+                                                              }
+                                                          }
+                                                      }
 
-                                                                   // =============================================================================
-                                                                   // Test
-                                                                   // =============================================================================
-                                                                   #[cfg(test)]
-                                                                   mod tests {
-                                                                       use super::*;
-                                                                       use crate::quests::{jstr, Seed, Tone};
-                                                                       use std::io::{BufRead, BufReader};
-                                                                       use std::net::TcpListener;
-                                                                       use std::sync::atomic::{AtomicU32, AtomicU64};
+                                                      /// Prefetch delle voci degli NPC di un interno.
+                                                      ///
+                                                      /// Consuma `crate::interior::InteriorEntered` (emesso da
+                                                      /// `interior::interior_enter_exit` quando entri in un edificio
+                                                      /// con almeno un NPC). Per ogni voce chiama
+                                                      /// `QuestWorker::request_voice`, che è idempotente:
+                                                      ///   - `Unknown` → mette in coda (`Pending`);
+                                                      ///   - `Pending`/`Ready`/`Failed` → no-op.
+                                                      ///
+                                                      /// Se il quest della città non è ancora pronto (nessuna `Seed`),
+                                                      /// `request_voice` ritorna `false` e la voce verrà richiesta
+                                                      /// on-demand quando parli (stessa cosa che succederebbe senza
+                                                      /// prefetch). Utile perché l'utente può entrare in un interno
+                                                      /// prima che `quest_trigger` abbia finito di generare.
+                                                      fn prefetch_interior_voices(
+                                                          mut events: EventReader<InteriorEntered>,
+                                                          worker: Res<QuestWorker>,
+                                                          mut book: ResMut<QuestBook>,
+                                                      ) {
+                                                          for ev in events.read() {
+                                                              if book.quest(ev.city).is_none() {
+                                                                  debug!(
+                                                                      "Prefetch voci: quest non ancora pronta per ({},{}), salto",
+                                                                         ev.city.0, ev.city.1,
+                                                                  );
+                                                                  continue;
+                                                              }
+                                                              let mut queued = 0;
+                                                              for v in &ev.voices {
+                                                                  if worker.request_voice(
+                                                                      &mut book,
+                                                                      ev.city,
+                                                                      &v.voice_key,
+                                                                      &v.description,
+                                                                      &v.original_label,
+                                                                      v.sprite_stem.as_deref(),
+                                                                  ) {
+                                                                      queued += 1;
+                                                                  }
+                                                              }
+                                                              if queued > 0 {
+                                                                  info!(
+                                                                      "Prefetch voci: {} NPC in ({},{}), {} nuove in coda",
+                                                                        ev.voices.len(), ev.city.0, ev.city.1, queued,
+                                                                  );
+                                                              } else {
+                                                                  debug!(
+                                                                      "Prefetch voci: {} NPC in ({},{}), tutte già in cache",
+                                                                         ev.voices.len(), ev.city.0, ev.city.1,
+                                                                  );
+                                                              }
+                                                          }
+                                                      }
 
-                                                                       fn test_cfg(port: u16) -> QuestConfig {
-                                                                           QuestConfig { port, server_bin: "/does/not/exist/llama-server".into(),
-                                                                               idle_stop_secs: 1, ..QuestConfig::default() }
-                                                                       }
+                                                      // =============================================================================
+                                                      // Test
+                                                      // =============================================================================
+                                                      #[cfg(test)]
+                                                      mod tests {
+                                                          use super::*;
+                                                          use crate::quests::{jstr, Seed, Tone};
+                                                          use std::io::{BufRead, BufReader};
+                                                          use std::net::TcpListener;
+                                                          use std::sync::atomic::{AtomicU32, AtomicU64};
 
-                                                                       fn tpl() -> Templates {
-                                                                           Templates {
-                                                                               seed: DEFAULT_SEED_PROMPT.to_string(), rumors: DEFAULT_RUMORS_PROMPT.to_string(),
-                                                                               npc_flavor: DEFAULT_NPC_FLAVOR_PROMPT.to_string(),
-                                                                               voice: DEFAULT_NPC_VOICE_PROMPT.to_string(), ask: DEFAULT_NPC_ASK_PROMPT.to_string(),
-                                                                           }
-                                                                       }
+                                                          fn test_cfg(port: u16) -> QuestConfig {
+                                                              QuestConfig { port, server_bin: "/does/not/exist/llama-server".into(),
+                                                                  idle_stop_secs: 1, ..QuestConfig::default() }
+                                                          }
 
-                                                                       fn good_seed_json() -> Json {
-                                                                           Json::parse(
-                                                                               r#"{"theme":"artifact_discovery","title":"The Whisper of Vael","dungeon_id":"dgf_crypt_ash",
-                                                                               "quest_giver_id":"mages_guild","tomb_name":"Nekhar-Zul","artifact_name":"Eye of Vael",
-                                                                               "difficulty":3,"lore":"An ancient glass eye sleeps beneath the crypt."}"#,
-                                                                           ).unwrap()
-                                                                       }
+                                                          fn tpl() -> Templates {
+                                                              Templates {
+                                                                  seed: DEFAULT_SEED_PROMPT.to_string(), rumors: DEFAULT_RUMORS_PROMPT.to_string(),
+                                                                  npc_flavor: DEFAULT_NPC_FLAVOR_PROMPT.to_string(),
+                                                                  voice: DEFAULT_NPC_VOICE_PROMPT.to_string(), ask: DEFAULT_NPC_ASK_PROMPT.to_string(),
+                                                              }
+                                                          }
 
-                                                                       fn seed_reply() -> String { format!("```json\n{}\n```", good_seed_json().compact()) }
+                                                          fn good_seed_json() -> Json {
+                                                              Json::parse(
+                                                                  r#"{"theme":"artifact_discovery","title":"The Whisper of Vael","dungeon_id":"dgf_crypt_ash",
+                                                                  "quest_giver_id":"mages_guild","tomb_name":"Nekhar-Zul","artifact_name":"Eye of Vael",
+                                                                  "difficulty":3,"lore":"An ancient glass eye sleeps beneath the crypt."}"#,
+                                                              ).unwrap()
+                                                          }
 
-                                                                       fn rumors_reply() -> String {
-                                                                           let texts: [&str; 5] = [
-                                                                               "Your Grace, it is said the Mages Guild watches over Nekhar-Zul and the Eye of Vael.",
-                                                                               "The roads to Nekhar-Zul are a couple of hours out, and prices are rising.",
-                                                                               "I saw the mages leave for those ruins. They seek the Eye of Vael.",
-                                                                               "They say there's something pulsing in the crypt outside town. It scares me.",
-                                                                               "Dunno, Nekhar... Nekhal? Ten or twenty kilometers, let's drink!",
-                                                                           ];
-                                                                           let items: Vec<Json> = Tone::ALL.iter().zip(texts)
-                                                                           .map(|(t, text)| Json::Obj(vec![("tone".into(), jstr(t.key())), ("text".into(), jstr(text))]))
-                                                                           .collect();
-                                                                           Json::Obj(vec![("rumors".into(), Json::Arr(items))]).compact()
-                                                                       }
+                                                          fn seed_reply() -> String { format!("```json\n{}\n```", good_seed_json().compact()) }
 
-                                                                       fn empty_location() -> DFLocation {
-                                                                           DFLocation { name: "X".into(), region_index: 0, world_x: 0, world_y: 0,
-                                                                               width: 0, height: 0, block_names: Vec::new(), letter1_for_rmb_name: None }
-                                                                       }
+                                                          fn rumors_reply() -> String {
+                                                              let texts: [&str; 5] = [
+                                                                  "Your Grace, it is said the Mages Guild watches over Nekhar-Zul and the Eye of Vael.",
+                                                                  "The roads to Nekhar-Zul are a couple of hours out, and prices are rising.",
+                                                                  "I saw the mages leave for those ruins. They seek the Eye of Vael.",
+                                                                  "They say there's something pulsing in the crypt outside town. It scares me.",
+                                                                  "Dunno, Nekhar... Nekhal? Ten or twenty kilometers, let's drink!",
+                                                              ];
+                                                              let items: Vec<Json> = Tone::ALL.iter().zip(texts)
+                                                              .map(|(t, text)| Json::Obj(vec![("tone".into(), jstr(t.key())), ("text".into(), jstr(text))]))
+                                                              .collect();
+                                                              Json::Obj(vec![("rumors".into(), Json::Arr(items))]).compact()
+                                                          }
 
-                                                                       #[test]
-                                                                       fn extract_json_handles_fences_and_thinking() {
-                                                                           assert_eq!(extract_json("<think>x</think>```json\n{\"a\":1}\n```"), "{\"a\":1}");
-                                                                           assert_eq!(extract_json("Here: {\"a\": 1} end"), "{\"a\": 1}");
-                                                                       }
+                                                          fn voice_reply() -> String {
+                                                              Json::Obj(vec![
+                                                                  ("name".into(), jstr("Matthew")),
+                                                                        ("description".into(), jstr("You are Matthew, a member of the Mages Guild.")),
+                                                                        ("text".into(), jstr("The mages are moving on Nekhar-Zul.")),
+                                                              ]).compact()
+                                                          }
 
-                                                                       #[test]
-                                                                       fn http_responses_are_parsed() {
-                                                                           let plain = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
-                                                                           assert_eq!(parse_http_response(plain).unwrap(), (200, "{\"a\":1}".to_string()));
-                                                                       }
+                                                          fn empty_location() -> DFLocation {
+                                                              DFLocation { name: "X".into(), region_index: 0, world_x: 0, world_y: 0,
+                                                                  width: 0, height: 0, block_names: Vec::new(), letter1_for_rmb_name: None }
+                                                          }
 
-                                                                       struct FakeServer { port: u16, bodies: Arc<Mutex<Vec<String>>> }
+                                                          #[test]
+                                                          fn extract_json_handles_fences_and_thinking() {
+                                                              assert_eq!(extract_json("<think>x</think>```json\n{\"a\":1}\n```"), "{\"a\":1}");
+                                                              assert_eq!(extract_json("Here: {\"a\": 1} end"), "{\"a\": 1}");
+                                                          }
 
-                                                                       fn fake_server(replies: Vec<(u16, String)>) -> FakeServer {
-                                                                           let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                                                                           let port = listener.local_addr().unwrap().port();
-                                                                           let bodies = Arc::new(Mutex::new(Vec::new()));
-                                                                           let seen = Arc::clone(&bodies);
-                                                                           let replies = Arc::new(Mutex::new(replies.into_iter().collect::<std::collections::VecDeque<_>>()));
-                                                                           std::thread::spawn(move || {
-                                                                               for stream in listener.incoming() {
-                                                                                   let Ok(mut stream) = stream else { break };
-                                                                                   let mut reader = BufReader::new(stream.try_clone().unwrap());
-                                                                                   let mut request_line = String::new();
-                                                                                   reader.read_line(&mut request_line).unwrap_or(0);
-                                                                                   let mut length = 0usize;
-                                                                                   loop {
-                                                                                       let mut line = String::new();
-                                                                                       if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" { break; }
-                                                                                       if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                                                                                           length = v.trim().parse().unwrap_or(0);
-                                                                                       }
-                                                                                   }
-                                                                                   let mut body = vec![0u8; length];
-                                                                                   reader.read_exact(&mut body).ok();
-                                                                                   let (status, payload) = if request_line.starts_with("GET /health") {
-                                                                                       (200, "{\"status\":\"ok\"}".to_string())
-                                                                                   } else {
-                                                                                       seen.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
-                                                                                       let (st, content) = replies.lock().unwrap().pop_front().unwrap_or((500, "done".into()));
-                                                                                       if st == 200 {
-                                                                                           let json = Json::Obj(vec![("choices".into(),
-                                                                                                                      Json::Arr(vec![Json::Obj(vec![
-                                                                                                                          ("message".into(), Json::Obj(vec![("content".into(), jstr(&content))])),
-                                                                                                                                               ("finish_reason".into(), jstr("stop")),
-                                                                                                                      ])]))]);
-                                                                                           (200, json.compact())
-                                                                                       } else { (st, content) }
-                                                                                   };
-                                                                                   let response = format!(
-                                                                                       "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                                                                                       payload.len());
-                                                                                   stream.write_all(response.as_bytes()).ok();
-                                                                               }
-                                                                           });
-                                                                           FakeServer { port, bodies }
-                                                                       }
+                                                          #[test]
+                                                          fn http_responses_are_parsed() {
+                                                              let plain = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
+                                                              assert_eq!(parse_http_response(plain).unwrap(), (200, "{\"a\":1}".to_string()));
+                                                          }
 
-                                                                       #[test]
-                                                                       fn llm_call_reads_content() {
-                                                                           let srv = fake_server(vec![(200, "hello".into())]);
-                                                                           assert_eq!(call_llm(&test_cfg(srv.port), "test").unwrap(), "hello");
-                                                                       }
+                                                          struct FakeServer { port: u16, bodies: Arc<Mutex<Vec<String>>> }
 
-                                                                       #[test]
-                                                                       fn quest_is_generated_with_retries() {
-                                                                           let srv = fake_server(vec![
-                                                                               (200, "<think>hmm</think> no json".into()),
-                                                                                                 (200, seed_reply()),
-                                                                                                 (200, rumors_reply()),
-                                                                           ]);
-                                                                           let job = Job {
-                                                                               city: (207, 213), city_name: "Daggerfall".into(), theme: "rescue",
-                                                                               location: empty_location(), blocks_buf: Arc::new(Vec::new()),
-                                                                               arena_dir: PathBuf::from("/tmp"),
-                                                                           };
-                                                                           let q = generate_quest(&test_cfg(srv.port), &tpl(), &job, &[]).unwrap();
-                                                                           assert_eq!(q.seed.tomb_name, "Nekhar-Zul");
-                                                                           assert_eq!(q.rumors.len(), 5);
-                                                                       }
+                                                          fn fake_server(replies: Vec<(u16, String)>) -> FakeServer {
+                                                              let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                                                              let port = listener.local_addr().unwrap().port();
+                                                              let bodies = Arc::new(Mutex::new(Vec::new()));
+                                                              let seen = Arc::clone(&bodies);
+                                                              let replies = Arc::new(Mutex::new(replies.into_iter().collect::<std::collections::VecDeque<_>>()));
+                                                              std::thread::spawn(move || {
+                                                                  for stream in listener.incoming() {
+                                                                      let Ok(mut stream) = stream else { break };
+                                                                      let mut reader = BufReader::new(stream.try_clone().unwrap());
+                                                                      let mut request_line = String::new();
+                                                                      reader.read_line(&mut request_line).unwrap_or(0);
+                                                                      let mut length = 0usize;
+                                                                      loop {
+                                                                          let mut line = String::new();
+                                                                          if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" { break; }
+                                                                          if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                                                              length = v.trim().parse().unwrap_or(0);
+                                                                          }
+                                                                      }
+                                                                      let mut body = vec![0u8; length];
+                                                                      reader.read_exact(&mut body).ok();
+                                                                      let (status, payload) = if request_line.starts_with("GET /health") {
+                                                                          (200, "{\"status\":\"ok\"}".to_string())
+                                                                      } else {
+                                                                          seen.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
+                                                                          let (st, content) = replies.lock().unwrap().pop_front().unwrap_or((500, "done".into()));
+                                                                          if st == 200 {
+                                                                              let json = Json::Obj(vec![("choices".into(),
+                                                                                                         Json::Arr(vec![Json::Obj(vec![
+                                                                                                             ("message".into(), Json::Obj(vec![("content".into(), jstr(&content))])),
+                                                                                                                                  ("finish_reason".into(), jstr("stop")),
+                                                                                                         ])]))]);
+                                                                              (200, json.compact())
+                                                                          } else { (st, content) }
+                                                                      };
+                                                                      let response = format!(
+                                                                          "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                                                          payload.len());
+                                                                      stream.write_all(response.as_bytes()).ok();
+                                                                  }
+                                                              });
+                                                              FakeServer { port, bodies }
+                                                          }
 
-                                                                       #[test]
-                                                                       fn missing_binary_fails_cleanly() {
-                                                                           let cfg = test_cfg(1);
-                                                                           let err = ensure_server(&cfg, &Arc::new(Mutex::new(None))).unwrap_err();
-                                                                           assert!(err.contains("llama-server not found"), "{err}");
-                                                                       }
+                                                          #[test]
+                                                          fn llm_call_reads_content() {
+                                                              let srv = fake_server(vec![(200, "hello".into())]);
+                                                              assert_eq!(call_llm(&test_cfg(srv.port), "test").unwrap(), "hello");
+                                                          }
 
-                                                                       #[test]
-                                                                       fn server_args_match_script() {
-                                                                           let cfg = QuestConfig { model_path: "/m/x.gguf".into(), ..QuestConfig::default() };
-                                                                           assert!(server_args(&cfg, Some(99)).join(" ").contains("-ngl 99"));
-                                                                       }
+                                                          #[test]
+                                                          fn quest_is_generated_with_retries() {
+                                                              let srv = fake_server(vec![
+                                                                  (200, "<think>hmm</think> no json".into()),
+                                                                                    (200, seed_reply()),
+                                                                                    (200, rumors_reply()),
+                                                              ]);
+                                                              let job = Job {
+                                                                  city: (207, 213), city_name: "Daggerfall".into(), theme: "rescue",
+                                                                  location: empty_location(), blocks_buf: Arc::new(Vec::new()),
+                                                                  arena_dir: PathBuf::from("/tmp"),
+                                                              };
+                                                              let q = generate_quest(&test_cfg(srv.port), &tpl(), &job, &[]).unwrap();
+                                                              assert_eq!(q.seed.tomb_name, "Nekhar-Zul");
+                                                              assert_eq!(q.rumors.len(), 5);
+                                                          }
 
-                                                                       #[test]
-                                                                       fn ngl_falls_back_after_oom() {
-                                                                           assert_eq!(ngl_candidates(None, None), vec![None, Some(32), Some(16), Some(8), Some(0)]);
-                                                                       }
+                                                          #[test]
+                                                          fn voice_generation_returns_name_and_description() {
+                                                              let srv = fake_server(vec![(200, voice_reply())]);
+                                                              let cfg = test_cfg(srv.port);
+                                                              let seed = crate::quests::enrich_seed(&good_seed_json()).unwrap();
+                                                              let (text, name, description) = generate_voice(
+                                                                  &cfg, &tpl(), &seed, "- Appearance: blonde woman",
+                                                              ).unwrap();
+                                                              assert_eq!(text, "The mages are moving on Nekhar-Zul.");
+                                                              assert_eq!(name.as_deref(), Some("Matthew"));
+                                                              assert_eq!(
+                                                                  description.as_deref(),
+                                                                         Some("You are Matthew, a member of the Mages Guild.")
+                                                              );
+                                                          }
 
-                                                                       #[test]
-                                                                       fn worker_generates_saves() {
-                                                                           let srv = fake_server(vec![(200, seed_reply()), (200, rumors_reply())]);
-                                                                           let dir = std::env::temp_dir().join(format!("quest_worker_{}", std::process::id()));
-                                                                           std::fs::create_dir_all(&dir).unwrap();
-                                                                           let path = dir.join("quests.txt");
-                                                                           let _ = std::fs::remove_file(&path);
-                                                                           let (job_tx, job_rx) = mpsc::channel();
-                                                                           let (res_tx, res_rx) = mpsc::channel();
-                                                                           let server: SharedServer = Arc::new(Mutex::new(None));
-                                                                           let (cfg, t, p, s) = (test_cfg(srv.port), tpl(), path.clone(), Arc::clone(&server));
-                                                                           let handle = std::thread::spawn(move || worker_main(cfg, t, p, job_rx, res_tx, s));
-                                                                           job_tx.send(Job {
-                                                                               city: (207, 213), city_name: "Daggerfall".into(), theme: "escort",
-                                                                                       location: empty_location(), blocks_buf: Arc::new(Vec::new()), arena_dir: dir.clone(),
-                                                                           }).unwrap();
-                                                                           match res_rx.recv_timeout(Duration::from_secs(20)).unwrap() {
-                                                                               QuestMsg::Done(q) => assert_eq!(q.rumors.len(), 5),
-                                                                               _ => panic!("doveva riuscire"),
-                                                                           }
-                                                                           assert_eq!(QuestBook::load(&path).len(), 1);
-                                                                           drop(job_tx);
-                                                                           handle.join().unwrap();
-                                                                           let _ = std::fs::remove_dir_all(&dir);
-                                                                       }
-                                                                   }
+                                                          #[test]
+                                                          fn voice_generation_falls_back_when_name_missing() {
+                                                              let srv = fake_server(vec![(200, Json::Obj(vec![
+                                                                  ("text".into(), jstr("The mages are moving on Nekhar-Zul.")),
+                                                              ]).compact())]);
+                                                              let cfg = test_cfg(srv.port);
+                                                              let seed = crate::quests::enrich_seed(&good_seed_json()).unwrap();
+                                                              let (text, name, description) = generate_voice(
+                                                                  &cfg, &tpl(), &seed, "a guard",
+                                                              ).unwrap();
+                                                              assert_eq!(text, "The mages are moving on Nekhar-Zul.");
+                                                              assert!(name.is_none());
+                                                              assert!(description.is_none());
+                                                          }
+
+                                                          #[test]
+                                                          fn missing_binary_fails_cleanly() {
+                                                              let cfg = test_cfg(1);
+                                                              let err = ensure_server(&cfg, &Arc::new(Mutex::new(None))).unwrap_err();
+                                                              assert!(err.contains("llama-server not found"), "{err}");
+                                                          }
+
+                                                          #[test]
+                                                          fn server_args_match_script() {
+                                                              let cfg = QuestConfig { model_path: "/m/x.gguf".into(), ..QuestConfig::default() };
+                                                              assert!(server_args(&cfg, Some(99)).join(" ").contains("-ngl 99"));
+                                                          }
+
+                                                          #[test]
+                                                          fn ngl_falls_back_after_oom() {
+                                                              assert_eq!(ngl_candidates(None, None), vec![None, Some(32), Some(16), Some(8), Some(0)]);
+                                                          }
+
+                                                          #[test]
+                                                          fn worker_generates_saves() {
+                                                              let srv = fake_server(vec![(200, seed_reply()), (200, rumors_reply())]);
+                                                              let dir = std::env::temp_dir().join(format!("quest_worker_{}", std::process::id()));
+                                                              std::fs::create_dir_all(&dir).unwrap();
+                                                              let path = dir.join("quests.txt");
+                                                              let _ = std::fs::remove_file(&path);
+                                                              let (job_tx, job_rx) = mpsc::channel();
+                                                              let (res_tx, res_rx) = mpsc::channel();
+                                                              let server: SharedServer = Arc::new(Mutex::new(None));
+                                                              let (cfg, t, p, s) = (test_cfg(srv.port), tpl(), path.clone(), Arc::clone(&server));
+                                                              let handle = std::thread::spawn(move || worker_main(cfg, t, p, job_rx, res_tx, s));
+                                                              job_tx.send(Job {
+                                                                  city: (207, 213), city_name: "Daggerfall".into(), theme: "escort",
+                                                                          location: empty_location(), blocks_buf: Arc::new(Vec::new()), arena_dir: dir.clone(),
+                                                              }).unwrap();
+                                                              match res_rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+                                                                  QuestMsg::Done(q) => assert_eq!(q.rumors.len(), 5),
+                                                                  _ => panic!("doveva riuscire"),
+                                                              }
+                                                              assert_eq!(QuestBook::load(&path).len(), 1);
+                                                              drop(job_tx);
+                                                              handle.join().unwrap();
+                                                              let _ = std::fs::remove_dir_all(&dir);
+                                                          }
+                                                      }

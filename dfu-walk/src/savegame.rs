@@ -49,6 +49,22 @@
 //! scattare `fix_player_height_after_load`, che ricalcola `feet_y` in base al
 //! terreno del map pixel corrente. Prima era `Local<bool>`, che si attivava
 //! solo una volta: dopo un caricamento manuale il fix non veniva rieseguito.
+//!
+//! ## Animazioni walk / idle dei follower classici (FIX)
+//!
+//! Dopo un load, i follower nati da NPC classici (`InteriorFollowerId`) devono
+//! avere sia `custom_walk` che `custom_idle`, altrimenti `update_followers` li
+//! fa "slittare" con l'idle base anche mentre si muovono. `apply_recruit`
+//! (in `dialog.rs`) carica entrambi; `load_savegame_now` caricava solo l'idle.
+//! Ora replica esattamente `apply_recruit`:
+//!
+//! - `<archive>_<record>-0_walk_N.png` → `with_walk(frames, sizes, 8.0)`
+//! - `<archive>_<record>-0_idle_N.png` → `with_idle(frames, sizes, 1.0)`
+//!
+//! `walk_fps`/`idle_fps` personalizzati nel `.txt` dell'NPC classico non
+//! vengono riletti al load (a `apply_recruit` sì): si può aggiungere
+//! `classic_npc::resolve_existing` + `ov.walk_fps` in futuro senza toccare
+//! altro.
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, PrimaryWindow};
 use bevy_egui::{egui, EguiContexts};
@@ -58,8 +74,8 @@ use std::sync::Arc;
 
 use crate::data::terrain_mesh::{terrain_height, CELL_SIZE};
 use crate::interior::{
-    load_custom_idle_frames, load_custom_walk_frames, load_flat_idle_frames, CustomNpcCache,
-    CustomNpcName, InteriorState,
+    load_custom_idle_frames, load_custom_walk_frames, load_flat_idle_frames,
+    load_flat_walk_frames, CustomNpcCache, CustomNpcName, InteriorState,
 };
 use crate::mod_textures::ModTextures;
 use crate::player::{Player, EYE_HEIGHT};
@@ -1131,8 +1147,14 @@ fn load_savegame_now(
         }
     }
 
-    // Follower interni (flat). Idle multiframe se `<archive>_<record>-0_idle_N.png`
-    // esistono nella cartella textures, altrimenti restano statici.
+    // Follower interni (flat). Idle/walk multiframe se
+    // `<archive>_<record>-0_{walk,idle}_N.png` esistono nella cartella textures,
+    // altrimenti restano statici.
+    //
+    // FIX: prima venivano caricate solo le idle. Risultato: dopo un load, i
+    // follower classici con `_walk_N.png` mostravano l'idle base anche mentre
+    // si muovevano (effetto "slide"). Ora replichiamo esattamente quello che
+    // fa `dialog.rs::apply_recruit`: walk + idle, con gli stessi default.
     let mut wall_textures = WallTextures::default();
     for f in &sg.followers_interior {
         let Some((mat, _, _)) = wall_textures.flat_material(
@@ -1143,31 +1165,55 @@ fn load_savegame_now(
             mat.clone(), size, f.flat_archive, f.flat_record, f.face_record,
         );
 
-        // Idle per flat normali: stessa convenzione dei custom.
-        {
-            let base_size_px = mods
-            .size_by_name(&format!("{:03}_{}-0", f.flat_archive, f.flat_record))
-            .or_else(|| {
-                mods.size_by_name(&format!("{}_{}-0", f.flat_archive, f.flat_record))
-            })
-            .map(|(w, h)| Vec2::new(w as f32, h as f32))
-            .unwrap_or(size);
-            if let Some((idle_frames, idle_sizes)) = load_flat_idle_frames(
-                f.flat_archive,
-                f.flat_record,
-                0,
-                base_size_px,
-                size * IDLE_SIZE_SCALE_FLAT,
-                mods,
-                images,
-                materials,
-            ) {
-                info!(
-                    "savegame: flat {}:{} con {} frame idle",
-                    f.flat_archive, f.flat_record, idle_frames.len(),
-                );
-                follower = follower.with_idle(idle_frames, idle_sizes, 1.0);
-            }
+        // Dimensioni di riferimento in pixel (per scalare walk/idle).
+        // Usa lo stesso nome che usa `apply_recruit`: `{archive:03}_{record}-0`.
+        let base_size_px = mods
+        .size_by_name(&format!("{:03}_{}-0", f.flat_archive, f.flat_record))
+        .or_else(|| {
+            mods.size_by_name(&format!("{}_{}-0", f.flat_archive, f.flat_record))
+        })
+        .map(|(w, h)| Vec2::new(w as f32, h as f32))
+        .unwrap_or(size);
+
+        // Idle (come prima, ma con la costante IDLE_SIZE_SCALE_FLAT = 1.0).
+        if let Some((idle_frames, idle_sizes)) = load_flat_idle_frames(
+            f.flat_archive,
+            f.flat_record,
+            0,
+            base_size_px,
+            size * IDLE_SIZE_SCALE_FLAT,
+            mods,
+            images,
+            materials,
+        ) {
+            info!(
+                "savegame: flat {}:{} con {} frame idle",
+                f.flat_archive, f.flat_record, idle_frames.len(),
+            );
+            follower = follower.with_idle(idle_frames, idle_sizes, 1.0);
+        }
+
+        // Walk: la parte mancante del fix. `apply_recruit` usa
+        // `walk_fps.unwrap_or(8.0)`. Qui non abbiamo il contesto del dialogo,
+        // quindi usiamo lo stesso default. Se l'utente ha personalizzato
+        // `walk_fps` nel `.txt`, dopo un load viene momentaneamente ignorato;
+        // può essere ripristinato ricaricando il `.txt` con
+        // `classic_npc::resolve_existing` (miglioramento opzionale).
+        if let Some((walk_frames, walk_sizes)) = load_flat_walk_frames(
+            f.flat_archive,
+            f.flat_record,
+            0,
+            base_size_px,
+            size,
+            mods,
+            images,
+            materials,
+        ) {
+            info!(
+                "savegame: flat {}:{} con {} frame walk @ 8 fps",
+                f.flat_archive, f.flat_record, walk_frames.len(),
+            );
+            follower = follower.with_walk(walk_frames, walk_sizes, 8.0);
         }
 
         follower = follower.with_mood(f.mood);

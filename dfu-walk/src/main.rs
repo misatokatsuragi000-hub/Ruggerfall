@@ -7,10 +7,12 @@
 //!   Esc = rilascia, chiude i pannelli
 //!   WASD = cammina, Maiusc = corri, Spazio = salta
 //!   F = volo (Spazio/Ctrl su e giù, Maiusc = velocissimo)
-//!   T = ferma/riprendi il tempo, "," e "." = un'ora indietro/avanti
+//!   P = ferma/riprendi il tempo, "," e "." = un'ora indietro/avanti
+//!   T = viaggio rapido (mappa dell'Iliac Bay)
 //!   M = mappa dell'Iliac Bay
 //!   L = mappa locale della città (taverne verdi, negozi rossi, gilde blu)
 //!   G = attiva/disattiva l'erba
+//!   F11 = schermo intero senza bordi (on/off)
 //!   E / U = entra nel locale/dungeon / esci vicino alla porta
 //!   Backspace = esci sempre da dungeon/locali
 //!   C = equipaggiamento
@@ -20,15 +22,20 @@ mod torch;
 mod data;
 mod equipment;
 mod npc_home;
+mod calendar;
 mod grass;
 mod npc_anim;
 mod fps_weapon;
+mod snow_fx;
 mod dungeon_enemies;
 mod interior;
 mod local_map;
 mod dialog;
+mod ship;
 mod classic_npc;
 mod map;
+mod fast_travel; // <-- Aggiunto modulo viaggio rapido
+mod rain_fx;
 mod mod_textures;
 mod music;
 mod tuning_menu;
@@ -53,11 +60,12 @@ mod custom_cursor;
 use crate::data::blocks::RmbBlock;
 use crate::data::bsa::{BsaArchive, BsaDirectory};
 use crate::data::maps::{DFLocation, MapsReader};
+use crate::data::Season;
 use crate::data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
 use crate::data::{find_file_ci, generate_default_samples, PakFile, Palette, WoodsFile};
 use bevy::pbr::{DistanceFog, FogFalloff, MaterialPlugin};
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::window::{MonitorSelection, PrimaryWindow, WindowMode};
 use mod_textures::ModTexturesPlugin;
 use player::{Player, EYE_HEIGHT};
 use std::collections::{HashMap, HashSet};
@@ -119,6 +127,8 @@ struct Args {
     winter: bool,
     hour: f32,
     day_minutes: f32,
+    start_month: u8,
+    start_day: u8,
     start_dungeon: bool,
 }
 #[derive(Resource)]
@@ -164,10 +174,12 @@ fn parse_args() -> Args {
         mods_dir: default_mods,
         textures_dir: default_textures,
         pixel: None,
-        radius: 2,
+        radius: 6,
         winter: false,
         hour: 10.5,
         day_minutes: 24.0,
+        start_month: 0,   // Morning Star
+        start_day: 5,
         start_dungeon: true,
     };
     while let Some(a) = it.next() {
@@ -192,6 +204,8 @@ fn parse_args() -> Args {
             }
             "--radius" => args.radius = next_value::<i32>(&mut it, "--radius").clamp(1, 8),
             "--winter" => args.winter = true,
+            "--start-month" => args.start_month = next_value::<u8>(&mut it, "--start-month") % 12,
+            "--start-day"   => args.start_day   = next_value::<u8>(&mut it, "--start-day").clamp(1, 30),
             "--hour" => args.hour = next_value(&mut it, "--hour"),
             "--day-minutes" => {
                 args.day_minutes = next_value::<f32>(&mut it, "--day-minutes").max(0.0)
@@ -249,7 +263,26 @@ fn load_data(args: &Args) -> GameData {
         woods: Arc::new(WoodsFile::open(open("WOODS.WLD")).unwrap_or_else(|e| fail(e))),
         climate: Arc::new(PakFile::open(open("CLIMATE.PAK")).unwrap_or_else(|e| fail(e))),
         palette: Arc::new(Palette::open(open("ART_PAL.COL")).unwrap_or_else(|e| fail(e))),
-        winter: args.winter,
+        season: {
+            if args.winter {
+                // Flag deprecato: utile solo per test rapidi.
+                // Meglio usare --start-month 11 --start-day 1.
+                Season::Winter
+            } else {
+                // Stagione coerente con la data di partenza, così il primo
+                // frame di `stream_tiles` costruisce i tile con l'archivio
+                // giusto. Senza questo, con data Morning Star (Winter) ma
+                // `season = Summer` di default, i primi 2-4 tile sono verdi
+                // e restano tali finché non escono dal raggio di streaming.
+                crate::calendar::GameDate::new(
+                    405,
+                    args.start_month,
+                    args.start_day,
+                    args.hour,
+                )
+                .season()
+            }
+        },
         maps_buf,
         blocks_buf,
         arch3d_buf,
@@ -459,7 +492,8 @@ fn main() {
     println!("Cartella texture sciolte: {}", args.textures_dir.display());
     println!("Comandi: clic = cattura il mouse, Esc = rilascia, WASD = cammina, Maiusc = corri, ");
     println!("         Spazio = salta, F = volo (Spazio/Ctrl su e giù, Maiusc in volo = velocissimo). ");
-    println!("         T = ferma/riprendi il tempo, , e . = un'ora indietro/avanti. ");
+    println!("         P = ferma/riprendi il tempo, , e . = un'ora indietro/avanti. ");
+    println!("         T = viaggio rapido (mappa dell'Iliac Bay). ");
     println!("         M = apri/chiudi mappa dell'Iliac Bay. ");
     println!("         L = mappa locale della città (taverne verdi, negozi rossi, gilde blu). ");
     println!("         G = attiva/disattiva l'erba. ");
@@ -523,7 +557,7 @@ fn main() {
         DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Daggerfall - terreno e città".into(),
-                                 resolution: (1280.0_f32, 720.0_f32).into(),
+                                 resolution: (1280.0_f32, 720.0).into(),
                                  ..default()
             }),
             ..default()
@@ -532,24 +566,36 @@ fn main() {
     .add_plugins(dialog::DialogPlugin)
     .add_plugins(quest_llm::QuestPlugin)
     .add_plugins(tts::TtsPlugin)
+    .add_plugins(rain_fx::RainFxPlugin)
     .add_plugins(npc_home::NpcHomePlugin)
     .add_plugins(fps_weapon::FpsWeaponPlugin)
+    .add_plugins(calendar::CalendarPlugin)
     .add_plugins(compass::CompassPlugin)
+    .add_plugins(ship::ShipPlugin)
+    .add_plugins(fast_travel::FastTravelPlugin) // <-- Aggiunto plugin viaggio rapido
     .add_plugins(tiles::FollowerMoodPlugin)
     .add_plugins(vitals::VitalsPlugin)
     .add_plugins(tuning_menu::TuningMenuPlugin)
     .add_plugins(dungeon_enemies::DungeonEnemyPlugin)
+    .add_plugins(interior::InteriorPlugin)
     .add_plugins(torch::TorchPlugin)
     .add_plugins(savegame::SaveGamePlugin)
     .add_plugins(equipment::EquipmentPlugin)
     .add_plugins(relief_post::FakeReliefPlugin)
     .add_plugins(dungeon::DungeonPlugin)
+    .add_plugins(snow_fx::SnowFxPlugin)
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
+
     .add_plugins(ModTexturesPlugin {
         dir: args.mods_dir.clone(),
                  textures_dir: Some(args.textures_dir.clone()),
                  nearest_filter: false,
     })
+    // ── Cielo procedurale Dynamic Skies (DREAM-SKY) ────────────────────
+    // Deve venire DOPO `ModTexturesPlugin` perché `spawn_dream_sky` ha
+    // bisogno di `ModTextures` per caricare le texture (`CdMCloudy`, ecc.).
+    // Il `MaterialPlugin` per `DreamSkyMaterial` è già dentro `DreamSkyPlugin`.
+    .add_plugins(sky::dream_sky::DreamSkyPlugin)
     .add_plugins(custom_cursor::CustomCursorPlugin {
         cursor_path: Some(args.textures_dir.join("cursorA.png")),
     })
@@ -580,6 +626,8 @@ fn main() {
     .insert_resource(sky::SkyConfig {
         hour: args.hour,
         day_minutes: args.day_minutes,
+        start_month: args.start_month,
+        start_day: args.start_day,
     })
     .add_event::<music::MusicEvent>()
     .insert_resource(music::MusicController::default())
@@ -609,9 +657,11 @@ fn main() {
          tiles::update_followers, // ← aggiunto
          tiles::update_enemies,
          player::player_move,
+         map::update_ship_marker,
          rebase_origin,
          stream_tiles,
          collect_tiles,
+         sky::update_dream_texture,
          sky::update_sky.run_if(interior::outside),
         )
         .chain(),
@@ -636,6 +686,7 @@ fn main() {
     // (in `quest_llm.rs`) abbia emesso `QuestScriptReadyEvent`. Finché non
     // succede, il sistema è inerte (nessun evento da leggere).
     .add_systems(Update, reload_quest_library)
+    .add_systems(Update, toggle_borderless)
     .run();
 }
 // =============================================================================
@@ -684,6 +735,25 @@ fn setup(
     let _ = CELL_SIZE;
 }
 // =============================================================================
+// F11: schermo intero senza bordi (toggle)
+// =============================================================================
+fn toggle_borderless(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if !keys.just_pressed(KeyCode::F11) {
+        return;
+    }
+    let Ok(mut window) = windows.get_single_mut() else {
+        return;
+    };
+    window.mode = match window.mode {
+        WindowMode::Windowed => WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+        _ => WindowMode::Windowed,
+    };
+}
+
+// =============================================================================
 // Titolo della finestra
 // =============================================================================
 #[allow(clippy::too_many_arguments)]
@@ -715,7 +785,7 @@ fn update_title(
     .map(|t| t.rsplit('/').next().unwrap_or(t))
     .unwrap_or("nessuna");
     window.title = format!(
-        "Daggerfall - map pixel ({mx}, {my}) clima {} - quota {:.0} m - ore {:02}:{:02} - {}{} tile - {fps:.0} fps - ♪ {track} [M: mappa, L: locale]",
+        "Daggerfall - map pixel ({mx}, {my}) clima {} - quota {:.0} m - ore {:02}:{:02} - {}{} tile - {fps:.0} fps - ♪ {track} [M: mappa, T: viaggio, L: locale]",
                            climate_of(&data, mx, my),
                            p.feet_y,
                            clock.hours.floor() as i32,

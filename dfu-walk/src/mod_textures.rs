@@ -174,12 +174,7 @@ impl ModTextures {
             array_count += 1;
         }
 
-        info!(
-            "Mod caricata `{}`: {} texture 2D, {} array di terreno",
-            path.display(),
-              tex_count,
-              array_count
-        );
+
 
         let mut material_count = 0usize;
         let mut materials_unparsed: Vec<String> = Vec::new();
@@ -199,22 +194,14 @@ impl ModTextures {
                 }
             }
         }
-        if material_count > 0 || !materials_unparsed.is_empty() {
-            info!("  {material_count} materiali con nome archivio_record-frame");
-            if !materials_unparsed.is_empty() {
-                info!("  altri materiali con nomi diversi, ad es. {materials_unparsed:?}");
-            }
-        }
+
 
         if tex_count > 0 || material_count > 0 {
             let mut top: Vec<(u32, usize)> = mod_coverage.into_iter().collect();
             top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             top.truncate(10);
             let top: Vec<String> = top.iter().map(|(a, n)| format!("{a}({n})")).collect();
-            info!("  archivi coperti: {}", top.join(" "));
-            if unparsed_count > 0 {
-                info!("  {unparsed_count} nomi non nel formato archivio_record-frame, ad es. {unparsed:?}");
-            }
+
         }
 
         self.archives.push(m);
@@ -248,12 +235,7 @@ impl ModTextures {
             self.loose_paths.insert(stem.to_ascii_lowercase(), path);
             count += 1;
         }
-        info!("Indicizzate {} texture sciolte da {}", count, dir.display());
-        if count > 0 {
-            let mut sample: Vec<&String> = self.loose_paths.keys().take(20).collect();
-            sample.sort();
-            info!("  esempi: {:?}", sample);
-        }
+
     }
 
     /// Decodifica (una sola volta) una texture sciolta e ne restituisce l'handle.
@@ -393,10 +375,7 @@ impl ModTextures {
             for name in albedo_loose_names(key) {
                 if self.loose_paths.contains_key(&name) {
                     if let Some(h) = self.load_loose(&name, images) {
-                        info!(
-                            "override albedo: `{}` (archivio {} record {} frame {})",
-                              name, key.archive, key.record, key.frame
-                        );
+
                         return Some(h);
                     }
                 }

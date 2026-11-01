@@ -36,10 +36,38 @@
 //! Identita': come per le voci in `QuestBook`, un NPC classico e' la coppia
 //! (citta', chiave) dove la chiave e' `flat:A:R`, `face:N` o `walker:N`.
 //! Un campo vuoto o mancante ripiega sul valore automatico.
-
+//!
+//! ## Prefetch (read-only) e profilo LLM (write-once)
+//!
+//! Il modulo espone due funzioni che **non** creano file solo per leggere:
+//!
+//! - `resolve_existing`: legge il `.txt` dell'NPC **se esiste già** e ritorna
+//!   l'override, altrimenti `ClassicOverride::default()`. Usata dai sistemi di
+//!   prefetch (le voci degli NPC in `interior.rs`) che non devono creare
+//!   file/PNG solo per leggere una descrizione.
+//!
+//! - `apply_llm_background`: scrive nel `.txt` il **nome proprio** e il
+//!   **background** generati dall'LLM (in `quest_llm.rs` → `NPC_VOICE`), ma
+//!   **solo se il file è ancora "auto"** (prima riga == descrittore visivo,
+//!   description che inizia con "Appearance (visual descriptor"). Se l'utente
+//!   ha personalizzato nome o description, il file non viene toccato.
+//!
+//! Il flusso completo:
+//!
+//! 1. entri in un interno → `interior_enter_exit` emette `InteriorEntered` con
+//!    `PendingVoice` per ogni NPC (voice_key, description auto, original_label,
+//!    sprite_stem);
+//! 2. `prefetch_interior_voices` chiama `QuestWorker::request_voice` per ognuno;
+//! 3. `NPC_VOICE` produce `{name, description, text}` in un solo giro;
+//! 4. `quest_poll` salva in `QuestBook` con `store_voice_full` **e** chiama
+//!    `apply_llm_background` per fissare nome+background nel `.txt`;
+//! 5. al riavvio `QuestBook::load_voices` rilegge `name` e `background`, e
+//!    `classic_npc::resolve` (via `dialog.rs`) rilegge la `description` dal
+//!    `.txt`: nessuna chiamata LLM.
 use crate::data::city_map::PoiKind;
 use crate::interior::parse_custom_txt;
 use crate::mod_textures::ModTextures;
+use bevy::math::Affine2;
 use bevy::prelude::*;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -180,31 +208,31 @@ fn base_text(npc: &ClassicNpc) -> String {
     let portrait = npc.portrait_stem.as_deref().unwrap_or("-");
     format!(
         "{name}\n\
-         # NPC classico: file generato automaticamente, modificalo a piacere (non verra' sovrascritto).\n\
-         # Citta': {city} ({x}, {y})  |  chiave: {key}\n\
-         # id: identifica questo NPC (citta' + tipo), non modificarlo.\n\
-         # La prima riga e' il nome mostrato nel dialogo.\n\
-         # description: sostituisce la descrizione automatica nel prompt dell'LLM (una riga sola).\n\
-         # voice: es. af_kore:0.9,af_sky:0.1 (vuoto = voce automatica).\n\
-         # position: solo informativa (dove l'NPC e' stato incontrato), non sposta l'NPC.\n\
-         # Immagini condivise: {sprite}.png (sprite), {portrait}.png (ritratto).\n\
-         # Animazioni facoltative (condivise): {sprite}_walk_0.png, {sprite}_walk_1.png, ...\n\
-         #   e {sprite}_idle_0.png, {sprite}_idle_1.png, ... (mood = frame idle).\n\
-         # Velocita' (facoltative): togli il # davanti a walk_fps / idle_fps.\n\
-         id = {id}\n\
-         description = \"{desc}\"\n\
-         voice =\n\
-         position = {pos}\n\
-         # walk_fps = 8.0\n\
-         # idle_fps = 4.0\n",
-        city = if npc.city_name.is_empty() { "?" } else { npc.city_name },
-        x = npc.city.0,
-        y = npc.city.1,
-        key = npc.key,
-        sprite = npc.sprite_stem,
-        id = npc_id(npc),
-        desc = one_line(npc.description),
-        pos = position_word(npc.place),
+# NPC classico: file generato automaticamente, modificalo a piacere (non verra' sovrascritto).\n\
+# Citta': {city} ({x}, {y})  |  chiave: {key}\n\
+# id: identifica questo NPC (citta' + tipo), non modificarlo.\n\
+# La prima riga e' il nome mostrato nel dialogo.\n\
+# description: sostituisce la descrizione automatica nel prompt dell'LLM (una riga sola).\n\
+# voice: es. af_kore:0.9,af_sky:0.1 (vuoto = voce automatica).\n\
+# position: solo informativa (dove l'NPC e' stato incontrato), non sposta l'NPC.\n\
+# Immagini condivise: {sprite}.png (sprite), {portrait}.png (ritratto).\n\
+# Animazioni facoltative (condivise): {sprite}_walk_0.png, {sprite}_walk_1.png, ...\n\
+#   e {sprite}_idle_0.png, {sprite}_idle_1.png, ... (mood = frame idle).\n\
+# Velocita' (facoltative): togli il # davanti a walk_fps / idle_fps.\n\
+id = {id}\n\
+description = \"{desc}\"\n\
+voice =\n\
+position = {pos}\n\
+# walk_fps = 8.0\n\
+# idle_fps = 4.0\n",
+city = if npc.city_name.is_empty() { "?" } else { npc.city_name },
+            x = npc.city.0,
+            y = npc.city.1,
+            key = npc.key,
+            sprite = npc.sprite_stem,
+            id = npc_id(npc),
+            desc = one_line(npc.description),
+            pos = position_word(npc.place),
     )
 }
 
@@ -357,16 +385,424 @@ pub fn resolve(dir: &Path, npc: &ClassicNpc, images: &Assets<Image>, mods: &ModT
         Lookup::Found(content) => parse(&content),
         Lookup::Free(path) => {
             let written = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .and_then(|mut f| f.write_all(base_text(npc).as_bytes()));
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(base_text(npc).as_bytes()));
             match written {
                 Ok(()) => info!("NPC classico: creato {}", path.display()),
                 Err(e) => warn!("NPC classico: impossibile creare {}: {e}", path.display()),
             }
             ClassicOverride::default()
         }
+    }
+}
+
+/// Legge il file dell'NPC **se esiste già**, senza crearlo né esportare immagini.
+///
+/// A differenza di `resolve`, non ha effetti collaterali: se il txt manca
+/// restituisce `ClassicOverride::default()` senza scrivere nulla. Usata dai
+/// sistemi di prefetch (es. le voci degli NPC in background, in `interior.rs`)
+/// che non devono creare file solo per leggere una descrizione.
+///
+/// Costruisce un `ClassicNpc` minimo: `lookup` usa solo `city`, `key` e
+/// `sprite_stem`; gli altri campi (`label`, `description`, `place`, ...) non
+/// servono per individuare il file e restano vuoti. `parse` legge solo i
+/// campi del txt e ignora il resto, quindi il `ClassicNpc` "finto" non
+/// inquina il risultato.
+pub fn resolve_existing(
+    dir: &Path,
+    city: (i32, i32),
+                        key: &str,
+                        sprite_stem: &str,
+) -> ClassicOverride {
+    if !dir.is_dir() {
+        return ClassicOverride::default();
+    }
+    let npc = ClassicNpc {
+        city,
+        city_name: "",
+        key,
+        label: "",
+        description: "",
+        place: None,
+        sprite_stem: sprite_stem.to_string(),
+        portrait_stem: None,
+        sprite: None,
+        portrait: None,
+    };
+    match lookup(dir, &npc) {
+        Lookup::Found(content) => parse(&content),
+        // Nessun txt esistente: nessun override, niente scritture.
+        Lookup::Free(_) => ClassicOverride::default(),
+    }
+}
+
+// =============================================================================
+// Animazioni condivise (walk / idle) degli NPC classici
+// =============================================================================
+
+/// Velocita' di default se il txt non ha `walk_fps` / `idle_fps` (come per i custom).
+pub const DEFAULT_WALK_FPS: f32 = 8.0;
+pub const DEFAULT_IDLE_FPS: f32 = 4.0;
+
+/// Frame di animazione di un NPC classico, pronti da assegnare al follower.
+/// Le immagini hanno il nome della texture, quindi sono condivise da tutti gli
+/// NPC che usano lo stesso sprite (`182_11-0_walk_0.png`, `_walk_1.png`, ...).
+pub struct ClassicAnim {
+    pub walk: Vec<Handle<StandardMaterial>>,
+    pub walk_fps: f32,
+    pub idle: Vec<Handle<StandardMaterial>>,
+    pub idle_fps: f32,
+}
+
+/// Nomi (senza estensione) dei frame `<sprite>_<kind>_0.png`, `_1`, ... presenti
+/// in `dir`, finche' sono consecutivi (si ferma al primo buco). `kind` e' `walk`
+/// o `idle`. Il confronto ignora le maiuscole, ma si ritorna il nome REALE del
+/// file, cosi' il caricamento funziona anche su Linux (filesystem case-sensitive).
+pub fn frame_stems(dir: &Path, sprite_stem: &str, kind: &str) -> Vec<String> {
+    let prefix = format!("{sprite_stem}_{kind}_").to_ascii_lowercase();
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let lower = name.to_ascii_lowercase();
+        if !lower.starts_with(&prefix) {
+            continue;
+        }
+        let Some(stem) = lower.strip_suffix(".png") else { continue };
+        // ".png" e' ASCII: la stessa lunghezza vale per il nome originale.
+        found.insert(stem.to_string(), name[..name.len() - 4].to_string());
+    }
+    let mut out = Vec::new();
+    for i in 0.. {
+        match found.get(&format!("{prefix}{i}")) {
+            Some(real) => out.push(real.clone()),
+            None => break,
+        }
+    }
+    out
+}
+
+/// Un materiale per ogni frame (stessa costruzione di `load_custom_walk_frames`).
+/// `None` se manca anche un solo frame: un'animazione a meta' sarebbe peggio di nessuna.
+fn frame_materials(
+    stems: &[String],
+    what: &str,
+    mods: &mut ModTextures,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+) -> Option<Vec<Handle<StandardMaterial>>> {
+    let mut frames = Vec::with_capacity(stems.len());
+    for stem in stems {
+        let Some(handle) = mods.image_by_name(stem, images) else {
+            warn!("NPC classico: impossibile caricare il frame {what} '{stem}'");
+            return None;
+        };
+        let uv = if mods.needs_v_flip(&handle) {
+            Affine2::from_scale_angle_translation(Vec2::new(1.0, -1.0), 0.0, Vec2::new(0.0, 1.0))
+        } else {
+            Affine2::IDENTITY
+        };
+        frames.push(materials.add(StandardMaterial {
+            base_color_texture: Some(handle),
+            uv_transform: uv,
+            alpha_mode: AlphaMode::Mask(0.5),
+            cull_mode: None,
+            double_sided: true,
+            perceptual_roughness: 0.9,
+            reflectance: 0.1,
+            ..default()
+        }));
+    }
+    Some(frames)
+}
+
+/// Carica le animazioni walk/idle di un NPC classico dalla cartella delle texture.
+///
+/// - `sprite_stem`: nome della texture dello sprite (es. `182_11-0`), lo stesso
+///   usato per `ClassicNpc::sprite_stem`;
+/// - `ov`: override letto dal txt (`resolve_existing`) per `walk_fps` / `idle_fps`;
+///   con `&ClassicOverride::default()` si usano i valori di default.
+///
+/// Ritorna `None` se non esiste nessun frame (l'NPC resta statico come prima).
+pub fn load_anim(
+    dir: &Path,
+    sprite_stem: &str,
+    ov: &ClassicOverride,
+    mods: &mut ModTextures,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+) -> Option<ClassicAnim> {
+    let walk_stems = frame_stems(dir, sprite_stem, "walk");
+    let idle_stems = frame_stems(dir, sprite_stem, "idle");
+    if walk_stems.is_empty() && idle_stems.is_empty() {
+        return None;
+    }
+    let walk = if walk_stems.is_empty() {
+        Vec::new()
+    } else {
+        frame_materials(&walk_stems, "walk", mods, images, materials).unwrap_or_default()
+    };
+    let idle = if idle_stems.is_empty() {
+        Vec::new()
+    } else {
+        frame_materials(&idle_stems, "idle", mods, images, materials).unwrap_or_default()
+    };
+    if walk.is_empty() && idle.is_empty() {
+        return None;
+    }
+    info!(
+        "NPC classico '{sprite_stem}': {} frame walk, {} frame idle",
+        walk.len(),
+        idle.len()
+    );
+    Some(ClassicAnim {
+        walk,
+        walk_fps: ov.walk_fps.unwrap_or(DEFAULT_WALK_FPS),
+        idle,
+        idle_fps: ov.idle_fps.unwrap_or(DEFAULT_IDLE_FPS),
+    })
+}
+
+// =============================================================================
+// Profilo LLM (nome + background + voce)
+// =============================================================================
+
+/// Cerca, tra i `.txt` che condividono la `sprite_stem`, quello che contiene
+/// l'`id` di (city, key). Ritorna il percorso se lo trova.
+///
+/// È la controparte "path-aware" di `lookup`: `lookup` restituisce il contenuto
+/// (usato da `resolve`/`resolve_existing`), questa funzione il percorso (usato
+/// da `apply_llm_background` per riscrivere il file).
+fn find_existing_path(
+    dir: &Path,
+    city: (i32, i32),
+                      key: &str,
+                      sprite_stem: &str,
+) -> Option<PathBuf> {
+    let id = format!("{},{} {}", city.0, city.1, key);
+    let Ok(rd) = std::fs::read_dir(dir) else { return None };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(_) = txt_index(name, sprite_stem) else { continue };
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            if file_id(&content) == Some(id.as_str()) {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
+}
+
+/// Primo nome libero `<stem>.txt` / `<stem>_N.txt`, senza aprire i file.
+fn next_free_path(dir: &Path, sprite_stem: &str) -> PathBuf {
+    let mut used: HashSet<usize> = HashSet::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(n) = txt_index(name, sprite_stem) {
+                used.insert(n);
+            }
+        }
+    }
+    let n = (0..).find(|n| !used.contains(n)).unwrap_or(0);
+    dir.join(txt_name(sprite_stem, n))
+}
+
+/// Scrive nel `.txt` dell'NPC il nome proprio e il background generati
+/// dall'LLM (`NPC_VOICE` → `{name, description, text}`), ma **solo se il
+/// file è ancora "auto"**. Non sovrascrive mai un file personalizzato.
+///
+/// Regole:
+/// - `.txt` assente → viene creato con `name` come prima riga e
+///   `description = "<background>"`. Il resto del template (immagini,
+///   posizione, ...) è quello di `base_text`.
+/// - `.txt` esistente con prima riga == `original_label` (il descrittore
+///   visivo auto) **e** `description` che inizia con `"Appearance (visual
+///   descriptor"` (il prefisso che `describe_npc_in` produce sempre) →
+///   viene riscritto: prima riga = `name`, description = `background`. Il
+///   resto del file è preservato (commenti, `voice`, `position`, `walk_fps`,
+///   `idle_fps` restano com'erano).
+/// - In ogni altro caso (prima riga diversa da `original_label`, oppure
+///   description che non inizia col prefisso auto) → il file è considerato
+///   personalizzato e non viene toccato.
+///
+/// `name` e `background` possono essere `None`: se lo sono entrambi, la
+/// funzione non fa nulla. Se `name` è `None`, la prima riga resta
+/// `original_label`; se `background` è `None`, la description resta vuota
+/// (o invariata).
+///
+/// La funzione è **idempotente**: dopo aver scritto `name`, la prima riga
+/// non coincide più con `original_label`, quindi una seconda chiamata non
+/// tocca il file.
+pub fn apply_llm_background(
+    dir: &Path,
+    city: (i32, i32),
+                            key: &str,
+                            sprite_stem: &str,
+                            original_label: &str,
+                            name: Option<&str>,
+                            background: Option<&str>,
+) {
+    if !dir.is_dir() {
+        return;
+    }
+    if name.is_none() && background.is_none() {
+        return;
+    }
+    match find_existing_path(dir, city, key, sprite_stem) {
+        // Nessun file esistente: lo crea con nome+background.
+        None => {
+            let new_name = name.unwrap_or(original_label);
+            let new_desc = background.unwrap_or("");
+            let npc = ClassicNpc {
+                city,
+                city_name: "",
+                key,
+                label: new_name,
+                description: new_desc,
+                place: None,
+                sprite_stem: sprite_stem.to_string(),
+                portrait_stem: None,
+                sprite: None,
+                portrait: None,
+            };
+            let body = base_text(&npc);
+            let path = next_free_path(dir, sprite_stem);
+            if let Err(e) = std::fs::write(&path, body) {
+                warn!("NPC classico: impossibile scrivere {}: {e}", path.display());
+            } else {
+                info!(
+                    "NPC classico: creato {} con nome+background LLM",
+                    path.display()
+                );
+            }
+        }
+        // File esistente: capiamo se è ancora "auto".
+        Some(path) => {
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            // Nome: la prima riga "utile" (dopo i commenti, prima di `id =`).
+            // Il template auto non quota il nome, quindi la riga è testo nudo.
+            let current_name = content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#') && !l.contains('='))
+            .unwrap_or("");
+            let name_is_auto = current_name == original_label;
+
+            // Description: consideriamo "auto" se assente, vuota, o se inizia
+            // con il prefisso che `describe_npc_in` produce sempre
+            // ("Appearance (visual descriptor from the game data, ...)").
+            let ov = parse(&content);
+            let desc_is_auto = match ov.description.as_deref() {
+                None | Some("") => true,
+                Some(d) => d.starts_with("Appearance (visual descriptor"),
+            };
+
+            if !name_is_auto || !desc_is_auto {
+                debug!(
+                    "NPC classico: {} è personalizzato (nome auto: {}, desc auto: {}), non applico il background LLM",
+                       sprite_stem, name_is_auto, desc_is_auto
+                );
+                return;
+            }
+
+            let new_name = name.unwrap_or(original_label);
+            let new_desc = background.unwrap_or("");
+
+            // Riscrive solo le righe che ci interessano, preservando commenti
+            // e altre righe (voice, position, walk_fps, idle_fps, ...).
+            let mut out = String::new();
+            let mut replaced_name = false;
+            let mut replaced_desc = false;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !replaced_name
+                    && !trimmed.is_empty()
+                    && !trimmed.starts_with('#')
+                    && !trimmed.contains('=')
+                    {
+                        // Prima riga "utile" dopo i commenti: è il nome.
+                        out.push_str(new_name);
+                        out.push('\n');
+                        replaced_name = true;
+                        continue;
+                    }
+                    if trimmed.starts_with("description") {
+                        out.push_str(&format!(
+                            "description = \"{}\"\n",
+                            new_desc.replace('"', "'")
+                        ));
+                        replaced_desc = true;
+                        continue;
+                    }
+                    out.push_str(line);
+                    out.push('\n');
+            }
+            if !replaced_desc {
+                // Non c'era: aggiungila in fondo.
+                out.push_str(&format!(
+                    "description = \"{}\"\n",
+                    new_desc.replace('"', "'")
+                ));
+            }
+            if let Err(e) = std::fs::write(&path, out) {
+                warn!("NPC classico: impossibile riscrivere {}: {e}", path.display());
+            } else {
+                info!(
+                    "NPC classico: applicato nome+background LLM a {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Scrive nel `.txt` dell'NPC la voce TTS scelta dall'LLM (`NPC_VOICE` -> `voice`), ma solo se il
+/// campo `voice` e' ancora vuoto: una voce impostata dall'utente non viene mai toccata.
+///
+/// Va chiamata subito dopo `apply_llm_background` (il file esiste gia'). `voice` deve essere gia'
+/// validata (`quests::sanitize_voice`). Se il file non si trova non fa nulla: la voce resta
+/// quella automatica.
+pub fn apply_llm_voice(dir: &Path, city: (i32, i32), key: &str, sprite_stem: &str, voice: &str) {
+    let voice = voice.trim();
+    if voice.is_empty() || !dir.is_dir() {
+        return;
+    }
+    let Some(path) = find_existing_path(dir, city, key, sprite_stem) else { return };
+    let Ok(content) = std::fs::read_to_string(&path) else { return };
+    let mut out = String::with_capacity(content.len() + voice.len() + 16);
+    let mut done = false;
+    for line in content.lines() {
+        if !done {
+            if let Some(rest) = line.trim().strip_prefix("voice") {
+                if let Some(value) = rest.trim_start().strip_prefix('=') {
+                    if !value.trim().trim_matches('"').trim().is_empty() {
+                        return; // voce scelta dall'utente
+                    }
+                    out.push_str(&format!("voice = {voice}\n"));
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !done {
+        out.push_str(&format!("voice = {voice}\n"));
+    }
+    match std::fs::write(&path, out) {
+        Ok(()) => info!("NPC classico: voce '{voice}' applicata a {}", path.display()),
+        Err(e) => warn!("NPC classico: impossibile riscrivere {}: {e}", path.display()),
     }
 }
 
@@ -457,6 +893,309 @@ mod tests {
         let missing = dir.join("nope");
         assert_eq!(resolve(&missing, &a, &imgs, &mods), ClassicOverride::default());
         assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------- resolve_existing
+
+    #[test]
+    fn resolve_existing_does_not_create_anything() {
+        let dir = std::env::temp_dir().join(format!("classic_npc_existing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nessun txt: nessun override, nessun file creato.
+        let ov = resolve_existing(&dir, (207, 213), "flat:182:3", "182_3-0");
+        assert_eq!(ov, ClassicOverride::default());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0,
+                   "resolve_existing non deve creare file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_existing_reads_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("classic_npc_existing2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Crea il txt "come se" resolve fosse già stato chiamato.
+        let npc = npc((207, 213), "Daggerfall");
+        let imgs = Assets::<Image>::default();
+        let mods = ModTextures::default();
+        let _ = resolve(&dir, &npc, &imgs, &mods);
+        let path = dir.join("182_3-0.txt");
+        assert!(path.is_file());
+
+        // Personalizzo il file.
+        std::fs::write(
+            &path,
+            format!(
+                "Ellie\nid = 207,213 flat:182:3\ndescription = \"custom desc\"\nvoice = af_sarah\nposition = Tavern\nwalk_fps = 6\n",
+            ),
+        )
+        .unwrap();
+
+        // `resolve_existing` trova e legge l'override.
+        let ov = resolve_existing(&dir, (207, 213), "flat:182:3", "182_3-0");
+        assert_eq!(ov.name.as_deref(), Some("Ellie"));
+        assert_eq!(ov.description.as_deref(), Some("custom desc"));
+        assert_eq!(ov.voice.as_deref(), Some("af_sarah"));
+        assert_eq!(ov.walk_fps, Some(6.0));
+
+        // Città diversa: il file c'è ma con id diverso, quindi non corrisponde.
+        let ov = resolve_existing(&dir, (322, 164), "flat:182:3", "182_3-0");
+        assert_eq!(ov, ClassicOverride::default());
+
+        // Cartella inesistente: default, niente panico.
+        let missing = dir.join("nope");
+        let ov = resolve_existing(&missing, (207, 213), "flat:182:3", "182_3-0");
+        assert_eq!(ov, ClassicOverride::default());
+        assert!(!missing.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------ apply_llm_background
+
+    #[test]
+    fn apply_llm_background_creates_file_when_missing() {
+        let dir = std::env::temp_dir().join(format!("classic_npc_bg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nessun file: `apply_llm_background` crea.
+        apply_llm_background(
+            &dir,
+            (207, 213),
+                             "flat:181:3",
+                             "181_3-0",
+                             "blue-cloaked boy",
+                             Some("Matthew"),
+                             Some("You are Matthew, a member of the Temple."),
+        );
+        let path = dir.join("181_3-0.txt");
+        assert!(path.is_file());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("Matthew\n"), "{content}");
+        assert!(
+            content.contains("description = \"You are Matthew, a member of the Temple.\""),
+                "{content}"
+        );
+        assert!(content.contains("id = 207,213 flat:181:3"), "{content}");
+
+        // `resolve_existing` lo trova.
+        let ov = resolve_existing(&dir, (207, 213), "flat:181:3", "181_3-0");
+        assert_eq!(ov.name.as_deref(), Some("Matthew"));
+        assert_eq!(
+            ov.description.as_deref(),
+                   Some("You are Matthew, a member of the Temple.")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_llm_background_rewrites_auto_file() {
+        let dir = std::env::temp_dir().join(format!("classic_npc_bg_auto_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Simula il file auto creato da `resolve`.
+        let base = npc((207, 213), "Daggerfall");
+        let imgs = Assets::<Image>::default();
+        let mods = ModTextures::default();
+        let _ = resolve(&dir, &base, &imgs, &mods);
+        let path = dir.join("182_3-0.txt");
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.starts_with("Blonde woman\n"));
+        assert!(before.contains("description = \"Appearance (visual descriptor"));
+
+        // LLM produce nome + background: `apply_llm_background` riscrive.
+        apply_llm_background(
+            &dir,
+            (207, 213),
+                             "flat:182:3",
+                             "182_3-0",
+                             "Blonde woman",
+                             Some("Eleanor"),
+                             Some("You are Eleanor, a barmaid of the tavern."),
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with("Eleanor\n"), "{after}");
+        assert!(
+            after.contains("description = \"You are Eleanor, a barmaid of the tavern.\""),
+                "{after}"
+        );
+        // Il resto è preservato.
+        assert!(after.contains("id = 207,213 flat:182:3"), "{after}");
+        assert!(after.contains("voice ="), "{after}");
+        assert!(after.contains("# walk_fps = 8.0"), "{after}");
+
+        // Idempotente: una seconda chiamata non tocca il file (nome non più auto).
+        apply_llm_background(
+            &dir,
+            (207, 213),
+                             "flat:182:3",
+                             "182_3-0",
+                             "Blonde woman",
+                             Some("Different"),
+                             Some("Different description."),
+        );
+        let again = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, again);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_llm_background_respects_customized_name() {
+        let dir = std::env::temp_dir().join(format!("classic_npc_bg_name_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = npc((207, 213), "Daggerfall");
+        let imgs = Assets::<Image>::default();
+        let mods = ModTextures::default();
+        let _ = resolve(&dir, &base, &imgs, &mods);
+        let path = dir.join("182_3-0.txt");
+
+        // L'utente cambia solo il nome.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replacen("Blonde woman", "Ellie", 1)).unwrap();
+
+        apply_llm_background(
+            &dir,
+            (207, 213),
+                             "flat:182:3",
+                             "182_3-0",
+                             "Blonde woman",
+                             Some("Matthew"),
+                             Some("You are Matthew, a member of the Temple."),
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("Ellie"));
+        assert!(!after.contains("Matthew"));
+        assert!(!after.contains("You are Matthew"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_llm_background_respects_customized_description() {
+        let dir = std::env::temp_dir().join(format!("classic_npc_bg_desc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = npc((207, 213), "Daggerfall");
+        let imgs = Assets::<Image>::default();
+        let mods = ModTextures::default();
+        let _ = resolve(&dir, &base, &imgs, &mods);
+        let path = dir.join("182_3-0.txt");
+
+        // L'utente cambia solo la description.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let modified: String = text
+        .lines()
+        .map(|l| {
+            if l.trim().starts_with("description") {
+                "description = \"My custom description.\""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&path, modified).unwrap();
+
+        apply_llm_background(
+            &dir,
+            (207, 213),
+                             "flat:182:3",
+                             "182_3-0",
+                             "Blonde woman",
+                             Some("Matthew"),
+                             Some("You are Matthew, a member of the Temple."),
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("My custom description."));
+        assert!(!after.contains("You are Matthew"));
+        // Il nome NON viene aggiornato (file considerato personalizzato).
+        assert!(!after.contains("Matthew"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_llm_background_noop_when_both_none() {
+        let dir = std::env::temp_dir().join(format!("classic_npc_bg_noop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        apply_llm_background(
+            &dir,
+            (207, 213),
+                             "flat:182:3",
+                             "182_3-0",
+                             "Blonde woman",
+                             None,
+                             None,
+        );
+        // Nessun file creato.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_llm_voice_fills_only_an_empty_voice_field() {
+        let dir = std::env::temp_dir().join(format!("classic_npc_voice_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        apply_llm_background(&dir, (207, 213), "flat:181:3", "181_3-0", "blue-cloaked boy", Some("Matthew"), Some("You are Matthew."));
+        let path = dir.join("181_3-0.txt");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\nvoice =\n"));
+
+        // Voce vuota: viene riempita, il resto del file resta com'era.
+        apply_llm_voice(&dir, (207, 213), "flat:181:3", "181_3-0", "am_liam");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\nvoice = am_liam\n"), "{content}");
+        assert!(content.contains("id = 207,213 flat:181:3") && content.contains("# voice: es."), "{content}");
+        assert_eq!(resolve_existing(&dir, (207, 213), "flat:181:3", "181_3-0").voice.as_deref(), Some("am_liam"));
+
+        // Voce gia' impostata (anche dall'utente): non si tocca.
+        apply_llm_voice(&dir, (207, 213), "flat:181:3", "181_3-0", "bm_george");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\nvoice = am_liam\n"));
+
+        // Nessun file per quell'NPC: nessun effetto.
+        apply_llm_voice(&dir, (1, 2), "flat:181:3", "181_3-0", "bm_george");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn frame_stems_are_consecutive_and_case_insensitive() {
+        let dir = std::env::temp_dir().join(format!("classic_frames_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in [
+            "182_11-0_walk_0.png",
+            "182_11-0_Walk_1.PNG",
+            "182_11-0_walk_2.png",
+            "182_11-0_walk_4.png", // dopo un buco: ignorato
+            "182_11-0_idle_0.png",
+            "182_11-0.png",
+            "182_11-0_walk_0.txt",
+            "182_12-0_walk_0.png", // altra texture
+        ] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        assert_eq!(
+            frame_stems(&dir, "182_11-0", "walk"),
+            vec!["182_11-0_walk_0", "182_11-0_Walk_1", "182_11-0_walk_2"]
+        );
+        assert_eq!(frame_stems(&dir, "182_11-0", "idle"), vec!["182_11-0_idle_0"]);
+        assert!(frame_stems(&dir, "184_10-0", "walk").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,6 +4,43 @@
 //! - Nessun filare procedurale: gli alberi in città arrivano dai **flat RMB** (vedi `tiles.rs`),
 //!   che vengono renderizzati come cross-billboard 3D usando `NaturePool::tree_for_flat`.
 //!
+//! ## Stagione: mappatura ufficiale DFU
+//!
+//! Fonte: Interkarma (autore di Daggerfall Unity), forum DFWorkshop.
+//!
+//! ```text
+//! Clima                    Summer  Winter
+//! Rainforest               500  →  500   (nessuna neve)
+//! Sub-tropical             501  →  501   (nessuna neve)
+//! Swamp                    502  →  502   (nessuna neve)
+//! Desert                   503  →  503   (nessuna neve)
+//! Temperate Woodland       504  →  505
+//! Woodland Hills           506  →  507
+//! Haunted Woodlands        508  →  509
+//! Mountains                510  →  511
+//! ```
+//!
+//! Regola: **la variante invernale è `base + 1` solo per 504, 506, 508, 510**
+//! (archivi pari ≥ 504). Gli archivi 500-503 non hanno variante invernale nel
+//! gioco originale, quindi restano identici in ogni stagione.
+//!
+//! La mappatura `clima → archivio base` **non è duplicata qui**: viene da
+//! `crate::data::climate::world_climate_settings` (che è già allineata a DFU).
+//! Il vecchio codice locale usava `231 → 506` (sbagliato: 506 è Woodland Hills,
+//! il clima di Daggerfall è 231 Temperate Woodland → 504) e `base + 8` per
+//! l'inverno (sbagliato: la regola è `+1`). Risultato: `231 + Winter → 514`,
+//! archivio inesistente → fallback a 506 → **alberi sempre identici**,
+//! estate e inverno, dentro e fuori città.
+//!
+//! `NaturePool::cache` è keyed su `archive_id` (es. 504, 505), quindi cambiando
+//! stagione la chiave cambia e i `TreeType` vengono ricaricati automaticamente:
+//! non serve invalidare `NaturePool`.
+//!
+//! Se l'archivio invernale (`505`, `507`, `509`, `511`) non esiste (mod senza
+//! varianti invernali HD, o ARENA2 incompleto), `get_or_load` fa fallback
+//! all'archivio estivo (`archive_id - 1`) con un warning: meglio alberi estivi
+//! che nessun albero.
+//!
 //! ## Orientamento delle texture
 //!
 //! Le UV del billboard sono configurate in modo che la BASE del mesh (y=0, dove ci sono
@@ -13,10 +50,11 @@
 //!   - `false` (vanilla, PNG, DXT): riga 0 = top dell'immagine → `v_base=0.0`
 //!   - `true`  (BC7 Unity):          riga 0 = bottom dell'immagine → `v_base=1.0`
 //!
-//! **Nota storica**: in passato questa formula era invertita per errore; la versione
-//! attuale è quella verificata "a schermo". Se vedi alberi capovolti, il primo posto
-//! da guardare è questo `if`.
+//! **Non toccare senza testare**: se gli alberi appaiono capovolti, il primo
+//! posto da guardare è questo `if`.
 
+use crate::data::climate::Season;
+use crate::data::world_climate_settings;
 use crate::mod_textures::ModTextures;
 use crate::world::GameData;
 use bevy::prelude::*;
@@ -29,28 +67,34 @@ use dfmod::{MapKind, TextureKey};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
-// Scelta archivio / densità in base a clima e stagione
+// Scelta archivio in base a clima e stagione
 // ---------------------------------------------------------------------------
 
-pub fn nature_archive_for_climate(climate: i32, is_winter: bool) -> u32 {
-    if is_winter {
-        match climate {
-            226 => 509,
-            230 => 508,
-            231 | 232 => 508,
-            _ => 500,
-        }
-    } else {
-        match climate {
-            224 | 225 => 500,
-            226 => 501,
-            227 => 502,
-            228 => 503,
-            229 => 504,
-            230 => 505,
-            231 => 506,
-            232 => 507,
-            _ => 506,
+/// Archivio di natura per `(climate, season)`, come in Daggerfall Unity.
+///
+/// **Regola DFU** (fonte: Interkarma su forum.dfworkshop.net):
+///
+/// - il clima decide l'archivio **base** (500..=510), via
+///   `crate::data::climate::world_climate_settings(...).nature_archive`;
+/// - la variante invernale è `base + 1` **solo** per `504`, `506`, `508`, `510`;
+/// - `500`, `501`, `502`, `503` non hanno variante invernale: restano identici;
+/// - `Rain` condivide l'archivio estivo (la neve è solo invernale).
+///
+/// Non duplicare la mappatura `climate → base`: quella di
+/// `world_climate_settings` è già allineata a DFU ed è l'unica fonte di verità.
+pub fn nature_archive_for_climate(climate: i32, season: Season) -> u32 {
+    let base = world_climate_settings(climate).nature_archive as u32;
+    match season {
+        Season::Summer | Season::Rain => base,
+        Season::Winter => {
+            // Varianti invernali: 504→505, 506→507, 508→509, 510→511.
+            // Cioè solo archivi pari ≥ 504. 500-503 non hanno neve (foresta
+            // pluviale, sub-tropicale, palude, deserto).
+            if base >= 504 && base % 2 == 0 {
+                base + 1
+            } else {
+                base
+            }
         }
     }
 }
@@ -107,32 +151,20 @@ impl SimpleRng {
 ///   * `true`  → texture bottom-up (riga 0 = basso, convenzione Unity/BC7):
 ///               la base del billboard deve mostrare la base della texture
 ///               (radici), che in memoria è alla riga 0.
-///
-/// In entrambi i casi, la "base" è la parte del mesh a `y=0`.
 pub(crate) fn create_cross_billboard_mesh(w: f32, h: f32, is_unity_bottom_up: bool) -> Mesh {
     let hw = w / 2.0;
     let positions = vec![
-        // Piano A (X-Y)
         [-hw, 0.0, 0.0],
         [hw, 0.0, 0.0],
         [hw, h, 0.0],
         [-hw, h, 0.0],
-        // Piano B (Z-Y)
         [0.0, 0.0, -hw],
         [0.0, 0.0, hw],
         [0.0, h, hw],
         [0.0, h, -hw],
     ];
     let normals = vec![[0.0, 1.0, 0.0]; 8];
-
-    // V=0 deve cadere sulla riga 0 della texture.
-    //   top-down: riga 0 = alto   → v_top = 0.0, v_base = 1.0
-    //   bottom-up: riga 0 = basso → v_top = 1.0, v_base = 0.0
-    //
-    // **Non toccare senza testare**: se le texture della tua mod hanno
-    // convenzione opposta, inverti i due rami.
     let (v_base, v_top) = if is_unity_bottom_up { (0.0, 1.0) } else { (1.0, 0.0) };
-
     let uvs = vec![
         [0.0, v_base], [1.0, v_base], [1.0, v_top], [0.0, v_top],
         [0.0, v_base], [1.0, v_base], [1.0, v_top], [0.0, v_top],
@@ -183,8 +215,22 @@ impl NaturePool {
         materials: &mut Assets<StandardMaterial>,
     ) -> &[TreeType] {
         if !self.cache.contains_key(&archive_id) {
-            let species = Self::build_archive(archive_id, data, mods, images, meshes, materials);
-            self.cache.insert(archive_id, species);
+            let mut species =
+            Self::build_archive(archive_id, data, mods, images, meshes, materials);
+            // Fallback: se l'archivio invernale (505, 507, 509, 511) non
+            // esiste, usa il corrispondente estivo (archive_id - 1). Meglio
+            // alberi estivi che nessun albero.
+            if species.is_empty()
+                && matches!(archive_id, 505 | 507 | 509 | 511)
+                {
+                    let base = archive_id - 1;
+                    warn!(
+                        "Archivio vegetazione invernale {} mancante, uso il corrispondente estivo {}",
+                        archive_id, base
+                    );
+                    species = Self::build_archive(base, data, mods, images, meshes, materials);
+                }
+                self.cache.insert(archive_id, species);
         }
         if !self.by_record.keys().any(|(a, _)| *a == archive_id) {
             let species = self.cache.get(&archive_id).cloned().unwrap_or_default();
@@ -232,8 +278,6 @@ impl NaturePool {
                 (w_px as f32 * (1.0 + scale_x), h_px as f32 * (1.0 + scale_y))
             };
 
-            // Alberi grandi: 0.15 (era 0.12) per essere più imponenti.
-            // Clamp: 6-35 m di altezza, 4-25 m di larghezza.
             let h_meters = (final_h * 0.15).clamp(6.0, 35.0);
             let w_meters = (final_w * 0.15).clamp(4.0, 25.0);
 
@@ -299,13 +343,15 @@ impl NaturePool {
 ///
 /// La vegetazione **in città** non passa di qui: arriva dai flat RMB e viene
 /// renderizzata in `tiles.rs::collect_tiles` tramite `NaturePool::tree_for_flat`.
+///
+/// `season` (Summer, Winter, Rain) pilota `nature_archive_for_climate`.
 pub fn spawn_trees_for_chunk(
     commands: &mut Commands,
     chunk_entity: Entity,
     mx: i32,
     my: i32,
     climate: i32,
-    winter: bool,
+    season: Season,
     samples: &HeightSamples,
     data: &GameData,
     mods: &mut ModTextures,
@@ -318,7 +364,7 @@ pub fn spawn_trees_for_chunk(
     if climate == 223 {
         return;
     }
-    let archive = nature_archive_for_climate(climate, winter);
+    let archive = nature_archive_for_climate(climate, season);
     let tree_species = pool.get_or_load(archive, data, mods, images, meshes, materials);
     if tree_species.is_empty() {
         return;
@@ -327,8 +373,6 @@ pub fn spawn_trees_for_chunk(
     let mut rng = SimpleRng::new(seed);
 
     commands.entity(chunk_entity).with_children(|parent| {
-        // Alberi selvaggi esterni alle mura (disposizione originale di Daggerfall).
-        // NIENTE viale procedurale: gli alberi in città arrivano dai flat del RMB.
         let count = tree_count_for_climate(climate);
         for _ in 0..count {
             let gx = rng.gen_f32(2.0, 126.0);
@@ -358,8 +402,6 @@ pub fn spawn_trees_for_chunk(
             let tree = &tree_species[species_idx];
             let local_x = gx * CELL_SIZE;
             let local_z = -(gy * CELL_SIZE);
-            // Wild scatter: variazione di scala più ampia per non avere
-            // un bosco tutto uguale.
             let scale_var = rng.gen_f32(1.0, 1.7);
             parent.spawn((
                 Mesh3d(tree.mesh.clone()),

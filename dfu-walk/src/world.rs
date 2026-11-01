@@ -3,8 +3,18 @@
 //! Sistema di coordinate: in Bevy X = est, Y = su, Z = -nord. Le posizioni sono
 //! relative a un'origine mobile (in map pixel) così restano piccole anche a
 //! centinaia di chilometri dal punto di partenza (precisione degli f32).
+//!
+//! ## Stagione
+//!
+//! `GameData::season` sostituisce il vecchio `winter: bool`. È `Season` (Summer,
+//! Winter, Rain) di `crate::data::climate`, così anche la pioggia ha il suo
+//! archivio di texture (offset +2) e non collassa su "non inverno". Il cambio a
+//! runtime (es. tasto F4) funziona solo se qualcuno invalida `Streaming` per far
+//! ricostruire i tile: vedi `tiles::Streaming::invalidate_all` e il sistema
+//! `cycle_season` in `main.rs`.
 
 use bevy::prelude::*;
+use crate::data::climate::Season;
 use crate::data::maps::DFLocation;
 use crate::data::terrain_mesh::{terrain_height, CELL_SIZE, MAP_PIXEL_SIZE};
 use crate::data::{HeightSamples, PakFile, Palette, WoodsFile};
@@ -24,7 +34,14 @@ pub struct GameData {
     pub woods: Arc<WoodsFile>,
     pub climate: Arc<PakFile>,
     pub palette: Arc<Palette>,
-    pub winter: bool,
+    /// Stagione corrente. Sostituisce il vecchio `winter: bool`:
+    /// - `Summer` → archivi base;
+    /// - `Winter` → archivi +1 (neve);
+    /// - `Rain`   → archivi +2 (pioggia).
+    ///
+    /// Il cambio a runtime (es. tasto F4) funziona solo se qualcuno invalida
+    /// `Streaming` (vedi `tiles::Streaming::invalidate_all`).
+    pub season: Season,
     // Buffer per città, blocchi RMB e modelli 3D
     pub maps_buf: Arc<Vec<u8>>,
     pub blocks_buf: Arc<Vec<u8>>,

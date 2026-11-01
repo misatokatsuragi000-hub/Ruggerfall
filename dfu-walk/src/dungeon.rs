@@ -18,6 +18,18 @@
 //! Inoltre, se sei vicino all'uscita, il tasto E deve servire a uscire e non
 //! ad aprire una porta vicina: `dungeon_move` salta il toggle delle porte
 //! quando `d_exit < DUNGEON_EXIT_DISTANCE`.
+//!
+//! ## Collisione per i follower
+//!
+//! `DungeonState::blocked(x, z, feet_y, radius)` (metodo pubblico su `impl
+//! DungeonState`) permette a `tiles::update_followers` di far fermare i
+//! follower sui muri e sulle porte chiuse del dungeon corrente. Senza questo
+//! metodo, la query `TileCollision` (usata fuori, per le città) non copre i
+//! dungeon e i follower attraversavano i muri sotterranei.
+//!
+//! Le coordinate accettate sono **mondo** (come `Transform::translation` del
+//! giocatore e dei follower), e vengono convertite in locali sottraendo
+//! `ActiveDungeon::origin` prima di chiamare `BuiltDungeon::blocked`.
 
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
@@ -90,6 +102,30 @@ impl DungeonState {
     pub fn is_inside(&self) -> bool {
         self.active.is_some()
     }
+
+    /// True se un cerchio di raggio `radius` centrato in `(x, z)` (coordinate
+    /// **mondo**, come `Transform::translation`) alla quota `feet_y` (piedi,
+    /// sempre **mondo**) tocca un muro o una porta chiusa del dungeon corrente.
+    ///
+    /// Usata da `tiles::update_followers` per far fermare i follower sui muri
+    /// sotterranei invece di attraversarli. La query `TileCollision` usata fuori
+    /// per i chunk delle città non copre i dungeon, quindi senza questo metodo
+    /// i follower "passavano attraverso" pareti e porte chiuse.
+    ///
+    /// Fuori dal dungeon (`active == None`) restituisce `false`: nessuna
+    /// collisione da applicare. Il chiamante deve decidere in base a
+    /// `is_inside()` se chiamarlo.
+    pub fn blocked(&self, x: f32, z: f32, feet_y: f32, radius: f32) -> bool {
+        match &self.active {
+            Some(a) => a.dungeon.blocked(
+                x - a.origin.x,
+                z - a.origin.z,
+                feet_y - a.origin.y,
+                radius,
+            ),
+            None => false,
+        }
+    }
 }
 
 pub struct DungeonPlugin;
@@ -101,10 +137,10 @@ impl Plugin for DungeonPlugin {
             Update,
             (
                 check_initial_dungeon_spawn,
-                dungeon_enter_exit,
-                handle_dungeon_door_click,
-                dungeon_move,
-                face_dungeon_flats,
+             dungeon_enter_exit,
+             handle_dungeon_door_click,
+             dungeon_move,
+             face_dungeon_flats,
             )
             .chain()
             .before(crate::interior::interior_enter_exit)

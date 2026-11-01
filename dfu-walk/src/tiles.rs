@@ -1,33 +1,40 @@
 //! Caricamento e streaming dei map pixel: terreno, città, vegetazione,
 //! flat esterni (decorazioni) e NPC animati con supporto texture HD (.dfmod).
 //!
+//! ## Stagione
+//!
+//! `GameData::season` (Summer, Winter, Rain) pilota:
+//!
+//! - `ground_archive(climate, season)` per l'archivio delle tile del terreno;
+//! - `nature_archive_for_climate(climate, season)` per gli alberi 3D;
+//! - `spawn_trees_for_chunk(..., season, ...)` che usa la stessa stagione.
+//!
+//! Il cambio a runtime (`Streaming::invalidate_all` + `cycle_season` in
+//! `main.rs`) ricostruisce i tile al frame successivo. `wall_textures.cache`
+//! e `NaturePool::cache` non vanno invalidati: le chiavi sono `(archivio_finale,
+//! record)` e `archive_id`, entrambi dipendenti dalla stagione via
+//! `apply_climate` / `nature_archive_for_climate`.
+//!
+//! ## Collisione dei follower
+//!
+//! `update_followers` usa la query sui chunk (`TileCollision`) per fermare i
+//! follower sui muri procedurali delle città (fuori), `interior.blocked` e
+//! `dungeon.blocked` per fermarli su pareti e porte chiuse (dentro).
+//!
 //! ## Mood dei follower
 //!
-//! I follower nati da NPC custom possono cambiare espressione in base allo
-//! stato emotivo (`Follower.mood`): quando `mood > 0`, `update_followers`
-//! mostra staticamente il frame `idle[mood]` (clamped) invece del ciclo
-//! Still/Animated. Quando `mood == 0`, il comportamento è quello di sempre.
+//! `Follower.mood > 0` mostra staticamente `idle[mood]` (clamped) invece del
+//! ciclo Still/Animated. Vedi `tiles::CustomIdleAnim` e `apply_follower_mood`.
 //!
-//! Il mood viene impostato da:
-//! - `Follower::with_mood(..)` al momento del reclutamento (via
-//!   `dialog::apply_recruit` che legge `initial_mood` da `RecruitFollowerEvent`);
-//! - `FollowerMoodEvent` per i follower già attivi quando arriva una nuova
-//!   risposta LLM con mood.
+//! ## Navi
 //!
-//! ## Ciclo idle
-//!
-//! Quando il follower è fermo e `mood == 0`:
-//! - per `IDLE_START_DELAY` secondi resta su `Still` (mostra il primo frame o
-//!   la posa di riposo);
-//! - poi passa in `Animated` e mostra i frame idle uno dopo l'altro, ognuno
-//!   per `IDLE_FRAME_SECONDS`;
-//! - finiti i frame, torna in `Still` per altri `IDLE_START_DELAY` secondi.
-//!
-//! Quando si muove, il ciclo torna in `Still` con timer azzerato, così al
-//! prossimo stop riparte con un'attesa pulita.
+//! `rebase_origin` sposta anche le navi (`With<Ship>`) quando l'origine
+//! mobile cambia, così la nave spawnata in un map pixel costiero resta
+//! ancorata all'acqua anche dopo un lungo viaggio verso l'interno.
 use crate::interior::InteriorState;
 use crate::mod_textures::ModTextures;
 use crate::player::Player;
+use crate::ship::Ship;
 use crate::terrain_material::{TerrainExtension, TerrainMaterial};
 use crate::trees::{spawn_trees_for_chunk, NaturePool};
 use crate::wall_textures::WallTextures;
@@ -54,8 +61,8 @@ use dfmod::{MapKind, TextureKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const MAX_PENDING: usize = 4;
-const MAX_SPAWNS_PER_FRAME: usize = 2;
+const MAX_PENDING: usize = 12;
+const MAX_SPAWNS_PER_FRAME: usize = 4;
 const DEFAULT_CLIMATE: i32 = 231;
 
 const FLAT_IDS_AS_TREES: &[(u16, u8)] = &[(210, 28)];
@@ -117,13 +124,7 @@ const MIN_FOLLOWER_DIST: f32 = 1.4;
 const FORMATION_ROT_SPEED: f32 = 1.5;
 const PLAYER_MOVING_SPEED: f32 = 0.3;
 
-/// Ogni quanti secondi cambia il frame durante l'idle animato. Gli idle degli
-/// NPC custom non sono "animazioni" reali ma pose/espressioni, quindi ogni
-/// frame dura volutamente molto (5s). Il periodo `Animated` termina quando
-/// tutti i frame sono stati mostrati almeno una volta.
 const IDLE_FRAME_SECONDS: f32 = 5.0;
-
-/// Quanti secondi restare in `Still` tra un ciclo `Animated` e il successivo.
 const IDLE_START_DELAY: f32 = 4.0;
 
 fn formation_offset(slot: u32, behind: Vec2, right: Vec2) -> Vec3 {
@@ -646,6 +647,32 @@ pub fn probe_world<'a>(
     best
 }
 
+/// Muove `current` verso `candidate` e scivola lungo i muri asse-per-asse.
+/// Se `candidate` è libero lo usa; altrimenti prova a muoversi solo in X o solo in Z.
+/// Se anche quelli sono bloccati, resta in `current`.
+///
+/// Usata dai follower quando sono in un interno o in un dungeon (pareti quasi
+/// sempre ortogonali). Fuori si usa `resolve_world`, che spinge in diagonale
+/// (adatto ai muri procedurali delle città).
+fn slide_move(
+    current: Vec2,
+    candidate: Vec2,
+    blocked: &dyn Fn(f32, f32) -> bool,
+) -> Vec2 {
+    if !blocked(candidate.x, candidate.y) {
+        return candidate;
+    }
+    let try_x = Vec2::new(candidate.x, current.y);
+    if !blocked(try_x.x, try_x.y) {
+        return try_x;
+    }
+    let try_z = Vec2::new(current.x, candidate.y);
+    if !blocked(try_z.x, try_z.y) {
+        return try_z;
+    }
+    current
+}
+
 #[derive(Component)]
 pub struct NpcWalker {
     pub(crate) sprites: Arc<NpcSpriteSet>,
@@ -693,9 +720,6 @@ pub struct InteriorFollowerId {
 #[derive(Clone)]
 pub struct CustomWalkAnim {
     pub frames: Vec<Handle<StandardMaterial>>,
-    /// Dimensioni in metri di ogni frame (stessa lunghezza di `frames`).
-    /// Calcolate in `interior::load_frames_from_stems` in proporzione
-    /// all'idle base, per preservare l'aspect ratio di ciascun frame.
     pub sizes: Vec<Vec2>,
     pub fps: f32,
 }
@@ -703,11 +727,7 @@ pub struct CustomWalkAnim {
 #[derive(Clone)]
 pub struct CustomIdleAnim {
     pub frames: Vec<Handle<StandardMaterial>>,
-    /// Dimensioni in metri di ogni frame (stessa lunghezza di `frames`).
     pub sizes: Vec<Vec2>,
-    /// Non più usato per la velocità del ciclo: la durata di ogni frame è
-    /// fissata a `IDLE_FRAME_SECONDS`. Il campo resta per compatibilità con
-    /// la struct di `interior.rs` e per eventuali override futuri.
     pub fps: f32,
 }
 
@@ -730,9 +750,6 @@ pub struct Follower {
     idle_cycle: IdleCycle,
     idle_timer: f32,
     idle_rng: u64,
-    /// Stato emotivo corrente (0 = neutro). Vedi `FollowerMoodEvent`.
-    /// Se > 0 e il follower è fermo, il frame idle mostrato è `idle[mood]`
-    /// (clamped) invece del ciclo Still/Animated.
     mood: u8,
     moves: bool,
     frame: usize,
@@ -836,7 +853,6 @@ impl Follower {
         }
     }
 
-    /// Imposta l'animazione camminata (frames, dimensioni per frame, fps).
     pub fn with_walk(
         mut self,
         frames: Vec<Handle<StandardMaterial>>,
@@ -849,7 +865,6 @@ impl Follower {
         self
     }
 
-    /// Imposta l'animazione idle (frames, dimensioni per frame, fps).
     pub fn with_idle(
         mut self,
         frames: Vec<Handle<StandardMaterial>>,
@@ -865,14 +880,11 @@ impl Follower {
         self
     }
 
-    /// Imposta lo stato emotivo iniziale (0 = neutro).
     pub fn with_mood(mut self, mood: u8) -> Self {
         self.mood = mood;
         self
     }
 
-
-    /// Legge lo stato emotivo corrente (0 = neutro).
     pub fn mood(&self) -> u8 {
         self.mood
     }
@@ -1088,11 +1100,35 @@ impl Streaming {
     pub fn new(radius: i32, tile_px: (usize, usize)) -> Self {
         Self { radius, tile_px, loaded: HashMap::new(), pending: HashMap::new() }
     }
+
+    /// Numero di tile attualmente caricati (usato dal titolo della finestra).
     pub fn loaded_count(&self) -> usize {
         self.loaded.len()
     }
-}
 
+    /// Svuota i tile caricati e quelli in coda: al prossimo `stream_tiles` i
+    /// tile vengono ricostruiti con la stagione corrente di `GameData::season`.
+    ///
+    /// **Attenzione**: non despawna le entity dei tile in `loaded`. Se la usi
+    /// per cambiare stagione a runtime, preferisci `invalidate_all_with` (che
+    /// invece le despawna) per evitare tile orfani.
+    pub fn invalidate_all(&mut self) {
+        self.loaded.clear();
+        self.pending.clear();
+    }
+
+    /// Come `invalidate_all`, ma despawna anche le entity dei tile caricati.
+    ///
+    /// Necessario quando si cambia stagione a runtime (F4 in `calendar.rs`):
+    /// se solo si svuotasse `loaded`, `stream_tiles` non troverebbe più le
+    /// entity e non le eliminerebbe mai → tile orfani sovrapposti ai nuovi.
+    pub fn invalidate_all_with(&mut self, commands: &mut Commands) {
+        for (_, e) in self.loaded.drain() {
+            commands.entity(e).despawn_recursive();
+        }
+        self.pending.clear();
+    }
+}
 pub fn climate_of(data: &GameData, mx: i32, my: i32) -> i32 {
     data.climate
     .map_pixel_value(mx, my)
@@ -1172,10 +1208,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
         flatten_terrain_heights(&mut samples.data, samples.dim, &city_rect, 12.0);
         let ground = |x: f32, z: f32| terrain_height(&samples, x / CELL_SIZE, -z / CELL_SIZE);
         let (builder, stats) = build_city_buildings(loc, &blocks_bsa, &arch3d_bsa, &ground);
-        info!(
-            "{}: {} oggetti, {} edifici, {} scartati, {} modelli mancanti",
-            loc.name, stats.objects, stats.built, stats.skipped, stats.missing_models
-        );
+
         if !builder.is_empty() {
             let (parts, textured) = builder.into_all();
             let (wall_i, roof_i, trim_i) = (
@@ -1205,6 +1238,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
         let bh = loc.height.min(8);
         let start_bx = (8 - bw) / 2;
         let start_by = (8 - bh) / 2;
+        let block_debug = std::env::var("DF_MODEL_DEBUG_BLOCK").ok().map(|v| v.to_ascii_uppercase());
         for by in 0..bh {
             for bx in 0..bw {
                 let Some(name) = loc.block_names.get(by * loc.width + bx) else { continue };
@@ -1212,7 +1246,25 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                 let Ok(rmb) = RmbBlock::parse(raw) else { continue };
                 let bx0 = (start_bx + bx) as f32 * BLOCK_SIZE_M;
                 let bz0 = (start_by + by) as f32 * BLOCK_SIZE_M;
+                let flat_dbg = block_debug.as_deref().map_or(false, |f| name.to_ascii_uppercase().contains(f));
                 for flat in &rmb.flats {
+                    if flat_dbg {
+                        // DF_MODEL_DEBUG_BLOCK=GRVE: ogni flat del blocco e se viene scartato subito.
+                        eprintln!(
+                            "FLAT {name}: {}_{} a ({}, {}){}",
+                                  flat.texture_archive,
+                                  flat.texture_record,
+                                  flat.x,
+                                  flat.z,
+                                  if flat.block.is_some() {
+                                      "  [scartato: ha un blocco]"
+                                  } else if flat.texture_archive == 199 {
+                                      "  [scartato: archivio 199]"
+                                  } else {
+                                      ""
+                                  },
+                        );
+                    }
                     if flat.block.is_some() {
                         continue;
                     }
@@ -1268,18 +1320,16 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                 }
                 exterior_npcs.push((x, z, archive, bounds));
             }
-            info!(
-                "  {} decorazioni + {} NPC in {}",
-                exterior_flats.len(),
-                  exterior_npcs.len(),
-                  loc.name
-            );
+
         }
     }
     let tilemap = generate_default_tilemap(&samples, mx, my, tile_preset.as_deref()).ok()?;
     let encoded = encode_for_shader(&tilemap, true);
     let mesh = build_terrain_mesh(&samples, &encoded, tile_px);
-    let archive = ground_archive(climate_of(data, mx, my), data.winter);
+    // Archivio terreno per la stagione corrente (Summer/Winter/Rain).
+    // `ground_archive` accetta `Season` e restituisce l'archivio "stagionalizzato"
+    // (Summer = base, Winter = +1, Rain = +2 se il set supporta la pioggia).
+    let archive = ground_archive(climate_of(data, mx, my), data.season);
     let grass_mask = crate::grass::grass_mask(data, archive);
     let grass_tilemap = Arc::new(encoded.clone());
     let water: Vec<bool> = tilemap.iter().map(|&t| t == 0xFF || (t & 0x3F) == 0).collect();
@@ -1334,9 +1384,28 @@ pub fn rebase_origin(
     mut origin: ResMut<Origin>,
     interior: Res<InteriorState>,
     dungeon: Res<crate::dungeon::DungeonState>,
-    mut player: Query<&mut Transform, (With<Player>, Without<TerrainTile>)>,
-                     mut tiles: Query<(&TerrainTile, &mut Transform), Without<Player>>,
-                     mut followers: Query<&mut Transform, (With<Follower>, Without<Player>, Without<TerrainTile>, Without<Parent>)>,
+    mut player: Query<
+    &mut Transform,
+    (With<Player>, Without<TerrainTile>, Without<Ship>),
+                     >,
+                     mut tiles: Query<
+                     (&TerrainTile, &mut Transform),
+                     (Without<Player>, Without<Ship>),
+                     >,
+                     mut followers: Query<
+                     &mut Transform,
+                     (
+                         With<Follower>,
+                      Without<Player>,
+                      Without<TerrainTile>,
+                      Without<Parent>,
+                      Without<Ship>,
+                     ),
+                     >,
+                     mut ships: Query<
+                     &mut Transform,
+                     (With<Ship>, Without<Player>, Without<TerrainTile>, Without<Follower>),
+                     >,
 ) {
     if interior.is_inside() || dungeon.is_inside() {
         return;
@@ -1359,6 +1428,13 @@ pub fn rebase_origin(
     for mut ft in &mut followers {
         ft.translation.x -= de as f32 * crate::data::terrain_mesh::MAP_PIXEL_SIZE;
         ft.translation.z += dn as f32 * crate::data::terrain_mesh::MAP_PIXEL_SIZE;
+    }
+    // Rebase anche delle navi: l'origine mobile cambia, e le navi spawnate
+    // in un map pixel costiero devono restare ancorate all'acqua anche dopo
+    // un lungo viaggio verso l'interno.
+    for mut ship_tf in &mut ships {
+        ship_tf.translation.x -= de as f32 * crate::data::terrain_mesh::MAP_PIXEL_SIZE;
+        ship_tf.translation.z += dn as f32 * crate::data::terrain_mesh::MAP_PIXEL_SIZE;
     }
 }
 
@@ -1441,8 +1517,31 @@ pub fn collect_tiles(
         let tile_array_handle = match mods.terrain_texture_array(tile.archive as u32, &mut images) {
             Some(h) => h,
             None => {
-                warn!("Array terreno {} non trovato nelle mod", tile.archive);
-                continue;
+                use crate::data::climate::Season;
+                let summer_archive = match data.season {
+                    Season::Summer => None,
+                    Season::Winter if tile.archive > 0 => Some(tile.archive - 1),
+                    Season::Rain if tile.archive > 1 => Some(tile.archive - 2),
+                    _ => None,
+                };
+                let fallback = summer_archive
+                .and_then(|a| mods.terrain_texture_array(a as u32, &mut images).map(|h| (a, h)));
+                match fallback {
+                    Some((a, h)) => {
+                        debug!(
+                            "Array terreno {} non disponibile, uso l'archivio estivo {}",
+                            tile.archive, a
+                        );
+                        h
+                    }
+                    None => {
+                        debug!(
+                            "Array terreno {} non disponibile nelle mod: tile saltato",
+                            tile.archive
+                        );
+                        continue;
+                    }
+                }
             }
         };
         let tile_water = Arc::new(tile.water.clone());
@@ -1537,7 +1636,7 @@ pub fn collect_tiles(
             });
         }
         let climate = climate_of(&data, key.0, key.1);
-        let tree_archive = crate::trees::nature_archive_for_climate(climate, data.winter);
+        let tree_archive = crate::trees::nature_archive_for_climate(climate, data.season);
         nature_pool.get_or_load(
             tree_archive,
             &data,
@@ -1552,6 +1651,7 @@ pub fn collect_tiles(
         let mut rects_to_spawn: Vec<(Handle<Mesh>, Handle<StandardMaterial>, Vec3)> = Vec::new();
         let mut total_nature = 0usize;
         let mut total_decor = 0usize;
+        let flat_debug = std::env::var_os("DF_MODEL_DEBUG").is_some();
         for (fx, fz, archive, record) in &tile.exterior_flats {
             let gx = (fx / CELL_SIZE).clamp(0.0, 128.0);
             let gy = (-fz / CELL_SIZE).clamp(0.0, 128.0);
@@ -1564,10 +1664,16 @@ pub fn collect_tiles(
                 &mut images,
                 &mut standard_materials,
             ) else {
+                if flat_debug {
+                    eprintln!("FLAT {archive}_{record} a ({fx:.0}, {fz:.0}): nessuna texture/materiale, non viene mostrato");
+                }
                 continue;
             };
             if FLAT_IDS_AS_TREES.contains(&(*archive, *record)) {
                 let Some(tree) = tree_template.as_ref() else {
+                    if flat_debug {
+                        eprintln!("FLAT {archive}_{record} a ({fx:.0}, {fz:.0}): albero senza modello, non viene mostrato");
+                    }
                     continue;
                 };
                 let (w_tree, h_tree) = (6.0_f32, 12.0_f32);
@@ -1582,20 +1688,14 @@ pub fn collect_tiles(
                 ));
             } else {
                 let (w, h) = (w_px * DF_UNIT, h_px * DF_UNIT);
-                info!(
-                    "FLAT pos=({:.1},{:.1}) archive={} record={} size_px={}x{}",
-                      fx, fz, archive, record, w_px, h_px
-                );
+
                 let mesh = meshes.add(Rectangle::new(w, h));
                 rects_to_spawn.push((mesh, mat_orig, Vec3::new(*fx, y + h * 0.5, *fz)));
                 total_decor += 1;
             }
         }
         if total_nature + total_decor > 0 {
-            info!(
-                "Tile ({},{}): {} alberi 3D, {} decorazioni 2D",
-                  key.0, key.1, total_nature, total_decor
-            );
+
         }
         commands.entity(chunk_entity).with_children(|parent| {
             for (mesh, mat, pos, scale) in trees_to_spawn {
@@ -1749,7 +1849,7 @@ pub fn collect_tiles(
             key.0,
             key.1,
             climate_of(&data, key.0, key.1),
-                              data.winter,
+                              data.season,
                               &tile.samples,
                               &data,
                               &mut mods,
@@ -1782,6 +1882,14 @@ pub fn update_followers(
     interior: Res<InteriorState>,
     dungeon: Res<crate::dungeon::DungeonState>,
     player: Query<&Transform, (With<Player>, Without<Follower>)>,
+                        // Collider dei chunk (muri procedurali delle città).
+                        // Le due `Without` evitano conflitti di borrow:
+                        // - `Without<Player>` perché `player` prende `&Transform`;
+                        // - `Without<Follower>` perché `followers` prende `&mut Transform`.
+                        colliders: Query<
+                        (&TileCollision, &Transform),
+                        (Without<Player>, Without<Follower>),
+                        >,
                         mut followers: Query<(
                             Entity,
                             &mut Follower,
@@ -1912,26 +2020,40 @@ pub fn update_followers(
         let offset = formation_offset(slot, behind, right);
         let target = player_pos + offset;
 
-        if entered_new_env && !waiting {
-            tf.translation = target;
-            tf.translation.y = 0.0;
-            fol.shown = None;
-        }
-
-        let sprites_opt = fol.sprites.clone();
-        let sprites = sprites_opt.as_deref();
-
         let dist_player = Vec2::new(
             player_pos.x - tf.translation.x,
             player_pos.z - tf.translation.z,
         )
         .length();
 
-        if !waiting && !entered_new_env && dist_player > teleport_dist {
-            tf.translation = target;
+        let should_teleport = (entered_new_env && !waiting)
+        || (!waiting && !entered_new_env && dist_player > teleport_dist);
+
+        if should_teleport {
+            let feet_y = player_pos.y - EYE_OFFSET;
+            let mut tp = Vec2::new(target.x, target.z);
+            if in_dungeon {
+                if dungeon.blocked(tp.x, tp.y, feet_y, NPC_RADIUS) {
+                    tp = Vec2::new(player_pos.x, player_pos.z);
+                }
+            } else if interior.is_inside() {
+                if interior.blocked(tp.x, tp.y, feet_y, NPC_RADIUS) {
+                    tp = Vec2::new(player_pos.x, player_pos.z);
+                }
+            } else {
+                // Fuori: se cade dentro un muro (raro: solo se il giocatore è
+                // appoggiato a una parete), `resolve_world` lo spinge fuori
+                // in modo locale.
+                tp = resolve_world(colliders.iter(), tp, feet_y, NPC_RADIUS);
+            }
+            tf.translation.x = tp.x;
+            tf.translation.z = tp.y;
             tf.translation.y = 0.0;
             fol.shown = None;
         }
+
+        let sprites_opt = fol.sprites.clone();
+        let sprites = sprites_opt.as_deref();
 
         let to_target_xz = Vec2::new(
             target.x - tf.translation.x,
@@ -1950,8 +2072,25 @@ pub fn update_followers(
                 FOLLOW_SPEED
             };
             let step = (speed * dt).min(dist_to_target);
-            tf.translation.x += dir.x * step;
-            tf.translation.z += dir.y * step;
+
+            let current = Vec2::new(tf.translation.x, tf.translation.z);
+            let candidate = current + dir * step;
+            let feet_y = player_pos.y - EYE_OFFSET;
+
+            let resolved = if in_dungeon {
+                slide_move(current, candidate, &|x, z| {
+                    dungeon.blocked(x, z, feet_y, NPC_RADIUS)
+                })
+            } else if interior.is_inside() {
+                slide_move(current, candidate, &|x, z| {
+                    interior.blocked(x, z, feet_y, NPC_RADIUS)
+                })
+            } else {
+                // Fuori: `resolve_world` scorre lungo i muri (stessa logica del player).
+                resolve_world(colliders.iter(), candidate, feet_y, NPC_RADIUS)
+            };
+            tf.translation.x = resolved.x;
+            tf.translation.z = resolved.y;
         }
 
         if !waiting {
@@ -1962,14 +2101,26 @@ pub fn update_followers(
             let dist_now = to_player_xz.length();
             if dist_now < MIN_FOLLOWER_DIST && dist_now > 1e-3 {
                 let push = to_player_xz / dist_now * (MIN_FOLLOWER_DIST - dist_now);
-                tf.translation.x -= push.x;
-                tf.translation.z -= push.y;
+                let current = Vec2::new(tf.translation.x, tf.translation.z);
+                let candidate = current - push;
+                let feet_y = player_pos.y - EYE_OFFSET;
+
+                let resolved = if in_dungeon {
+                    slide_move(current, candidate, &|x, z| {
+                        dungeon.blocked(x, z, feet_y, NPC_RADIUS)
+                    })
+                } else if interior.is_inside() {
+                    slide_move(current, candidate, &|x, z| {
+                        interior.blocked(x, z, feet_y, NPC_RADIUS)
+                    })
+                } else {
+                    resolve_world(colliders.iter(), candidate, feet_y, NPC_RADIUS)
+                };
+                tf.translation.x = resolved.x;
+                tf.translation.z = resolved.y;
             }
         }
 
-        // --- Ciclo animazioni ---
-        // Mentre si muove: resetta l'idle e azzera il timer (così al prossimo
-        // stop riparte l'attesa pulita).
         if moving {
             if matches!(fol.idle_cycle, IdleCycle::Animated) {
                 fol.idle_cycle = IdleCycle::Still;
@@ -1979,7 +2130,6 @@ pub fn update_followers(
             fol.idle_timer = 0.0;
         }
 
-        // Avanzamento animazione di camminata.
         if moving {
             if let Some(sp) = sprites {
                 fol.frame_timer += dt;
@@ -1997,8 +2147,6 @@ pub fn update_followers(
             }
         }
 
-        // Idle da fermo (solo se mood == 0; se mood > 0 il rendering mostra
-        // staticamente idle[mood] e il timer resta fermo).
         if !moving && fol.mood == 0 {
             if matches!(fol.idle_cycle, IdleCycle::Still) {
                 fol.idle_timer += dt;
@@ -2011,8 +2159,6 @@ pub fn update_followers(
             } else if matches!(fol.idle_cycle, IdleCycle::Animated) {
                 fol.frame_timer += dt;
 
-                // Frame count e period uniformati a IDLE_FRAME_SECONDS: gli
-                // idle sono pose/espressioni, non animazioni reali.
                 let frame_count = if let Some(sp) = sprites {
                     sp.idle.len().max(1)
                 } else if let Some(idle) = fol.custom_idle.as_ref() {
@@ -2055,8 +2201,6 @@ pub fn update_followers(
                 let frame = fol.frame % frames.len().max(1);
                 (record, flip, frame, &frames[frame], sp.walk_size[record])
             } else if fol.mood > 0 {
-                // Mood su sprite vanilla: usa `idle[mood % len]` (non è
-                // personalizzato per gli NPC flat, ma mantiene coerenza).
                 let idx = (fol.mood as usize) % sp.idle.len().max(1);
                 (5, false, idx, &sp.idle[idx], sp.idle_size)
             } else {
@@ -2083,7 +2227,6 @@ pub fn update_followers(
                 }
             } else if let Some(idle) = fol.custom_idle.as_ref() {
                 if fol.mood > 0 {
-                    // Mood attiva: frame statico `idle[mood]` (clamped).
                     let idx = (fol.mood as usize).min(idle.frames.len().saturating_sub(1));
                     (idle.frames[idx].clone(), 20000 + idx, idle.sizes[idx])
                 } else {
@@ -2264,12 +2407,9 @@ pub fn update_enemies(
 // Mood dei follower
 // =============================================================================
 
-/// Evento emesso da `dialog::dialog_menu` quando una risposta LLM contiene una
-/// mood. Il sistema `apply_follower_mood` aggiorna il `Follower` corrispondente.
 #[derive(Event)]
 pub struct FollowerMoodEvent {
     pub entity: Entity,
-    /// 0 = neutro (ciclo Still/Animated di default), 1+ = frame idle statico.
     pub mood: u8,
 }
 
@@ -2288,8 +2428,6 @@ fn apply_follower_mood(
 ) {
     for ev in events.read() {
         if let Ok(mut fol) = followers.get_mut(ev.entity) {
-            // Reset del ciclo idle quando il mood cambia: evitiamo che il
-            // timer di Still/Animated riparta con un valore vecchio.
             if fol.mood != ev.mood {
                 fol.idle_cycle = IdleCycle::Still;
                 fol.idle_timer = 0.0;
@@ -2297,7 +2435,6 @@ fn apply_follower_mood(
                 fol.frame_timer = 0.0;
             }
             fol.mood = ev.mood;
-            // Forza il refresh del materiale al prossimo frame.
             fol.shown = None;
             info!("FOLLOWER MOOD: {:?} -> {}", ev.entity, ev.mood);
         }

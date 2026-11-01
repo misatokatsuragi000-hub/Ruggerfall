@@ -54,10 +54,32 @@
 //! - `walk_fps = 8.0` (default 8.0)
 //! - `idle_fps = 4.0` (default 4.0, **non usato** se il frame deve cambiare
 //!   ogni `IDLE_FRAME_SECONDS` fissi in `update_followers`; vedi `tiles.rs`)
+//!
+//! ## Prefetch delle voci
+//!
+//! Quando entri in un interno, `interior_enter_exit` emette `InteriorEntered`
+//! con `PendingVoice` (voice_key + description + original_label + sprite_stem)
+//! per ogni NPC che spawnerà. `quest_llm::prefetch_interior_voices` consuma
+//! l'evento e chiama `QuestWorker::request_voice` in background.
+//!
+//! **Istanza nella voice key**: la `voice_key` include `#N` (dove `N` è
+//! l'indice dell'NPC in `scene.people`), così due NPC con la stessa texture
+//! nello stesso edificio hanno **voci separate**. Formato:
+//!
+//! - flat con caption:   `flat:182:23@MAGE#3`
+//! - flat senza caption: `face:148@MAGE#5`
+//! - NPC custom:         `custom_Ellie@MAGE` (il nome è già univoco, niente `#N`)
+//!
+//! `dialog::voice_key_for` costruisce la stessa chiave al momento del dialogo,
+//! passando `Some(npc.instance)` per i flat e `None` per i custom. Se le due
+//! chiavi non coincidono, il prefetch genererebbe per `#N` e il dialogo
+//! cercherebbe senza `#N` (o viceversa): doppio giro LLM.
 use crate::dialog::DialogState;
+use crate::data::flats::FlatCatalog;
 use crate::mod_textures::ModTextures;
 use crate::npc_home::NpcHome;
 use crate::player::{Player, EYE_HEIGHT};
+use crate::quests::{describe_npc_in, guild_name_from_prefix, temperament_for, tone_for_npc};
 use crate::tiles::{climate_of, next_rand};
 use crate::wall_textures::WallTextures;
 use crate::world::*;
@@ -265,13 +287,26 @@ impl InteriorState {
     /// Prefisso a 4 lettere del nome del blocco RMB corrente: `"MAGE"`,
     /// `"FIGH"`, `"THIE"`, `"TEMP"`, `"PALA"`, ... `None` se non sei dentro
     /// un interno.
-    ///
-    /// Usalo con `crate::quests::guild_name_from_prefix` per ottenere il nome
-    /// della gilda (es. `"Mages Guild"`) da passare a `describe_npc_in` e a
-    /// `classic_npc::resolve`: così l'LLM sa che l'NPC è un membro della gilda
-    /// in cui ti trovi, non un estraneo che ne parla per sentito dire.
     pub fn block_prefix(&self) -> Option<&str> {
         self.active.as_ref().map(|a| a.block_prefix.as_str())
+    }
+
+    /// True se un cerchio di raggio `radius` centrato in `(x, z)` (coordinate
+    /// **mondo**, come `Transform`) alla quota `feet_y` (piedi) tocca un muro
+    /// dell'edificio corrente (o una porta chiusa).
+    ///
+    /// Usata da `tiles::update_followers` per far fermare i follower sui muri
+    /// degli interni invece di attraversarli.
+    pub fn blocked(&self, x: f32, z: f32, feet_y: f32, radius: f32) -> bool {
+        match &self.active {
+            Some(a) => a.scene.blocked(
+                x - a.origin.x,
+                z - a.origin.z,
+                feet_y - a.origin.y,
+                radius,
+            ),
+            None => false,
+        }
     }
 
     pub fn mark_recruited(&mut self, archive: u16, record: u8) { self.recruited.insert((archive, record)); }
@@ -291,6 +326,11 @@ pub struct InteriorNpc {
     pub flat_archive: u16,
     pub flat_record: u8,
     pub size: Vec2,
+    /// Indice dell'NPC nella lista `scene.people` dell'edificio. Stabile finché
+    /// il BlockData non cambia, quindi adatto a identificare univocamente
+    /// l'istanza (usato per `#N` nella voice key: due NPC con lo stesso flat
+    /// hanno istanze diverse e quindi voci diverse).
+    pub instance: u32,
 }
 
 #[derive(Component)]
@@ -395,9 +435,6 @@ pub struct CustomNpcCache {
 }
 
 impl CustomNpcCache {
-    /// Scansiona `textures_dir` cercando `<qualcosa>/*.txt` accanto a `<qualcosa>.png`
-    /// con prefisso `npc_` (case-insensitive) e, per ognuno, i frame walk
-    /// `<stem>_walk_0.png`, ... e idle `<stem>_idle_0.png`, ... (case-insensitive).
     pub fn load(textures_dir: &std::path::Path) -> Self {
         let mut npcs = Vec::new();
 
@@ -520,8 +557,6 @@ impl CustomNpcCache {
 /// `base_size_m`: dimensioni in metri dell'idle base.
 /// `size_scale`: moltiplicatore finale applicato a ogni frame (1.0 = nessuna
 /// riduzione; 0.5 = metà).
-///
-/// Ritorna `(frames, sizes)` con `sizes[i]` = dimensioni in metri del frame i.
 pub(crate) fn load_frames_from_stems(
     stems: &[String],
     npc_name: &str,
@@ -575,8 +610,6 @@ pub(crate) fn load_frames_from_stems(
     Some((frames, sizes))
 }
 
-/// Frame dell'animazione di camminata + le loro dimensioni in metri
-/// (per preservare l'aspect ratio di ogni frame).
 pub fn load_custom_walk_frames(
     data: &CustomNpcData,
     base_size_px: Vec2,
@@ -598,8 +631,6 @@ pub fn load_custom_walk_frames(
     )
 }
 
-/// Frame dell'animazione idle + le loro dimensioni in metri
-/// (per preservare l'aspect ratio di ogni frame).
 pub fn load_custom_idle_frames(
     data: &CustomNpcData,
     base_size_px: Vec2,
@@ -621,16 +652,6 @@ pub fn load_custom_idle_frames(
     )
 }
 
-/// Carica i frame idle di un flat (NPC normale), con la convenzione
-/// `<archive>_<record>-<frame>_idle_<N>.png` (o `<archive:03>_...` con padding).
-/// Se non trova nessun `_idle_N` per quel flat, ritorna `None`.
-///
-/// `base_size_px` = dimensioni in pixel dell'idle base del flat (es. la
-/// texture originale `182_11-0.png`). `base_size_m` = dimensioni in metri da
-/// assegnare ai frame, tipicamente già scalate dal chiamante (es. `size * 0.5`).
-///
-/// `frame` di solito è 0 (i flat usano frame singolo); l'argomento serve nel
-/// caso in cui gli idle siano associati a una variante specifica.
 pub fn load_flat_idle_frames(
     archive: u16,
     record: u8,
@@ -644,9 +665,6 @@ pub fn load_flat_idle_frames(
     load_flat_frames("idle", archive, record, frame, base_size_px, base_size_m, mods, images, materials)
 }
 
-/// Come `load_flat_idle_frames`, ma per la camminata: `<archive>_<record>-<frame>_walk_<N>.png`
-/// (es. `182_3-0_walk_0.png`). Stessa convenzione dei custom (`npc_ellie_walk_0.png`),
-/// con il nome della texture al posto di `npc_<nome>`.
 pub fn load_flat_walk_frames(
     archive: u16,
     record: u8,
@@ -671,7 +689,6 @@ fn load_flat_frames(
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
 ) -> Option<(Vec<Handle<StandardMaterial>>, Vec<Vec2>)> {
-    // Prova entrambi i prefissi (padding a 3 cifre e senza).
     let prefixes = [
         format!("{:03}_{}-{}", archive, record, frame),
             format!("{}_{}-{}", archive, record, frame),
@@ -693,7 +710,6 @@ fn load_flat_frames(
                 "flat {}:{}: {} frame {} trovati (prefisso '{}')",
                   archive, record, stems.len(), kind, prefix
             );
-            // `size_scale = 1.0`: base_size_m è già quello scalato dal chiamante.
             return load_frames_from_stems(
                 &stems,
                 &format!("flat {}:{}", archive, record),
@@ -776,6 +792,56 @@ fn debug_uv_scale(mesh: &WorldMesh, sm: &Submesh, size: (f32, f32)) {
     }
 }
 
+// =============================================================================
+// Prefetch delle voci
+// =============================================================================
+
+/// Una voce da prefetchare per un NPC di un interno.
+///
+/// Contiene tutto ciò che serve a:
+/// - `QuestWorker::request_voice`: la chiave e la description di input;
+/// - `classic_npc::apply_llm_background`: l'etichetta visiva originale
+///   (`original_label`) e lo stem dello sprite (`sprite_stem`).
+///
+/// `sprite_stem` è `None` per gli NPC custom (`npc_*.txt`), che non passano
+/// da `classic_npc`.
+///
+/// `voice_key` include già `#N` (indice dell'NPC in `scene.people`) per i
+/// flat: due NPC con la stessa texture nello stesso edificio hanno voci
+/// separate. La stessa chiave è costruita da `dialog::voice_key_for` al
+/// momento del dialogo (con `Some(npc.instance)`).
+#[derive(Clone, Debug)]
+pub struct PendingVoice {
+    pub voice_key: String,
+    pub description: String,
+    pub original_label: String,
+    pub sprite_stem: Option<String>,
+}
+
+/// Emesso da `interior_enter_exit` dopo aver spawnato gli NPC di un interno.
+#[derive(Event, Clone, Debug)]
+pub struct InteriorEntered {
+    pub city: (i32, i32),
+    pub voices: Vec<PendingVoice>,
+}
+
+/// Plugin minimale: registra l'evento `InteriorEntered`.
+///
+/// I sistemi di `interior.rs` sono già aggiunti a mano in `main.rs`; questo
+/// plugin serve solo a garantire che l'evento esista. Senza, l'`EventWriter`
+/// in `interior_enter_exit` andrebbe in panic al primo `send()`.
+pub struct InteriorPlugin;
+
+impl Plugin for InteriorPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_event::<InteriorEntered>();
+    }
+}
+
+// =============================================================================
+// Entrata / uscita
+// =============================================================================
+
 #[allow(clippy::too_many_arguments)]
 pub fn interior_enter_exit(
     mut commands: Commands,
@@ -793,6 +859,7 @@ pub fn interior_enter_exit(
                            mut flats_face_map: Local<Option<FlatsFaceMap>>,
                            custom_npcs: Res<CustomNpcCache>,
                            mut npc_home: ResMut<NpcHome>,
+                           mut voices_event: EventWriter<InteriorEntered>,
 ) {
     let leave = keys.just_pressed(KeyCode::Backspace);
     let act = keys.just_pressed(KeyCode::KeyE);
@@ -911,6 +978,115 @@ pub fn interior_enter_exit(
         crate::npc_home::save(&npc_home);
     }
 
+    // --- Prefetch voci degli NPC dell'interno ------------------------------
+    // Costruisce un `PendingVoice` per ogni NPC che spawnerà. La logica
+    // rispecchia quella di `dialog::update_dialog` ma è **read-only**: usa
+    // `resolve_existing` per i txt `classic_*.txt`.
+    //
+    // `voice_key` include `#N` per i flat (indice `i` in `scene.people`):
+    // `dialog::voice_key_for` costruisce la stessa chiave al momento del
+    // dialogo, passando `Some(npc.instance)`. Due NPC con lo stesso flat
+    // hanno istanze diverse e quindi voci separate.
+    //
+    // `sprite_stem` è `Some("181_3-0")` per i flat, `None` per i custom
+    // (che non usano `classic_npc`).
+    let mut voices_to_prefetch: Vec<PendingVoice> = Vec::new();
+    {
+        let city = (mx, my);
+        let place = Some(kind);
+        let guild = guild_name_from_prefix(&current_prefix);
+        let face_lookup = flats_face_map.as_ref().expect("inizializzata sopra");
+        let catalog = FlatCatalog::load(&data.dir);
+
+        // Flat vanilla (scene.people).
+        for (i, f) in scene.people.iter().enumerate() {
+            if state.is_recruited(f.archive, f.record) {
+                continue;
+            }
+            let info = catalog.get(f.archive, f.record);
+            let caption = info.and_then(|info| {
+                let c = info.caption.trim();
+                (!c.is_empty()).then(|| c.to_string())
+            });
+
+            // Con caption: key = flat:A:R, role = None.
+            // Senza caption: key = face:N (stessa formula di `update_dialog`),
+            // role = tone.role().
+            let (base_key, who, role) = match caption {
+                Some(cap) => (format!("flat:{}:{}", f.archive, f.record), cap, None),
+                None => {
+                    let face = face_lookup.face_for(f.archive, f.record).unwrap_or_else(|| {
+                        ((f.archive as usize * 37) + (f.record as usize * 13) + (i * 7)) % 500
+                    });
+                    let tone = tone_for_npc(face as u64, city, place);
+                    (
+                        format!("face:{}", face),
+                            "an ordinary townsperson".to_string(),
+                     Some(tone.role()),
+                    )
+                }
+            };
+            // Voice key con prefisso gilda e istanza: due NPC con lo stesso
+            // flat (stessa texture) hanno `#N` diverso e quindi voci separate.
+            let voice_key = format!("{}@{}#{}", base_key, current_prefix, i);
+            let temperament = temperament_for(&base_key, city);
+            let mut description = describe_npc_in(&who, role, place, temperament, guild);
+            let sprite_stem = format!("{}_{}-0", f.archive, f.record);
+            let ov = crate::classic_npc::resolve_existing(
+                &custom_npcs.dir,
+                city,
+                &base_key,
+                &sprite_stem,
+            );
+            if let Some(d) = ov.description {
+                description = d;
+            }
+            voices_to_prefetch.push(PendingVoice {
+                voice_key,
+                description,
+                original_label: who,
+                sprite_stem: Some(sprite_stem),
+            });
+        }
+
+        // NPC custom: quelli che rispettano `position`. Il nome è univoco,
+        // quindi niente `#N` (la voice key è già distinta per NPC).
+        for custom_npc in &custom_npcs.npcs {
+            if state.is_recruited_custom(&custom_npc.name) {
+                continue;
+            }
+            let should_spawn = match &custom_npc.position {
+                NpcPosition::Any => is_home,
+                NpcPosition::None => false,
+                NpcPosition::ByKind { kind: tk, index } => {
+                    *tk == kind && index.map_or(true, |i| i == kind_index)
+                }
+                NpcPosition::ByPrefix { prefix, index } => {
+                    current_prefix == *prefix && index.map_or(true, |i| i == prefix_index)
+                }
+            };
+            if !should_spawn {
+                continue;
+            }
+            let base_key = format!("custom_{}", custom_npc.name.replace(' ', "_"));
+            let voice_key = format!("{}@{}", base_key, current_prefix);
+            let temperament = temperament_for(&base_key, city);
+            let who = custom_npc.name.clone();
+            let description = custom_npc
+            .description
+            .clone()
+            .unwrap_or_else(|| describe_npc_in(&who, None, place, temperament, guild));
+            voices_to_prefetch.push(PendingVoice {
+                voice_key,
+                description,
+                original_label: who,
+                // I custom non usano `classic_npc::resolve`: nessun `.txt`
+                // condiviso da aggiornare con `apply_llm_background`.
+                sprite_stem: None,
+            });
+        }
+    }
+
     let origin_world = Vec3::new(tf.translation.x, INTERIOR_Y, tf.translation.z);
     let climate = climate_of(&data, mx, my);
     let face_lookup = flats_face_map.as_ref().expect("inizializzata sopra");
@@ -994,6 +1170,7 @@ pub fn interior_enter_exit(
                               flat_archive: f.archive,
                               flat_record: f.record,
                               size: Vec2::new(w, h),
+                          instance: i as u32,
                           },
             ));
         }
@@ -1039,6 +1216,9 @@ pub fn interior_enter_exit(
                               flat_archive: 0,
                               flat_record: 0,
                               size: Vec2::new(w, h),
+                          // I custom non hanno un `#N` (nome univoco);
+                          // `instance` è solo per i flat.
+                          instance: 0,
                           },
                           CustomNpcName { name: custom_npc.name.clone() },
             ));
@@ -1094,6 +1274,14 @@ pub fn interior_enter_exit(
     );
     clear.0 = Color::BLACK;
     state.active = Some(saved);
+
+    // Emette l'evento di prefetch **dopo** aver aggiornato `state` e spawnato
+    // gli NPC.
+    voices_event.send(InteriorEntered {
+        city: (mx, my),
+                      voices: voices_to_prefetch,
+    });
+
     let what = match kind {
         PoiKind::Shop => "negozio",
         PoiKind::Guild => "gilda",

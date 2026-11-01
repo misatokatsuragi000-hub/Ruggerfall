@@ -159,7 +159,7 @@ impl GrassMask {
             s / cells as u32 > 80
         })
         .collect();
-        info!("Erba: archivio terreno {archive}, tile in maggioranza verdi: {green_tiles:?}");
+
         Some(Self { weight, color, tile_max })
     }
 

@@ -253,12 +253,12 @@ impl WallTextures {
             if let Some(img) = images.get_mut(&handle) {
                 img.sampler = repeat_sampler();
             }
-            info!("Normal map {archive}:{record} dalla mod (verde girato, Rgba8Unorm)");
+
             self.normal_cache.insert((archive, record), Some(handle.clone()));
             return Some(handle);
         }
 
-        info!("Normal map {archive}:{record} non in mod, derivo dall'albedo");
+
         let path = find_file_ci(&data.dir, &archive_file_name(archive))?;
         let file = TextureFile::open(&path).ok()?;
         let frame = file.frame(record as usize, 0).ok()?;
@@ -318,7 +318,7 @@ impl WallTextures {
         images: &mut Assets<Image>,
         materials: &mut Assets<StandardMaterial>,
     ) -> Handle<StandardMaterial> {
-        let season = if data.winter { Season::Winter } else { Season::Summer };
+        let season = data.season;
         let climate = world_climate_settings(world_climate).climate_type;
         let final_archive = apply_climate(archive as i32, record as i32, climate, season).max(0) as u32;
         let key = (final_archive, record);
@@ -351,7 +351,7 @@ impl WallTextures {
         };
 
         let has_normal = normal.is_some() || depth.is_some();
-        let material = match albedo {
+        let mut material = match albedo {
             Some(texture) => StandardMaterial {
                 base_color_texture: Some(texture),
                 normal_map_texture: normal,
@@ -378,6 +378,13 @@ impl WallTextures {
                 }
             }
         };
+        // DIAGNOSTICA: con DF_WALL_DOUBLE_SIDED=1 le facce dei modelli si vedono da entrambi i lati.
+        // Se con questa variabile riappaiono pezzi di siepe, pali o cespugli, erano facce con
+        // l'avvolgimento rivolto dal lato sbagliato (backface culling), non geometria mancante.
+        if std::env::var_os("DF_WALL_DOUBLE_SIDED").is_some() {
+            material.cull_mode = None;
+            material.double_sided = true;
+        }
         let handle = materials.add(material);
         if has_normal {
             self.normal_materials.insert(handle.id());

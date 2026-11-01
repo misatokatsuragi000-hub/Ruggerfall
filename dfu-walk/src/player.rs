@@ -1,5 +1,16 @@
 //! Giocatore in prima persona: mouse, WASD, salto e volo, con il suolo che
 //! segue il terreno e un limite di pendenza.
+//!
+//! ## Nave
+//!
+//! `player_move` fa **early return** quando il giocatore è al timone di una
+//! nave (`ShipState::player_aboard.is_some()`): in quel caso la posizione
+//! del `Transform` viene gestita da `ship::ship_pilot`. Il check è
+//! `Option<Res<...>>` così se `ShipPlugin` non è registrato il gioco
+//! funziona come prima (i test e le build parziali non si rompono).
+//!
+//! `player_look` NON viene toccato: la camera continua a girare col mouse
+//! anche a bordo. La nave ha il suo yaw indipendente (A/D).
 
 use crate::tiles::{probe_world, resolve_world, surface_height_world, TileCollision};
 use crate::world::*;
@@ -68,11 +79,18 @@ pub fn grab_cursor(
     keys: Res<ButtonInput<KeyCode>>,
     equipment: Res<crate::equipment::EquipmentState>,
     dialog: Res<crate::dialog::DialogState>,
+    fast_travel: Option<Res<crate::fast_travel::FastTravelState>>, // <-- Aggiunto
     mut was_locked: Local<bool>,
 ) {
     if equipment.open {
         return;
     }
+
+    // Se il menu di viaggio rapido è aperto, non toccare il cursore
+    if fast_travel.as_ref().is_some_and(|f| f.is_open) {
+        return;
+    }
+
     let Ok(mut window) = windows.get_single_mut() else { return };
     let now_locked = window.cursor_options.grab_mode == CursorGrabMode::Locked;
 
@@ -108,6 +126,7 @@ pub fn grab_cursor(
 
 pub fn player_look(
     dialog: Res<crate::dialog::DialogState>,
+    fast_travel: Option<Res<crate::fast_travel::FastTravelState>>, // <-- Aggiunto
     weapon: Option<Res<crate::fps_weapon::FpsWeaponState>>,
     mouse: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
@@ -115,6 +134,11 @@ pub fn player_look(
     mut player: Query<(&mut Player, &mut Transform)>,
 ) {
     if dialog.open {
+        return;
+    }
+
+    // Se il menu di viaggio rapido è aperto, blocca la rotazione della camera
+    if fast_travel.as_ref().is_some_and(|f| f.is_open) {
         return;
     }
 
@@ -145,20 +169,34 @@ fn step_allowed(field: &HeightField, origin: &Origin, from: Vec3, delta: Vec3, f
     airborne || (g_new - g_here) / delta.length().max(1e-4) <= MAX_SLOPE
 }
 
+type ShipQuery<'w, 's> = Query<'w, 's, &'static Transform, (With<crate::ship::Ship>, Without<Player>)>;
+
+#[allow(clippy::too_many_arguments)]
 fn ground_height(
     field: &HeightField, origin: &Origin,
     colliders: &Query<(&TileCollision, &Transform), Without<Player>>,
+                 ships: &ShipQuery,
                  x: f32, z: f32, feet_y: f32,
 ) -> Option<f32> {
     let terrain = field.ground(origin, x, z)?;
     let surface = surface_height_world(colliders.iter(), Vec2::new(x, z), feet_y + SURFACE_STEP);
-    Some(surface.map_or(terrain, |s| s.max(terrain)))
+    let mut ground = surface.map_or(terrain, |s| s.max(terrain));
+    // Ponte delle navi: calpestabile se i piedi sono entro SURFACE_STEP dal ponte.
+    for ship_tf in ships.iter() {
+        if let Some(deck) = crate::ship::deck_height_at(ship_tf, Vec2::new(x, z)) {
+            if deck <= feet_y + SURFACE_STEP && deck > ground {
+                ground = deck;
+            }
+        }
+    }
+    Some(ground)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn climb_update(
     keys: &ButtonInput<KeyCode>, field: &HeightField, origin: &Origin,
     colliders: &Query<(&TileCollision, &Transform), Without<Player>>,
+                ships: &ShipQuery,
                 p: &mut Player, pos: &mut Vec3, forward: Vec3, right: Vec3, dt: f32,
 ) -> bool {
     let holding = keys.pressed(KeyCode::KeyQ);
@@ -214,7 +252,7 @@ fn climb_update(
 
     p.feet_y += vertical * CLIMB_SPEED * dt;
     if vertical < 0.0 {
-        if let Some(ground) = ground_height(field, origin, colliders, pos.x, pos.z, p.feet_y) {
+        if let Some(ground) = ground_height(field, origin, colliders, ships, pos.x, pos.z, p.feet_y) {
             if p.feet_y <= ground {
                 p.feet_y = ground;
                 p.climbing = false;
@@ -248,92 +286,108 @@ fn climb_update(
 
 pub fn player_move(
     dialog: Res<crate::dialog::DialogState>,
+    fast_travel: Option<Res<crate::fast_travel::FastTravelState>>, // <-- Aggiunto anche qui
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     field: Res<HeightField>,
     origin: Res<Origin>,
     interior: Res<crate::interior::InteriorState>,
     dungeon: Res<crate::dungeon::DungeonState>,
+    ship_state: Option<Res<crate::ship::ShipState>>,
     colliders: Query<(&TileCollision, &Transform), Without<Player>>,
-                   mut player: Query<(&mut Player, &mut Transform)>,
+                   ships: ShipQuery,
+                   mut player: Query<(&mut Player, &mut Transform), Without<crate::ship::Ship>>,
 ) {
     if dialog.open {
         return;
     }
-    if interior.is_inside() || dungeon.is_inside() {
-        if let Ok((mut p, _)) = player.get_single_mut() {
-            p.climbing = false;
-        }
+
+    // Se il menu di viaggio rapido è aperto, blocca il movimento
+    if fast_travel.as_ref().is_some_and(|f| f.is_open) {
         return;
     }
-    let Ok((mut p, mut tf)) = player.get_single_mut() else { return };
-    let dt = time.delta_secs().min(0.1);
 
-    if keys.just_pressed(KeyCode::KeyF) {
-        p.fly = !p.fly;
-        p.vel_y = 0.0;
-    }
-
-    let forward = Vec3::new(-p.yaw.sin(), 0.0, -p.yaw.cos());
-    let right = Vec3::new(p.yaw.cos(), 0.0, -p.yaw.sin());
-    let axis = |pos: KeyCode, neg: KeyCode| keys.pressed(pos) as i32 as f32 - keys.pressed(neg) as i32 as f32;
-    let wish = forward * axis(KeyCode::KeyW, KeyCode::KeyS) + right * axis(KeyCode::KeyD, KeyCode::KeyA);
-    let running = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-
-    let mut pos = tf.translation;
-    if !p.fly {
-        if climb_update(&keys, &field, &origin, &colliders, &mut p, &mut pos, forward, right, dt) {
-            pos.y = p.feet_y + EYE_HEIGHT;
-            tf.translation = pos;
+    // A bordo della nave: il movimento è gestito da `ship::ship_pilot`.
+    if ship_state
+        .as_ref()
+        .is_some_and(|s| s.player_aboard.is_some())
+        {
             return;
         }
-    } else {
-        p.climbing = false;
-    }
-    if p.fly {
-        let speed = FLY_SPEED * if running { FLY_RUN_MULTIPLIER } else { 1.0 };
-        let vertical = axis(KeyCode::Space, KeyCode::ControlLeft);
-        pos += (wish.normalize_or_zero() + Vec3::Y * vertical) * speed * dt;
-        p.feet_y = pos.y - EYE_HEIGHT;
-    } else {
-        let speed = WALK_SPEED * if running { RUN_MULTIPLIER } else { 1.0 };
-        let delta = wish.normalize_or_zero() * speed * dt;
-        if delta != Vec3::ZERO {
-            for candidate in [delta, Vec3::new(delta.x, 0.0, 0.0), Vec3::new(0.0, 0.0, delta.z)] {
-                if candidate != Vec3::ZERO && step_allowed(&field, &origin, pos, candidate, p.feet_y) {
-                    let steps = ((candidate.length() / COLLISION_SUBSTEP).ceil() as usize).max(1);
-                    let sub = candidate / steps as f32;
-                    for _ in 0..steps {
-                        let next = pos + sub;
-                        let fixed = resolve_world(colliders.iter(), Vec2::new(next.x, next.z), p.feet_y, PLAYER_RADIUS);
-                        pos.x = fixed.x;
-                        pos.z = fixed.y;
-                    }
-                    break;
-                }
+        if interior.is_inside() || dungeon.is_inside() {
+            if let Ok((mut p, _)) = player.get_single_mut() {
+                p.climbing = false;
             }
+            return;
+        }
+        let Ok((mut p, mut tf)) = player.get_single_mut() else { return };
+        let dt = time.delta_secs().min(0.1);
+
+        if keys.just_pressed(KeyCode::KeyF) {
+            p.fly = !p.fly;
+            p.vel_y = 0.0;
         }
 
-        if let Some(ground) = ground_height(&field, &origin, &colliders, pos.x, pos.z, p.feet_y) {
-            if keys.just_pressed(KeyCode::Space) && p.on_ground {
-                p.vel_y = JUMP_SPEED;
-                p.on_ground = false;
+        let forward = Vec3::new(-p.yaw.sin(), 0.0, -p.yaw.cos());
+        let right = Vec3::new(p.yaw.cos(), 0.0, -p.yaw.sin());
+        let axis = |pos: KeyCode, neg: KeyCode| keys.pressed(pos) as i32 as f32 - keys.pressed(neg) as i32 as f32;
+        let wish = forward * axis(KeyCode::KeyW, KeyCode::KeyS) + right * axis(KeyCode::KeyD, KeyCode::KeyA);
+        let running = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+
+        let mut pos = tf.translation;
+        if !p.fly {
+            if climb_update(&keys, &field, &origin, &colliders, &ships, &mut p, &mut pos, forward, right, dt) {
+                pos.y = p.feet_y + EYE_HEIGHT;
+                tf.translation = pos;
+                return;
             }
-            if p.on_ground && p.feet_y - ground <= SNAP_DISTANCE && p.vel_y <= 0.0 {
-                p.feet_y = ground;
-                p.vel_y = 0.0;
-            } else {
-                p.vel_y = (p.vel_y - GRAVITY * dt).max(-MAX_FALL_SPEED);
-                p.feet_y += p.vel_y * dt;
-                p.on_ground = false;
-                if p.feet_y <= ground {
+        } else {
+            p.climbing = false;
+        }
+        if p.fly {
+            let speed = FLY_SPEED * if running { FLY_RUN_MULTIPLIER } else { 1.0 };
+            let vertical = axis(KeyCode::Space, KeyCode::ControlLeft);
+            pos += (wish.normalize_or_zero() + Vec3::Y * vertical) * speed * dt;
+            p.feet_y = pos.y - EYE_HEIGHT;
+        } else {
+            let speed = WALK_SPEED * if running { RUN_MULTIPLIER } else { 1.0 };
+            let delta = wish.normalize_or_zero() * speed * dt;
+            if delta != Vec3::ZERO {
+                for candidate in [delta, Vec3::new(delta.x, 0.0, 0.0), Vec3::new(0.0, 0.0, delta.z)] {
+                    if candidate != Vec3::ZERO && step_allowed(&field, &origin, pos, candidate, p.feet_y) {
+                        let steps = ((candidate.length() / COLLISION_SUBSTEP).ceil() as usize).max(1);
+                        let sub = candidate / steps as f32;
+                        for _ in 0..steps {
+                            let next = pos + sub;
+                            let fixed = resolve_world(colliders.iter(), Vec2::new(next.x, next.z), p.feet_y, PLAYER_RADIUS);
+                            pos.x = fixed.x;
+                            pos.z = fixed.y;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if let Some(ground) = ground_height(&field, &origin, &colliders, &ships, pos.x, pos.z, p.feet_y) {
+                if keys.just_pressed(KeyCode::Space) && p.on_ground {
+                    p.vel_y = JUMP_SPEED;
+                    p.on_ground = false;
+                }
+                if p.on_ground && p.feet_y - ground <= SNAP_DISTANCE && p.vel_y <= 0.0 {
                     p.feet_y = ground;
                     p.vel_y = 0.0;
-                    p.on_ground = true;
+                } else {
+                    p.vel_y = (p.vel_y - GRAVITY * dt).max(-MAX_FALL_SPEED);
+                    p.feet_y += p.vel_y * dt;
+                    p.on_ground = false;
+                    if p.feet_y <= ground {
+                        p.feet_y = ground;
+                        p.vel_y = 0.0;
+                        p.on_ground = true;
+                    }
                 }
             }
         }
-    }
-    pos.y = p.feet_y + EYE_HEIGHT;
-    tf.translation = pos;
+        pos.y = p.feet_y + EYE_HEIGHT;
+        tf.translation = pos;
 }

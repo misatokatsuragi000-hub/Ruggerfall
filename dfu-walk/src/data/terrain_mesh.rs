@@ -15,7 +15,7 @@ pub const MAP_PIXEL_SIZE: f32 = 32768.0 * 0.025;
 /// Lato di una cella in metri.
 pub const CELL_SIZE: f32 = MAP_PIXEL_SIZE / TILEMAP_DIM as f32;
 /// Moltiplicatore verticale (TerrainScale predefinito di DFU).
-pub const TERRAIN_HEIGHT_SCALE: f32 = 2.5;
+pub const TERRAIN_HEIGHT_SCALE: f32 = 1.0;
 /// Margine in texel dai bordi della tile, per non pescare i vicini.
 const UV_INSET_TEXELS: f32 = 0.25;
 

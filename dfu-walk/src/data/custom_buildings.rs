@@ -1,7 +1,9 @@
 //! Generatore procedurale di edifici custom per Daggerfall:
 //! - Templi Pagani Classici degli Otto Divini (crepidoma a gradoni, maestoso pronao con colonnato ellenico-romano,
 //!   trabeazione continua, grande timpano triangolare a due falde, portale ad arco in pietra con ante door.png).
-//! - Torre della Gilda dei Maghi (cilindro solido senza forature, portale ad arco su facciata Sud piana).
+//! - Torre della Gilda dei Maghi: **ottagono** solido senza forature, portale ad arco su facciata Sud piana,
+//!   **7 piani** con **4 finestre per piano alternate** (lati pari) **in stile Palazzo Reale** a mezza scala
+//!   (davanzale, stipiti, arco a tutto sesto, chiave di volta, vetro con gradiente diagonale, inferriate).
 //! - Fighters Hall / Maschio dei Guerrieri (torrette, feritoie e portale monumentale).
 //! - Thieves Guild & Hall generica (architettura fortificata con portale ad arco).
 //!
@@ -28,6 +30,17 @@
 //! un blocco di colore uniforme, privo della texture del muro. Ora è in `wall`
 //! (`stone`), quindi eredita la stessa texture del muro circostante (pietra,
 //! mattoni, legno, a seconda dell'edificio).
+//!
+//! ## Torre dei Maghi ottagonale a 7 piani con finestre del Palazzo Reale
+//!
+//! La torre era un cilindro quasi perfetto (`sides = 20`) a 5 piani, con finestre
+//! a quadrato blu piatto. Ora è un **ottagono** (`sides = 8`), quindi con **lati
+//! piatti** come nelle torri originali di Daggerfall, a **7 piani**, e ogni faccia
+//! **pari** di ogni piano ha una finestra in stile Palazzo Reale disegnata da
+//! `push_palace_window` a **mezza scala** (`scale = 0.5`). Le facce **dispari**
+//! restano senza finestre (4 finestre per piano, alternate). Il portale d'ingresso
+//! è sul lato con centro a 270° in direzione `-Z` (`door_side_idx = 5`, dispari),
+//! dove arriva il giocatore, quindi il portale non ha mai una finestra sopra.
 use super::arch3d::BuildingTextures;
 use super::building_gen::{BuildingMesh, Footprint, MeshPart, Side};
 use std::f32::consts::{PI, TAU};
@@ -234,7 +247,6 @@ pub fn push_rich_window(
     let hw = width * 0.5;
     let hh = height * 0.5;
 
-    // Parametri del vetro e della cornice.
     let frame_w = 0.22;
     let frame_depth = 0.10;
     let glass_n = 0.02;
@@ -243,7 +255,6 @@ pub fn push_rich_window(
     let glass_scale = 1.0;
     let iron_scale = 1.0;
 
-    // Vetro (colore fisso, leggermente fuori dal muro per evitare z-fighting).
     frame.push_box_local(
         windows,
         center,
@@ -254,7 +265,6 @@ pub fn push_rich_window(
                          glass_scale,
     );
 
-    // Cornice in pietra: 4 lati attorno al vetro.
     frame.push_box_local(
         wall,
         center,
@@ -292,7 +302,6 @@ pub fn push_rich_window(
                          wall_scale,
     );
 
-    // Architrave in cima (sporge di più, come un piccolo cornicione locale).
     frame.push_box_local(
         wall,
         center,
@@ -303,7 +312,6 @@ pub fn push_rich_window(
                          wall_scale,
     );
 
-    // Davanzale in fondo (sporge di più, come un piccolo ripiano).
     frame.push_box_local(
         wall,
         center,
@@ -314,7 +322,6 @@ pub fn push_rich_window(
                          wall_scale,
     );
 
-    // Inferriate incrociate: una barra verticale al centro, una orizzontale.
     let bar_n0 = glass_n + glass_depth;
     let bar_n1 = bar_n0 + 0.02;
     let bar_w = 0.04;
@@ -550,7 +557,6 @@ pub fn build_arched_guild_portal(
     let stud_c = [0.08, 0.08, 0.09, 1.0];
     let bldg_interior = [center_x, y_spring, wall_front_z + 2.0f32];
 
-    // Soglia a terra
     push_box(
         wall,
         [center_x - total_hw - 0.06, y_door_base - 0.25, z_front - 0.08],
@@ -559,7 +565,6 @@ pub fn build_arched_guild_portal(
         2.0,
     );
 
-    // Spallette
     push_box(
         wall,
         [center_x - total_hw, y_door_base, z_front],
@@ -575,7 +580,6 @@ pub fn build_arched_guild_portal(
         2.0,
     );
 
-    // Capitelli
     push_box(
         wall,
         [center_x - total_hw - 0.03, y_spring - 0.08, z_front - 0.04],
@@ -591,7 +595,6 @@ pub fn build_arched_guild_portal(
         1.0,
     );
 
-    // Muratura sopra le spallette
     let y_ent_base = y_arch_ext + 0.08f32;
     push_box(
         wall,
@@ -608,7 +611,6 @@ pub fn build_arched_guild_portal(
         2.0,
     );
 
-    // Archivolto e intradosso a tutto sesto
     let vault_segs = 16;
     let z_arch_front = z_front - 0.04f32;
     for k in 0..vault_segs {
@@ -678,7 +680,6 @@ pub fn build_arched_guild_portal(
         );
     }
 
-    // Chiave di volta
     let kw_bot = 0.11f32;
     let kw_top = 0.17f32;
     let y_ks_bot = y_arch_top - 0.05f32;
@@ -688,14 +689,12 @@ pub fn build_arched_guild_portal(
     push_face(wall, &[[center_x - kw_bot, y_ks_bot, z_arch_front], [center_x - kw_bot, y_ks_bot, z_ks_front], [center_x - kw_top, y_ks_top, z_ks_front], [center_x - kw_top, y_ks_top, z_arch_front]], stone, 1.0, bldg_interior);
     push_face(wall, &[[center_x + kw_bot, y_ks_bot, z_ks_front], [center_x + kw_bot, y_ks_bot, z_arch_front], [center_x + kw_top, y_ks_top, z_arch_front], [center_x + kw_top, y_ks_top, z_ks_front]], stone, 1.0, bldg_interior);
 
-    // Trabeazione e cornicione superiore
     let y_ent_top = y_ent_base + 0.20f32;
     let y_cornice_top = y_ent_top + 0.10f32;
 
     push_box(wall, [center_x - total_hw - 0.03, y_ent_base, z_front - 0.02], [center_x + total_hw + 0.03, y_ent_top, z_back], stone, 2.0);
     push_box(wall, [center_x - total_hw - 0.08, y_ent_top, z_front - 0.08], [center_x + total_hw + 0.08, y_cornice_top, z_back], stone, 1.5);
 
-    // Timpano
     let y_timp_base = y_cornice_top;
     let y_timp_top = y_timp_base + 0.45f32;
     let hw_timp = total_hw + 0.08f32;
@@ -712,7 +711,6 @@ pub fn build_arched_guild_portal(
     push_face(wall, &[p_left, p_apex, p_apex_b, p_left_b], stone, 1.5, [center_x, y_timp_base - 0.5, wall_front_z]);
     push_face(wall, &[p_apex, p_right, p_right_b, p_apex_b], stone, 1.5, [center_x, y_timp_base - 0.5, wall_front_z]);
 
-    // Ante in legno (door.png)
     let n_planks = 4;
     let plank_w = (2.0 * r_arch) / n_planks as f32;
     for i in 0..n_planks {
@@ -751,7 +749,6 @@ pub fn build_arched_guild_portal(
         }
     }
 
-    // Ferramenta
     for &ys in &[y_door_base + 0.65f32, y_door_base + 1.80f32] {
         push_box(trim, [center_x - r_arch + 0.04, ys - 0.04, z_door - 0.015], [center_x + r_arch - 0.04, ys + 0.04, z_door], iron_c, 1.0);
         for &bx in &[-0.50f32, -0.20, 0.20, 0.50] {
@@ -783,7 +780,6 @@ pub fn generate_pagan_temple(fp: &Footprint, btex: BuildingTextures) -> Building
     let hd = (fp.depth * 0.5).max(14.0);
     let total_h = fp.height.max(14.0);
 
-    // 1. Podio a gradoni classico (Crepidoma a 3 livelli)
     let y_base = -0.6f32;
     let y_step1 = -0.2f32;
     let y_step2 = 0.2f32;
@@ -793,7 +789,6 @@ pub fn generate_pagan_temple(fp: &Footprint, btex: BuildingTextures) -> Building
     push_box(wall, [-hw - 0.7, y_step1, -hd - 0.7], [hw + 0.7, y_step2, hd + 0.7], stone, 3.0);
     push_box(wall, [-hw - 0.2, y_step2, -hd - 0.2], [hw + 0.2, y_floor, hd + 0.2], stone, 3.0);
 
-    // 2. Cella sacra chiusa (il santuario interno)
     let cella_hw = hw * 0.70;
     let cella_front = -hd + 5.5;
     let cella_back = hd - 1.2;
@@ -801,7 +796,6 @@ pub fn generate_pagan_temple(fp: &Footprint, btex: BuildingTextures) -> Building
 
     push_box(wall, [-cella_hw, y_floor, cella_front], [cella_hw, y_architrave, cella_back], stone, 4.0);
 
-    // 3. Colonnato monumentale classico nel pronao
     let col_h = y_architrave - y_floor;
     let col_r = 0.52f32;
     let col_sides = 16;
@@ -817,7 +811,6 @@ pub fn generate_pagan_temple(fp: &Footprint, btex: BuildingTextures) -> Building
         push_box(trim, [cx - col_r * 1.45, y_floor + col_h - 0.45, cz - col_r * 1.45], [cx + col_r * 1.45, y_floor + col_h, cz + col_r * 1.45], marble_trim, 1.0);
     }
 
-    // Colonne laterali di raccordo del pronao
     for &cz in &[-hd + 2.8, -hd + 4.4] {
         for &cx in &[-hw + 1.4, hw - 1.4] {
             push_box(trim, [cx - col_r * 1.35, y_floor, cz - col_r * 1.35], [cx + col_r * 1.35, y_floor + 0.35, cz + col_r * 1.35], marble_trim, 1.0);
@@ -826,35 +819,29 @@ pub fn generate_pagan_temple(fp: &Footprint, btex: BuildingTextures) -> Building
         }
     }
 
-    // 4. Trabeazione orizzontale continua (Architrave + Fregio)
     let y_frieze_top = y_architrave + 1.2f32;
     push_box(trim, [-hw - 0.4, y_architrave, -hd - 0.4], [hw + 0.4, y_frieze_top, hd + 0.4], marble_trim, 2.5);
 
-    // Cornicione sporgente modanato
     let y_cornice = y_frieze_top + 0.35f32;
     push_box(trim, [-hw - 0.8, y_frieze_top, -hd - 0.8], [hw + 0.8, y_cornice, hd + 0.8], marble_trim, 2.0);
 
-    // 5. Grande Timpano e Frontone Classico Pagano a due falde
     let y_ridge = y_cornice + (hw * 0.42).clamp(3.0, 5.5);
     let z_front_edge = -hd - 0.8;
     let z_back_edge = hd + 0.8;
     let ins_temple = [0.0, y_cornice, 0.0];
 
-    // Timpano frontale triangolare pieno
     push_face(wall, &[
         [-hw - 0.8, y_cornice, z_front_edge],
         [hw + 0.8, y_cornice, z_front_edge],
         [0.0, y_ridge, z_front_edge],
     ], stone, 3.0, [0.0, y_cornice, z_front_edge + 2.0]);
 
-    // Timpano posteriore
     push_face(wall, &[
         [hw + 0.8, y_cornice, z_back_edge],
         [-hw - 0.8, y_cornice, z_back_edge],
         [0.0, y_ridge, z_back_edge],
     ], stone, 3.0, [0.0, y_cornice, z_back_edge - 2.0]);
 
-    // Falde del tetto classico a due spioventi
     push_face(roof, &[
         [-hw - 1.0, y_cornice, -hd - 1.0],
         [-hw - 1.0, y_cornice, hd + 1.0],
@@ -869,14 +856,216 @@ pub fn generate_pagan_temple(fp: &Footprint, btex: BuildingTextures) -> Building
         [0.0, y_ridge, hd + 1.0],
     ], roof_c, 3.5, ins_temple);
 
-    // 6. Portale monumentale ad arco sulla cella sacra frontale
     build_arched_guild_portal(wall, doors, trim, stone, 0.0, cella_front, y_floor);
 
     mesh
 }
 
 // =========================================================================
-// TORRE DELLA GILDA DEI MAGHI (MAGE)
+// FINESTRA IN STILE PALAZZO REALE (con parametro di scala)
+// =========================================================================
+
+/// Disegna una finestra **in stile Palazzo Reale** (`palace_gen.rs`) su una
+/// faccia piana con normale `normal` (orizzontale, unitaria).
+///
+/// `base_center` è il punto sul muro al **centro della base** della finestra
+/// (alla quota `fy`, sotto lo stipite), non al centro geometrico. La finestra
+/// si estende verso l'esterno lungo `normal`.
+///
+/// `scale` scala **tutte** le dimensioni: con `scale = 1.0` la finestra è
+/// identica a quella del palazzo (davanzale, stipiti, arco a tutto sesto,
+/// chiave di volta, vetro con gradiente diagonale, inferriate a croce e
+/// bottone centrale). Con `scale = 0.5` è esattamente metà in ogni dimensione.
+///
+/// `win_r` e `win_h_rect` sono le dimensioni del **vetro** (raggio dell'arco
+/// e altezza del rettangolo). Devono essere già scalati coerentemente con
+/// `scale`: in genere `win_r = 0.92 * scale`, `win_h_rect = 2.05 * scale`.
+fn push_palace_window(
+    wall: &mut MeshPart,
+    windows: &mut MeshPart,
+    trim: &mut MeshPart,
+    base_center: V3,
+    normal: V3,
+    win_r: f32,
+    win_h_rect: f32,
+    scale: f32,
+    stone: [f32; 4],
+    iron_bar_c: [f32; 4],
+) {
+    let sc = scale.max(1e-3);
+
+    // Sistema locale (t, up, n) destrorso: `t × up = n`.
+    let n = [normal[0], 0.0, normal[2]];
+    let t = [n[2], 0.0, -n[0]];
+    let up = [0.0f32, 1.0, 0.0];
+
+    let pw = |u: f32, v: f32, off: f32| -> V3 {
+        [
+            base_center[0] + t[0] * u + n[0] * off,
+            base_center[1] + up[1] * v + n[1] * off,
+            base_center[2] + t[2] * u + n[2] * off,
+        ]
+    };
+
+    // Punto dentro il muro: `push_face` lo usa per l'orientamento delle facce.
+    let inside = [
+        base_center[0] - n[0] * 1.0,
+        base_center[1] + win_h_rect * 0.5,
+        base_center[2] - n[2] * 1.0,
+    ];
+
+    // Box orientato nel sistema (t, up, n).
+    let mut obox = |part: &mut MeshPart,
+    u0: f32, u1: f32,
+    v0: f32, v1: f32,
+    n0: f32, n1: f32,
+    col: [f32; 4], s: f32| {
+        let mut corners = [[0.0f32; 3]; 8];
+        for (i, c) in corners.iter_mut().enumerate() {
+            let uu = if i & 1 == 0 { u0 } else { u1 };
+            let vv = if i & 2 == 0 { v0 } else { v1 };
+            let nn = if i & 4 == 0 { n0 } else { n1 };
+            *c = pw(uu, vv, nn);
+        }
+        push_box_from_corners(part, corners, col, s);
+    };
+
+    let wy_spring = win_h_rect;
+    let wy_top = wy_spring + win_r;
+
+    // 1. Davanzale
+    obox(wall, -1.25 * sc, 1.25 * sc, -0.25 * sc, 0.0, -0.04 * sc, 0.16 * sc, stone, 2.0);
+
+    // 2. Stipiti
+    obox(wall, -1.20 * sc, -win_r, 0.0, wy_spring, 0.0, 0.16 * sc, stone, 1.5);
+    obox(wall, win_r, 1.20 * sc, 0.0, wy_spring, 0.0, 0.16 * sc, stone, 1.5);
+
+    // 3. Arco a tutto sesto in pietra (12 segmenti)
+    let r_out_win = win_r + 0.25 * sc;
+    let n_arch = 12;
+    for k in 0..n_arch {
+        let a0 = (k as f32 / n_arch as f32) * PI;
+        let a1 = ((k + 1) as f32 / n_arch as f32) * PI;
+
+        let u0_in = -win_r * a0.cos();
+        let v0_in = wy_spring + win_r * a0.sin();
+        let u1_in = -win_r * a1.cos();
+        let v1_in = wy_spring + win_r * a1.sin();
+
+        let u0_out = -r_out_win * a0.cos();
+        let v0_out = wy_spring + r_out_win * a0.sin();
+        let u1_out = -r_out_win * a1.cos();
+        let v1_out = wy_spring + r_out_win * a1.sin();
+
+        // Anello frontale
+        push_face(wall, &[
+            pw(u0_in, v0_in, 0.0),
+                  pw(u1_in, v1_in, 0.0),
+                  pw(u1_out, v1_out, 0.0),
+                  pw(u0_out, v0_out, 0.0),
+        ], stone, 1.5, inside);
+
+        // Estrusione esterna
+        push_face(wall, &[
+            pw(u0_out, v0_out, 0.0),
+                  pw(u1_out, v1_out, 0.0),
+                  pw(u1_out, v1_out, 0.16 * sc),
+                  pw(u0_out, v0_out, 0.16 * sc),
+        ], stone, 1.5, inside);
+
+        // Intradosso
+        push_face(wall, &[
+            pw(u0_in, v0_in, 0.0),
+                  pw(u1_in, v1_in, 0.0),
+                  pw(u1_in, v1_in, 0.16 * sc),
+                  pw(u0_in, v0_in, 0.16 * sc),
+        ], stone, 1.5, inside);
+    }
+
+    // 4. Chiave di volta
+    obox(wall,
+         -0.16 * sc, 0.16 * sc,
+         wy_top - 0.05 * sc, wy_top + 0.22 * sc,
+         0.0, 0.20 * sc,
+         stone, 1.0);
+
+    // 5. Vetro con gradiente diagonale
+    let z_glass = 0.05 * sc;
+    let glass_norm = [n[0], 0.0, n[2]];
+    let glass_color_at = |u: f32, v: f32| -> [f32; 4] {
+        let u_norm = ((u + win_r) / (win_r * 2.0)).clamp(0.0, 1.0);
+        let v_norm = (v / wy_top).clamp(0.0, 1.0);
+        let diag = (1.0 - u_norm) * 0.55 + v_norm * 0.45;
+        [0.10 + 0.38 * diag, 0.22 + 0.50 * diag, 0.48 + 0.46 * diag, 1.0]
+    };
+
+    // Rettangolo del vetro
+    let g_base = windows.positions.len() as u32;
+    let quad = [
+        (pw(-win_r, 0.0, z_glass), glass_color_at(-win_r, 0.0), [0.0, 1.0]),
+        (pw(win_r, 0.0, z_glass), glass_color_at(win_r, 0.0), [1.0, 1.0]),
+        (pw(win_r, wy_spring, z_glass), glass_color_at(win_r, wy_spring), [1.0, 0.0]),
+        (pw(-win_r, wy_spring, z_glass), glass_color_at(-win_r, wy_spring), [0.0, 0.0]),
+    ];
+    for (pos, col, uv) in quad {
+        windows.positions.push(pos);
+        windows.normals.push(glass_norm);
+        windows.uvs.push(uv);
+        windows.colors.push(col);
+    }
+    windows.indices.extend_from_slice(&[
+        g_base, g_base + 1, g_base + 2,
+        g_base, g_base + 2, g_base + 3,
+    ]);
+
+    // Arco del vetro a ventaglio (semicerchio)
+    let c_center = pw(0.0, wy_spring, z_glass);
+    let c_idx = windows.positions.len() as u32;
+    windows.positions.push(c_center);
+    windows.normals.push(glass_norm);
+    windows.uvs.push([0.5, 0.5]);
+    windows.colors.push(glass_color_at(0.0, wy_spring));
+
+    let n_fan = 12;
+    for k in 0..=n_fan {
+        let a = (k as f32 / n_fan as f32) * PI;
+        let u = -win_r * a.cos();
+        let v = wy_spring + win_r * a.sin();
+        windows.positions.push(pw(u, v, z_glass));
+        windows.normals.push(glass_norm);
+        windows.uvs.push([(u + win_r) / (win_r * 2.0), v / wy_top]);
+        windows.colors.push(glass_color_at(u, v));
+    }
+    for k in 0..n_fan {
+        let p0 = c_idx + 1 + k;
+        let p1 = c_idx + 2 + k;
+        windows.indices.extend_from_slice(&[c_idx, p1, p0]);
+    }
+
+    // 6. Inferriate incrociate
+    let t_bar = 0.035 * sc;
+    let bar_n0 = z_glass + 0.01 * sc;
+    let bar_n1 = z_glass + 0.04 * sc;
+
+    obox(trim, -t_bar * 0.5, t_bar * 0.5,
+         0.0, wy_top - 0.02 * sc,
+         bar_n0, bar_n1,
+         iron_bar_c, 1.0);
+
+    let y_cross = wy_spring * 0.58;
+    obox(trim, -win_r, win_r,
+         y_cross - t_bar * 0.5, y_cross + t_bar * 0.5,
+         bar_n0, bar_n1,
+         iron_bar_c, 1.0);
+
+    obox(trim, -0.035 * sc, 0.035 * sc,
+         y_cross - 0.035 * sc, y_cross + 0.035 * sc,
+         bar_n1, bar_n1 + 0.02 * sc,
+         [0.08, 0.08, 0.09, 1.0], 1.0);
+}
+
+// =========================================================================
+// TORRE DELLA GILDA DEI MAGHI (MAGE) — OTTAGONO A 7 PIANI
 // =========================================================================
 
 pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMesh {
@@ -890,83 +1079,124 @@ pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMe
     let trim_c = [0.25, 0.22, 0.20, 1.0];
     let dome_c = [1.0, 1.0, 1.0, 1.0];
     let gold_c = [0.85, 0.70, 0.25, 1.0];
-    let window_glass = [0.10, 0.28, 0.55, 1.0];
+    let iron_bar_c = [0.03, 0.03, 0.035, 1.0];
 
     let r = (fp.width.min(fp.depth) * 0.5).max(7.0);
-    let total_h = fp.height.max(26.0);
-    let sides = 20;
+    let total_h = fp.height.max(46.0);
+    // Ottagono: lati piatti come nelle torri dei maghi di Daggerfall.
+    let sides = 8;
 
     let BuildingMesh { parts: [wall, roof, trim, _], doors, windows, .. } = &mut mesh;
 
     let angle_offset = PI / sides as f32;
-    let door_side_idx = 14usize;
-    let wall_front_z = -r * angle_offset.cos();
+    // Lato con centro a 270° (verso -Z, dove arriva il giocatore):
+    //   angle_offset + (i + 0.5) * 2PI/sides = 270° → con sides = 8 → i = 5.
+    let door_side_idx = 5usize;
+    let wall_front_z = -r * (PI / sides as f32).cos();
 
-    // Zoccolo di fondazione
+    // ===== FONDAZIONE =====
     let r_base = r * 1.12;
-    push_cylinder(wall, 0.0, 0.0, r_base, -0.5, 0.2, sides, stone, 4.0, angle_offset, Some(door_side_idx));
-    push_ring(trim, 0.0, 0.0, r_base * 0.98, r_base * 1.02, 0.1, 0.3, sides, trim_c, 2.0, angle_offset, Some(door_side_idx));
+    push_cylinder(wall, 0.0, 0.0, r_base, -0.5, 0.2, sides, stone, 4.0,
+                  angle_offset, Some(door_side_idx));
+    push_ring(trim, 0.0, 0.0, r_base * 0.98, r_base * 1.02, 0.1, 0.3, sides,
+              trim_c, 2.0, angle_offset, Some(door_side_idx));
 
-    // Corpo a 5 piani: pareti continue e solide a 360° (nessuna voragine)
+    // ===== CORPO A 7 PIANI =====
+    const N_FLOORS: usize = 10;
     let y_floor = 0.0;
-    let y1 = total_h * 0.20;
-    let y2 = total_h * 0.40;
-    let y3 = total_h * 0.60;
-    let y4 = total_h * 0.80;
-    let y5 = total_h;
+    let floor_h = total_h / N_FLOORS as f32;
+    let mut floor_ys = Vec::with_capacity(N_FLOORS + 1);
+    floor_ys.push(y_floor);
+    for i in 1..=N_FLOORS {
+        floor_ys.push(y_floor + floor_h * i as f32);
+    }
 
-    push_cylinder(wall, 0.0, 0.0, r, y_floor, y1, sides, stone, 4.0, angle_offset, None);
-    push_cylinder(wall, 0.0, 0.0, r, y1, y2, sides, stone, 4.0, angle_offset, None);
-    push_cylinder(wall, 0.0, 0.0, r, y2, y3, sides, stone, 4.0, angle_offset, None);
-    push_cylinder(wall, 0.0, 0.0, r, y3, y4, sides, stone, 4.0, angle_offset, None);
-    push_cylinder(wall, 0.0, 0.0, r, y4, y5, sides, stone, 4.0, angle_offset, None);
+    for i in 0..N_FLOORS {
+        push_cylinder(wall, 0.0, 0.0, r, floor_ys[i], floor_ys[i + 1],
+                      sides, stone, 4.0, angle_offset, None);
+    }
 
-    // Marcapiani sagomati ad anello tra i piani
+    // Marcapiani tra i piani
     let r_cornice = r + 0.28;
-    push_ring(trim, 0.0, 0.0, r, r_cornice, y1 - 0.15, y1 + 0.15, sides, trim_c, 2.0, angle_offset, None);
-    push_ring(trim, 0.0, 0.0, r, r_cornice, y2 - 0.15, y2 + 0.15, sides, trim_c, 2.0, angle_offset, None);
-    push_ring(trim, 0.0, 0.0, r, r_cornice, y3 - 0.15, y3 + 0.15, sides, trim_c, 2.0, angle_offset, None);
-    push_ring(trim, 0.0, 0.0, r, r_cornice, y4 - 0.15, y4 + 0.15, sides, trim_c, 2.0, angle_offset, None);
+    for i in 1..N_FLOORS {
+        let y = floor_ys[i];
+        push_ring(wall, 0.0, 0.0, r, r_cornice, y - 0.15, y + 0.15, sides,
+                  trim_c, 2.0, angle_offset, None);
+    }
+
+    // Anello in cima
     let r_top = r + 0.55;
-    push_ring(trim, 0.0, 0.0, r, r_top, y5, y5 + 0.65, sides, trim_c, 2.0, angle_offset, None);
+    let y_top_ring = floor_ys[N_FLOORS];
+    push_ring(trim, 0.0, 0.0, r, r_top, y_top_ring, y_top_ring + 0.65, sides,
+              trim_c, 2.0, angle_offset, None);
 
-    // Cupola sommitale
+    // Cupola e guglia
     let dome_r = r_top;
-    let dome_h = r * 0.9;
-    push_cone(roof, 0.0, 0.0, dome_r, y5 + 0.65, y5 + 0.65 + dome_h, sides, dome_c, 3.5, angle_offset);
+    let dome_h = r * 2.9;
+    push_cone(roof, 0.0, 0.0, dome_r, y_top_ring + 0.65,
+              y_top_ring + 0.65 + dome_h, sides, dome_c, 3.5, angle_offset);
+    let spire_base_y = y_top_ring + 0.65 + dome_h;
+    push_cone(trim, 0.0, 0.0, 0.6, spire_base_y, spire_base_y + 3.5, 8,
+              gold_c, 1.5, 0.0);
 
-    // Guglia dorata
-    let spire_base_y = y5 + 0.65 + dome_h;
-    push_cone(trim, 0.0, 0.0, 0.6, spire_base_y, spire_base_y + 3.5, 8, gold_c, 1.5, 0.0);
-
-    // Portale monumentale ad arco sulla facciata Sud piana
+    // ===== PORTALE =====
     build_arched_guild_portal(wall, doors, trim, stone, 0.0, wall_front_z, y_floor);
 
-    // Finestre distribuite su tutti i piani
-    let door_dir_norm = (-std::f32::consts::FRAC_PI_2).rem_euclid(TAU);
-    for (floor_idx, floor_y) in [
-        (0usize, y_floor + (y1 - y_floor) * 0.55),
-        (1, (y1 + y2) * 0.5),
-        (2, (y2 + y3) * 0.5),
-        (3, (y3 + y4) * 0.5),
-        (4, (y4 + y5) * 0.5),
-    ] {
-        let n_windows = 4;
-        for k in 0..n_windows {
-            let base_angle = (k as f32 / n_windows as f32) * TAU;
-            let offset = if floor_idx % 2 == 0 { 0.0 } else { PI / n_windows as f32 };
-            let angle = base_angle + offset;
-            let angle_norm = angle.rem_euclid(TAU);
-            let raw_diff = (angle_norm - door_dir_norm).abs();
-            let diff = raw_diff.min(TAU - raw_diff);
-            if floor_idx == 0 && diff < 0.5 {
+    // ===== FINESTRE IN STILE PALAZZO REALE (a mezza scala) =====
+    // Dimensioni fedeli del palazzo, dimezzate.
+    let win_scale = 0.5f32;
+    let win_r = 0.92 * win_scale;         // 0.46 m
+    let win_h_rect = 2.05 * win_scale;    // 1.025 m
+    let win_h_total = win_h_rect + win_r; // 1.485 m
+
+    let apothem = r * (PI / sides as f32).cos();
+
+    for floor_idx in 0..N_FLOORS {
+        // Piano terra: nessuna finestra (solo il portale).
+        if floor_idx == 0 {
+            continue;
+        }
+
+        let floor_bottom = floor_ys[floor_idx];
+        let local_floor_h = floor_ys[floor_idx + 1] - floor_bottom;
+
+        // Margine minimo di 0.3 m dal fondo del piano; se non basta, salta.
+        let margin = (local_floor_h - win_h_total).max(0.0);
+        let win_base_v = (margin * 0.5).max(0.3);
+        if win_base_v + win_h_total > local_floor_h {
+            continue;
+        }
+        let win_base_y = floor_bottom + win_base_v;
+
+        // Alterna la parità del lato per piano, così le finestre di piani
+        // consecutivi non sono allineate verticalmente (zig-zag).
+        //   Piano 1 (parità 1): lati 1, 3, 5, 7
+        //   Piano 2 (parità 0): lati 0, 2, 4, 6
+        //   Piano 3 (parità 1): lati 1, 3, 5, 7
+        //   ...
+        let face_parity = floor_idx % 2;
+
+        for face_idx in 0..sides {
+            if face_idx % 2 != face_parity {
                 continue;
             }
-            let wx = angle.cos() * (r + 0.02);
-            let wz = angle.sin() * (r + 0.02);
-            push_window_quad(windows, wx, wz, 0.45, 0.75, angle, floor_y, window_glass, 2.0);
+
+            let angle_center =
+            angle_offset + (face_idx as f32 + 0.5) * (TAU / sides as f32);
+            let (sin_a, cos_a) = angle_center.sin_cos();
+
+            let base_center = [apothem * cos_a, win_base_y, apothem * sin_a];
+            let face_normal = [cos_a, 0.0, sin_a];
+
+            push_palace_window(
+                wall, windows, trim,
+                base_center, face_normal,
+                win_r, win_h_rect, win_scale,
+                stone, iron_bar_c,
+            );
         }
     }
+
     mesh
 }
 
@@ -983,7 +1213,6 @@ pub fn generate_fighters_hall(fp: &Footprint, btex: BuildingTextures) -> Buildin
 
     let stone = [1.0, 1.0, 1.0, 1.0];
     let trim_c = [0.25, 0.22, 0.20, 1.0];
-    // Vetro e inferriate delle finestre: colori ereditati dal Palazzo Reale.
     let guild_glass = [0.10, 0.28, 0.55, 1.0];
     let guild_iron = [0.03, 0.03, 0.035, 1.0];
 
@@ -1019,7 +1248,6 @@ pub fn generate_fighters_hall(fp: &Footprint, btex: BuildingTextures) -> Buildin
 
     // Finestre arricchite (piano terra + secondo piano).
     for &wx in &[-hw * 0.6, hw * 0.6] {
-        // Fronte (normale -Z)
         push_rich_window(
             wall, windows, trim,
             [wx, y_floor + 1.6, -hd],
@@ -1036,7 +1264,6 @@ pub fn generate_fighters_hall(fp: &Footprint, btex: BuildingTextures) -> Buildin
         );
     }
     for &wz in &[-hd * 0.5, hd * 0.5] {
-        // Lati sinistro/destro (normale ±X)
         push_rich_window(
             wall, windows, trim,
             [-hw, y_floor + 1.6, wz],

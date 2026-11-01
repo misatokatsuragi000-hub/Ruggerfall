@@ -795,13 +795,33 @@ impl CityBuilder {
         rot_deg: f32,
         position: [f32; 3],
     ) {
+        self.add_arch3d_instance_tilted(model, rot_deg, 0.0, 0.0, position);
+    }
+
+    /// Come `add_arch3d_instance`, con le inclinazioni attorno a X e Z degli oggetti RMB (travi,
+    /// pali e insegne che sporgono dai muri). Ordine come in DFU (`Quaternion.Euler`): prima Z,
+    /// poi X, infine Y. Con inclinazioni nulle e' identica alla versione senza inclinazioni.
+    pub fn add_arch3d_instance_tilted(
+        &mut self,
+        model: &Arch3dModel,
+        rot_deg: f32,
+        rot_x_deg: f32,
+        rot_z_deg: f32,
+        position: [f32; 3],
+    ) {
         let (s, c) = rot_deg.to_radians().sin_cos();
+        let (sx, cx) = rot_x_deg.to_radians().sin_cos();
+        let (sz, cz) = rot_z_deg.to_radians().sin_cos();
 
         let trans = |v: [f32; 3]| -> [f32; 3] {
+            // Z, poi X (attorno agli assi locali del modello)...
+            let (x1, y1, z1) = (v[0] * cz - v[1] * sz, v[0] * sz + v[1] * cz, v[2]);
+            let (x2, y2, z2) = (x1, y1 * cx - z1 * sx, y1 * sx + z1 * cx);
+            // ...infine Y (come prima).
             [
-                v[0] * c + v[2] * s + position[0],
-                v[1] + position[1],
-                -v[0] * s + v[2] * c + position[2],
+                x2 * c + z2 * s + position[0],
+                y2 + position[1],
+                -x2 * s + z2 * c + position[2],
             ]
         };
 
@@ -814,35 +834,35 @@ impl CityBuilder {
             let key = (face.texture_archive, face.texture_record);
             let dst = self.textured_part(key);
 
-            let v0_raw = model.vertices.get(face.vertex_indices[0] as usize).copied().unwrap_or([0.0; 3]);
-            let v1_raw = model.vertices.get(face.vertex_indices[1] as usize).copied().unwrap_or([0.0; 3]);
-            let v2_raw = model.vertices.get(face.vertex_indices[2] as usize).copied().unwrap_or([0.0; 3]);
+            // Vertici della faccia gia' trasformati (rotazione + posizione).
+            let poly: Vec<[f32; 3]> = face
+                .vertex_indices
+                .iter()
+                .map(|&i| trans(model.vertices.get(i as usize).copied().unwrap_or([0.0; 3])))
+                .collect();
 
-            let p0 = trans(v0_raw);
-            let p1 = trans(v1_raw);
-            let p2 = trans(v2_raw);
-
-            // Calcolo normale geometrica CCW (0, k+1, k)
-            let v01 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-            let v02 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-            let nx = v01[1] * v02[2] - v01[2] * v02[1];
-            let ny = v01[2] * v02[0] - v01[0] * v02[2];
-            let nz = v01[0] * v02[1] - v01[1] * v02[0];
+            // Normale con il metodo di Newell sull'intero poligono: dai primi 3 punti usciva nulla
+            // (e la faccia restava buia) quando erano allineati, come nei contorni concavi delle
+            // siepi. Stessa convenzione di prima: i triangoli sono emessi con avvolgimento
+            // invertito, quindi la normale e' l'opposta di quella di Newell.
+            let (mut nx, mut ny, mut nz) = (0.0f32, 0.0f32, 0.0f32);
+            for i in 0..n_pts {
+                let (a, b) = (poly[i], poly[(i + 1) % n_pts]);
+                nx += (a[1] - b[1]) * (a[2] + b[2]);
+                ny += (a[2] - b[2]) * (a[0] + b[0]);
+                nz += (a[0] - b[0]) * (a[1] + b[1]);
+            }
             let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-5);
-            let normal = [nx / len, ny / len, nz / len];
+            let normal = [-nx / len, -ny / len, -nz / len];
 
-            for k in 1..(n_pts - 1) {
-                let idx0 = face.vertex_indices[0] as usize;
-                let idx1 = face.vertex_indices[k] as usize;
-                let idx2 = face.vertex_indices[k + 1] as usize;
+            // Ear clipping: le facce concave (siepi, merli, croci) non si riempiono con un ventaglio
+            // dal vertice 0, che lascia buchi e triangoli ribaltati.
+            for [ia, ib, ic] in face.triangulate(&model.vertices) {
+                let (vert0, vert1, vert2) = (poly[ia], poly[ib], poly[ic]);
 
-                let vert0 = trans(model.vertices.get(idx0).copied().unwrap_or([0.0; 3]));
-                let vert1 = trans(model.vertices.get(idx1).copied().unwrap_or([0.0; 3]));
-                let vert2 = trans(model.vertices.get(idx2).copied().unwrap_or([0.0; 3]));
-
-                let raw_uv0 = face.uvs.get(0).copied().unwrap_or([0.0, 0.0]);
-                let raw_uv1 = face.uvs.get(k).copied().unwrap_or([1.0, 0.0]);
-                let raw_uv2 = face.uvs.get(k + 1).copied().unwrap_or([0.0, 1.0]);
+                let raw_uv0 = face.uvs.get(ia).copied().unwrap_or([0.0, 0.0]);
+                let raw_uv1 = face.uvs.get(ib).copied().unwrap_or([1.0, 0.0]);
+                let raw_uv2 = face.uvs.get(ic).copied().unwrap_or([0.0, 1.0]);
 
                 // Normalizzazione UV su 64 pixel (ripetizione texture 1:1)
                 let uv0 = [raw_uv0[0] / 128.0, raw_uv0[1] / 128.0];

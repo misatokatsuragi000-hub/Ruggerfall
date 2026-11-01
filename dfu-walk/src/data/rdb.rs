@@ -9,12 +9,35 @@
 //! di Bevy è antioraria (regola della mano destra). Senza il segno meno, ogni
 //! oggetto RDB risulta ruotato nel verso opposto: l'effetto visibile è che
 //! l'ingresso del dungeon sembra ruotato di 180° e i blocchi non si allineano.
+//!
+//! ## Correzioni rispetto alla versione precedente
+//!
+//! - **Root vuote**: DFU usa `offset > 0`, non `offset >= 0`. Un offset `0`
+//!   punterebbe all'header del file, non a un oggetto. Usare `>= 0` produceva
+//!   un oggetto fantasma per ogni root vuota.
+//! - **Liste lunghe**: il limite `visited < 5000` è stato portato a
+//!   `MAX_VISITS = 100_000`. I dungeon grandi (fortezze orchescHE, cattedrali)
+//!   possono superare i 1000 oggetti per root, ma mai 100.000.
+//! - **Diagnostica**: con `DF_RDB_DEBUG=1` nell'ambiente, `parse` logga un
+//!   riepilogo per blocco (oggetti totali, model/flat/light, resource None,
+//!   `res_offset` fuori range, liste troncate). Utile per capire se un
+//!   "elemento mancante" viene scartato qui o a valle.
+//!
+//! I filtri a valle (`dungeon_builder.rs::build_dungeon`, `dungeon.rs`) sono
+//! la causa più frequente di elementi "mancanti": un ModelID che non esiste
+//! in ARCH3D.BSA, o un flat che punta a un archivio non presente in ARENA2.
+//! Con `DF_RDB_DEBUG=1` questi scarti diventano visibili.
 
 use std::str::FromStr;
 
 pub const RDB_SIDE_UNITS: f32 = 2048.0;
 pub const RDB_SIDE_METERS: f32 = RDB_SIDE_UNITS * 0.025; // 51.2 metri per blocco
 pub const RDB_DA_TO_DEG: f32 = 360.0 / 2048.0;
+
+/// Numero massimo di oggetti visitabili in una singola linked list. Un RDB
+/// reale può averne 200-2000; 100.000 è un limite di sicurezza per evitare
+/// loop infiniti su file corrotti, senza troncare liste legittime.
+const MAX_VISITS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RdbResourceType {
@@ -127,13 +150,11 @@ impl RdbBlock {
         if root_offset >= data.len() {
             return Err("ObjectRootOffset oltre la fine del file RDB");
         }
-
         let total_roots = width * height;
         let roots_end = root_offset + total_roots * 4;
         if roots_end > data.len() {
             return Err("ObjectRootList oltre la fine del file RDB");
         }
-
         let mut root_offsets = Vec::with_capacity(total_roots);
         for i in 0..total_roots {
             let off = i32::from_le_bytes(
@@ -141,16 +162,24 @@ impl RdbBlock {
                 .try_into()
                 .unwrap(),
             );
-            if off >= 0 {
+            // FIX: DFU usa `offset > 0`. Un `offset == 0` punterebbe
+            // all'header del file, non a un oggetto. Usare `>= 0` produceva
+            // un oggetto fantasma per ogni root vuota (e poteva consumare
+            // iterazioni utili del ciclo, sovrapponendo elementi reali).
+            if off > 0 {
                 root_offsets.push(off as usize);
             }
         }
 
         // 3. Traversal della linked list per ciascuna radice
         let mut objects = Vec::new();
+        let mut none_count = 0usize;
+        let mut res_out_of_range = 0usize;
+        let mut truncated_lists = 0usize;
+
         for mut obj_pos in root_offsets {
             let mut visited = 0;
-            while obj_pos + 25 <= data.len() && visited < 5000 {
+            while obj_pos + 25 <= data.len() && visited < MAX_VISITS {
                 visited += 1;
                 let next = i32::from_le_bytes(data[obj_pos..obj_pos + 4].try_into().unwrap());
                 let x = i32::from_le_bytes(data[obj_pos + 8..obj_pos + 12].try_into().unwrap());
@@ -199,6 +228,7 @@ impl RdbBlock {
                                                    action_offset: act_off,
                                 })
                             } else {
+                                none_count += 1;
                                 RdbResource::None
                             }
                         }
@@ -221,6 +251,7 @@ impl RdbBlock {
                                                   flags,
                                 })
                             } else {
+                                none_count += 1;
                                 RdbResource::None
                             }
                         }
@@ -231,12 +262,14 @@ impl RdbBlock {
                                 );
                                 RdbResource::Light(RdbLightResource { radius })
                             } else {
+                                none_count += 1;
                                 RdbResource::None
                             }
                         }
                         _ => RdbResource::None,
                     }
                 } else {
+                    res_out_of_range += 1;
                     RdbResource::None
                 };
 
@@ -246,6 +279,36 @@ impl RdbBlock {
                     break;
                 }
                 obj_pos = next as usize;
+            }
+            if visited >= MAX_VISITS {
+                truncated_lists += 1;
+            }
+        }
+
+        // Diagnostica opt-in: `DF_RDB_DEBUG=1` mostra cosa è successo.
+        if std::env::var_os("DF_RDB_DEBUG").is_some() {
+            let models = objects
+            .iter()
+            .filter(|o| matches!(o.resource, RdbResource::Model(_)))
+            .count();
+            let flats = objects
+            .iter()
+            .filter(|o| matches!(o.resource, RdbResource::Flat(_)))
+            .count();
+            let lights = objects
+            .iter()
+            .filter(|o| matches!(o.resource, RdbResource::Light(_)))
+            .count();
+            eprintln!(
+                "RDB `{name}`: {} oggetti totali | {models} model | {flats} flat | {lights} light \
+| none {none_count} | res_offset fuori range {res_out_of_range} | liste troncate {truncated_lists}",
+objects.len()
+            );
+            if truncated_lists > 0 {
+                eprintln!(
+                    "  ATTENZIONE: {truncated_lists} linked list hanno raggiunto MAX_VISITS \
+({MAX_VISITS}). Il file potrebbe essere corrotto o contiene più oggetti del previsto."
+                );
             }
         }
 

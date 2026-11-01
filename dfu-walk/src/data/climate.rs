@@ -2,6 +2,21 @@
 //! Porting di ClimateSwaps.cs e di MapsFile.GetWorldClimateSettings
 //! (Daggerfall Unity, MIT). Le stranezze del codice originale sono mantenute
 //! di proposito, così i numeri di archivio coincidono con quelli di DFU.
+//!
+//! ## Stagione
+//!
+//! `Season` ha tre varianti: `Summer` (archivi base), `Winter` (archivi +1, neve),
+//! `Rain` (archivi +2, pioggia). Il supporto effettivo dipende dall'archivio:
+//! vedi `climate_texture_info` (`supports_winter`, `supports_rain`) e le eccezioni
+//! dentro `apply_climate`.
+//!
+//! `ground_archive(world_climate, season)` sceglie l'archivio delle tile del
+//! terreno delegando ad `apply_climate`, che conosce già tutte le eccezioni di
+//! DFU (deserto, marmo, castello, mages guild, ecc.). In pratica:
+//!
+//! - `Summer` → archivio base (2, 102, 302, 402 a seconda del clima);
+//! - `Winter` → +1 se `supports_winter`, tranne nel deserto;
+//! - `Rain`   → +2 se `supports_rain` (il terrain set ce l'ha, gli altri no).
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClimateBase {
@@ -132,33 +147,33 @@ pub fn apply_climate(archive: i32, record: i32, climate: ClimateBase, season: Se
     // Precedenza identica a DFU: (palude && gilda dei maghi) || (castello && record > 3).
     if (climate == ClimateBase::Swamp && set == SET_MAGES_GUILD)
         || (set == SET_CASTLE && record > 3)
-    {
-        ci.supports_winter = false;
-    }
-
-    // Archivi senza texture invernali.
-    if (archive == 82 && record > 1) || archive == 77 {
-        ci.supports_winter = false;
-    }
-
-    // Archivi con variante invernale ma specifici di un clima.
-    let suppress_climate_index = matches!(archive, 75 | 76 | 77 | 79 | 80 | 82 | 83);
-
-    if archive < 500 && !suppress_climate_index {
-        let mut index = climate.offset() + set;
-        if season == Season::Winter && ci.supports_winter {
-            index += WINTER_OFFSET;
-        } else if season == Season::Rain && ci.supports_rain {
-            index += RAIN_OFFSET;
+        {
+            ci.supports_winter = false;
         }
-        index
-    } else {
-        let mut index = archive;
-        if season == Season::Winter && ci.supports_winter {
-            index += WINTER_OFFSET;
+
+        // Archivi senza texture invernali.
+        if (archive == 82 && record > 1) || archive == 77 {
+            ci.supports_winter = false;
         }
-        index
-    }
+
+        // Archivi con variante invernale ma specifici di un clima.
+        let suppress_climate_index = matches!(archive, 75 | 76 | 77 | 79 | 80 | 82 | 83);
+
+        if archive < 500 && !suppress_climate_index {
+            let mut index = climate.offset() + set;
+            if season == Season::Winter && ci.supports_winter {
+                index += WINTER_OFFSET;
+            } else if season == Season::Rain && ci.supports_rain {
+                index += RAIN_OFFSET;
+            }
+            index
+        } else {
+            let mut index = archive;
+            if season == Season::Winter && ci.supports_winter {
+                index += WINTER_OFFSET;
+            }
+            index
+        }
 }
 
 /// Valori di CLIMATE.PAK (223..=232).
@@ -193,15 +208,18 @@ pub fn world_climate_settings(world_climate: i32) -> ClimateSettings {
     }
 }
 
-/// Archivio delle tile del terreno; d'inverno si passa alle texture con la neve
-/// (+1), tranne nel deserto.
-pub fn ground_archive(world_climate: i32, winter: bool) -> i32 {
+/// Archivio delle tile del terreno per la stagione.
+///
+/// - `Summer` → archivio base (2, 102, 302, 402 a seconda del clima);
+/// - `Winter` → +1 se `supports_winter` (il terrain set ce l'ha, tranne nel
+///   deserto dove `apply_climate` disattiva `supports_winter`);
+/// - `Rain`   → +2 se `supports_rain` (il terrain set ce l'ha, gli altri no).
+///
+/// Delega ad `apply_climate`, che conosce già tutte le eccezioni di DFU
+/// (deserto, marmo in palude, castello, mages guild, ecc.).
+pub fn ground_archive(world_climate: i32, season: Season) -> i32 {
     let s = world_climate_settings(world_climate);
-    if winter && s.climate_type != ClimateBase::Desert {
-        s.ground_archive + 1
-    } else {
-        s.ground_archive
-    }
+    apply_climate(s.ground_archive, 0, s.climate_type, season).max(0)
 }
 
 #[cfg(test)]
@@ -280,6 +298,10 @@ mod tests {
         assert_eq!(climate_texture_info(510).group, TextureGroup::Nature);
         assert_eq!(climate_texture_info(46).set, None);
         assert!(!climate_texture_info(74).supports_winter);
+        // Il terrain set supporta anche la pioggia.
+        assert!(climate_texture_info(302).supports_rain);
+        // Gli altri set esterni non hanno variante pioggia.
+        assert!(!climate_texture_info(312).supports_rain);
     }
 
     #[test]
@@ -295,14 +317,31 @@ mod tests {
         assert_eq!(world_climate_settings(999).ground_archive, 302);
     }
 
+    // ------------------------------------------------------------- ground_archive
+
     #[test]
-    fn ground_archive_winter_rules() {
-        assert_eq!(ground_archive(231, false), 302);
-        assert_eq!(ground_archive(231, true), 303);
-        assert_eq!(ground_archive(226, true), 103);
-        assert_eq!(ground_archive(228, true), 403);
-        // Deserto e sub-tropicale (tipo Desert): niente neve.
-        assert_eq!(ground_archive(224, true), 2);
-        assert_eq!(ground_archive(229, true), 2);
+    fn ground_archive_seasons() {
+        // 231 (boschi, Temperate): base 302, inverno 303, pioggia 304.
+        assert_eq!(ground_archive(231, Summer), 302);
+        assert_eq!(ground_archive(231, Winter), 303);
+        assert_eq!(ground_archive(231, Rain), 304);
+
+        // 226 (montagna): base 102, inverno 103, pioggia 104.
+        assert_eq!(ground_archive(226, Summer), 102);
+        assert_eq!(ground_archive(226, Winter), 103);
+        assert_eq!(ground_archive(226, Rain), 104);
+
+        // 228 (palude): base 402, inverno 403, pioggia 404.
+        assert_eq!(ground_archive(228, Winter), 403);
+
+        // 224/225 e 229 (Desert): niente inverno.
+        assert_eq!(ground_archive(224, Summer), 2);
+        assert_eq!(ground_archive(224, Winter), 2);
+        assert_eq!(ground_archive(229, Winter), 2);
+
+        // La pioggia NON è esclusa per il deserto da `apply_climate` (solo
+        // l'inverno lo è). Se TEXTURE.004 non esiste nei BSA, il chiamante
+        // emette un warning e il tile non viene spawnato.
+        assert_eq!(ground_archive(224, Rain), 4);
     }
 }

@@ -95,6 +95,14 @@ pub fn build_city_buildings(
         dist_x < 22.0 || (z <= road_z_north && dist_x < 42.0)
     };
 
+    let model_debug = std::env::var_os("DF_MODEL_DEBUG").is_some();
+    let block_debug = std::env::var("DF_MODEL_DEBUG_BLOCK").ok().map(|v| v.to_ascii_uppercase());
+    // DF_MODEL_DUMP=750,753: stampa una volta sola l'intera geometria di quei modelli.
+    let dump_ids: Vec<u32> = std::env::var("DF_MODEL_DUMP")
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    let mut dumped: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
     for by in 0..bh {
         for bx in 0..bw {
             let Some(name) = location.block_names.get(by * location.width + bx) else { continue };
@@ -193,8 +201,27 @@ pub fn build_city_buildings(
                     stats.objects += 1;
 
                     let (model, fp, btex) = match model_cache.entry(pm.model_id).or_insert_with(|| {
-                        let raw = arch3d_bsa.get_by_id(pm.model_id)?;
-                        let m = Arch3dModel::parse(pm.model_id, raw).ok()?;
+                        // Con DF_MODEL_DEBUG=1 dice perche' un modello viene scartato (una sola
+                        // volta per id: il risultato e' in cache): assente dal BSA o parse fallito.
+                        let Some(raw) = arch3d_bsa.get_by_id(pm.model_id) else {
+                            if model_debug {
+                                eprintln!("ARCH3D modello {}: assente da ARCH3D.BSA (blocco {name})", pm.model_id);
+                            }
+                            return None;
+                        };
+                        let m = match Arch3dModel::parse(pm.model_id, raw) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                if model_debug {
+                                    eprintln!(
+                                        "ARCH3D modello {}: parse fallito ({e}), {} byte (blocco {name})",
+                                        pm.model_id,
+                                        raw.len()
+                                    );
+                                }
+                                return None;
+                            }
+                        };
                         let fp = Footprint::from_model(&m);
                         let btex = m.building_textures();
                         Some((m, fp, btex))
@@ -205,6 +232,43 @@ pub fn build_city_buildings(
                             continue;
                         }
                     };
+
+                    if dump_ids.contains(&pm.model_id) && dumped.insert(pm.model_id) {
+                        // Un file per modello nella cartella di lavoro (non dipende dalla redirezione
+                        // dei log, che mescola le righe di piu' thread).
+                        let path = format!("df_model_{}.txt", pm.model_id);
+                        match std::fs::write(&path, model.dump()) {
+                            Ok(()) => eprintln!("DUMP modello {} scritto in {path} (blocco {name})", pm.model_id),
+                            Err(e) => eprintln!("DUMP modello {}: impossibile scrivere {path}: {e}", pm.model_id),
+                        }
+                    }
+
+                    // DF_MODEL_DEBUG_BLOCK=GRVE: elenca ogni modello piazzato nei blocchi il cui nome
+                    // contiene il testo (id, posizione, vertici, facce e texture) per confrontarlo
+                    // con quello che si vede in gioco.
+                    if let Some(filter) = block_debug.as_deref() {
+                        if upper_name.contains(filter) {
+                            let mut by_len = std::collections::BTreeMap::<usize, usize>::new();
+                            let mut textures: Vec<(u16, u8)> = Vec::new();
+                            for f in &model.faces {
+                                *by_len.entry(f.vertex_indices.len()).or_default() += 1;
+                                let t = (f.texture_archive, f.texture_record);
+                                if !textures.contains(&t) && textures.len() < 8 {
+                                    textures.push(t);
+                                }
+                            }
+                            eprintln!(
+                                "BLOCCO {name}: modello {} a ({:.1}, {:.1}) rot {:.0} | {} vertici, {} facce (punti per faccia: {by_len:?}) | texture {textures:?} | edificio: {}",
+                                pm.model_id,
+                                pm.x,
+                                pm.n,
+                                pm.rotation_deg,
+                                model.vertices.len(),
+                                model.faces.len(),
+                                pm.is_building,
+                            );
+                        }
+                    }
 
                     let px = bx0 + pm.x * DF_UNIT;
                     let pz = -(bz0 + pm.n * DF_UNIT);
@@ -419,14 +483,70 @@ pub fn build_city_buildings(
                     .iter()
                     .map(|v| v[1])
                     .fold(f32::MAX, f32::min);
-                    let final_y = gy - min_model_y;
-                    builder.add_arch3d_instance(&model, rot, [px, final_y, pz]);
+                    // Oggetti con quota (YPos) o inclinati (travi, pali, insegne): come in DFU il modello
+                    // sta con l'origine a terreno + quota, ruotato su Z, X e Y; non si appoggia la base
+                    // a terra. Disattivabile con DF_OBJ_FULL_TRANSFORM=0 (comportamento di prima).
+                    let tilted = pm.rotation_x_deg.abs() > 0.5 || pm.rotation_z_deg.abs() > 0.5;
+                    let full = obj_full_transform() && (tilted || pm.y != 0);
+                    let final_y = if full {
+                        gy + obj_y_sign() * pm.y as f32 * DF_UNIT
+                    } else {
+                        gy - min_model_y
+                    };
+                    if dump_ids.contains(&pm.model_id) {
+                        // DF_MODEL_DUMP: dove finisce davvero l'istanza (mondo, altezza terreno, ingombro).
+                        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                        for v in &model.vertices {
+                            for k in 0..3 {
+                                lo[k] = lo[k].min(v[k]);
+                                hi[k] = hi[k].max(v[k]);
+                            }
+                        }
+                        eprintln!(
+                            "PIAZZATO {name}: modello {} -> mondo ({px:.1}, {final_y:.2}, {pz:.1}) rot {rot:.0} | terreno {gy:.2}, y minima modello {min_model_y:.2} | ingombro x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] m",
+                            pm.model_id, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
+                        );
+                        eprintln!(
+                            "   grezzi: y {} | rot Y {:.1} X {:.1} Z {:.1} gradi | usata trasformazione completa: {full} | tail(+46..+66) {:?}",
+                            pm.y, pm.rotation_deg, pm.rotation_x_deg, pm.rotation_z_deg, pm.tail,
+                        );
+                    }
+                    if full {
+                        builder.add_arch3d_instance_tilted(
+                            &model,
+                            rot,
+                            pm.rotation_x_deg * tilt_sign(),
+                            pm.rotation_z_deg * tilt_sign(),
+                            [px, final_y, pz],
+                        );
+                    } else {
+                        builder.add_arch3d_instance(&model, rot, [px, final_y, pz]);
+                    }
                     stats.built += 1;
                 }
         }
     }
 
     (builder, stats)
+}
+
+/// `DF_OBJ_FULL_TRANSFORM=0` ripristina il posizionamento di prima (base a terra, solo rotazione Y).
+fn obj_full_transform() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("DF_OBJ_FULL_TRANSFORM").map_or(true, |v| v != "0"))
+}
+
+/// Segno della quota degli oggetti (`DF_OBJ_Y_SIGN`, default -1: in DF la Y cresce verso il basso).
+fn obj_y_sign() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("DF_OBJ_Y_SIGN").ok().and_then(|v| v.parse().ok()).unwrap_or(-1.0))
+}
+
+/// Moltiplicatore del verso delle inclinazioni X/Z (`DF_TILT_SIGN`, default 1: segue gia' il
+/// segno di `DF_ROTATION_SIGN` applicato in `placed_models`).
+fn tilt_sign() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("DF_TILT_SIGN").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
 }
 
 fn place_procedural(

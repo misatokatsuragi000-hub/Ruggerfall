@@ -104,12 +104,7 @@ pub fn assemble_city_tilemap(
             }
         }
     }
-    for y in rect.min_y..rect.max_y {
-        let row: Vec<String> = (rect.min_x..rect.max_x)
-        .map(|x| format!("{:02X}", preset[y * 128 + x]))
-        .collect();
-        eprintln!("{}", row.join(" "));
-    }
+
     (preset, rect)
 }
 

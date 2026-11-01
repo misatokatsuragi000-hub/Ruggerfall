@@ -1,4 +1,38 @@
 //! Parser dei blocchi RMB di BLOCKS.BSA, secondo la specifica UESP.
+//!
+//! ## Fix 1: `n_of` per i misc objects
+//!
+//! I misc objects (`o.block = None`) sono quegli `objects_3d` che non
+//! appartengono a nessun subrecord. La formula originale
+//!
+//! ```ignore
+//! if z_raw < 0.0 { BLOCK_UNITS + z_raw } else { BLOCK_UNITS - z_raw }
+//! ```
+//!
+//! è **simmetrica**: `z_raw = +500` e `z_raw = -500` danno entrambi
+//! `4096 - 500 = 3596`. Due pali posti simmetricamente rispetto al centro
+//! del blocco finiscono nello **stesso punto**, spostati di decine di metri.
+//!
+//! Il fix usa `z_raw.abs()` (default) oppure una delle altre interpretazioni,
+//! selezionabili con `DF_MISC_Z_MODE`:
+//!
+//! - `abs` (default): `z.abs()` — simmetrico ma "non perde" il segno
+//! - `center`: `z + BLOCK_UNITS/2` — z relativo al centro del blocco
+//! - `flip`: `BLOCK_UNITS - z` — z = distanza dal nord, invertita
+//! - `raw`: `z` — z già "distanza dal sud"
+//! - `orig`: formula originale (simmetrica, bug)
+//!
+//! ## Fix 2: `rotation_sign` configurabile
+//!
+//! `ROTATION_SIGN = -1.0` è quello che serve alle case (che sono a posto
+//! e non vogliamo rompere). Ma se alcuni pali sembrano "ruotati nel verso
+//! opposto" rispetto all'edificio, si può provare `DF_ROTATION_SIGN=1`.
+//! Il default resta `-1.0` (comportamento attuale preservato).
+//!
+//! La variabile viene letta una volta sola con `OnceLock`, quindi non c'è
+//! overhead per ogni `placed_models`.
+
+use std::sync::OnceLock;
 
 pub const RMB_HEADER_LEN: usize = 6776;
 const OFF_BLOCK_POS: usize = 3;
@@ -18,6 +52,82 @@ pub const Z_FROM_NORTH_EDGE: bool = true;
 pub const ROTATION_SIGN: f32 = -1.0;
 const BLOCK_UNITS: f32 = 4096.0;
 pub const DA_TO_DEG: f32 = 360.0 / 2048.0;
+
+/// Segno di rotazione attivo. Di default `ROTATION_SIGN` (-1.0), ma può
+/// essere sovrascritto con `DF_ROTATION_SIGN` (es. `DF_ROTATION_SIGN=1`).
+///
+/// Viene letto **una volta sola** (`OnceLock`), quindi non c'è overhead
+/// per ogni `placed_models` (che è chiamato migliaia di volte per città).
+///
+/// Se le case si rompono con `DF_ROTATION_SIGN=1`, il segno corretto per
+/// il tuo asset è `-1.0` (default) e il problema dei pali è altrove.
+pub fn rotation_sign() -> f32 {
+    static SIGN: OnceLock<f32> = OnceLock::new();
+    *SIGN.get_or_init(|| {
+        std::env::var("DF_ROTATION_SIGN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(ROTATION_SIGN)
+    })
+}
+
+/// Modalità di calcolo della `n` (distanza dal bordo sud) per i misc objects
+/// (`o.block = None`). Vedi il commento in testa al file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MiscZMode {
+    /// `z.abs()` — simmetrico ma "esplicito". **Default** (Fix 1).
+    Abs,
+    /// `z + BLOCK_UNITS/2` — z relativo al centro del blocco.
+    Center,
+    /// `BLOCK_UNITS - z` — z = distanza dal nord, senza abs.
+    Flip,
+    /// `z` — z già "distanza dal sud".
+    Raw,
+    /// Formula originale: `if z < 0 { BLOCK_UNITS + z } else { BLOCK_UNITS - z }`.
+    /// Simmetrica, è il bug che Fix 1 corregge.
+    Orig,
+}
+
+/// Modalità attiva per `n_of` dei misc objects.
+///
+/// Letta da `DF_MISC_Z_MODE` una volta sola (`OnceLock`), con default `Abs`.
+/// Valori accettati: `abs` (default), `center`, `flip`, `raw`, `orig`.
+fn misc_z_mode() -> MiscZMode {
+    static MODE: OnceLock<MiscZMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("DF_MISC_Z_MODE").ok().as_deref() {
+        Some("center") => MiscZMode::Center,
+                      Some("flip") => MiscZMode::Flip,
+                      Some("raw") => MiscZMode::Raw,
+                      Some("orig") => MiscZMode::Orig,
+                      _ => MiscZMode::Abs,
+    })
+}
+
+fn n_of_misc(z_raw: f32, mode: MiscZMode) -> f32 {
+    match mode {
+        MiscZMode::Abs => z_raw.abs(),
+        MiscZMode::Center => z_raw + BLOCK_UNITS * 0.5,
+        MiscZMode::Flip => {
+            if Z_FROM_NORTH_EDGE {
+                BLOCK_UNITS - z_raw
+            } else {
+                z_raw
+            }
+        }
+        MiscZMode::Raw => z_raw,
+        MiscZMode::Orig => {
+            if Z_FROM_NORTH_EDGE {
+                if z_raw < 0.0 {
+                    BLOCK_UNITS + z_raw
+                } else {
+                    BLOCK_UNITS - z_raw
+                }
+            } else {
+                z_raw.abs()
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RmbBuildingData {
@@ -75,6 +185,12 @@ pub struct RmbObject3D {
     pub z: i32,
     pub pivot: [i32; 3],
     pub rotation_y_deg: f32,
+    /// Rotazione attorno a X (inclinazione), stesso formato di `rotation_y_deg` (letta a +48).
+    pub rotation_x_deg: f32,
+    /// Rotazione attorno a Z (inclinazione) (letta a +56).
+    pub rotation_z_deg: f32,
+    /// Byte grezzi 46..66 del record come 10 i16, per diagnosticare i campi non ancora decodificati.
+    pub tail: [i16; 10],
     pub block: Option<u8>,
 }
 
@@ -86,6 +202,10 @@ pub struct PlacedModel {
     pub n: f32,
     pub y: i32,
     pub rotation_deg: f32,
+    /// Inclinazioni (gradi, stesso segno di `rotation_deg`): travi, insegne e pali orizzontali.
+    pub rotation_x_deg: f32,
+    pub rotation_z_deg: f32,
+    pub tail: [i16; 10],
     pub is_building: bool,
     pub subrecord: Option<u8>,
 }
@@ -132,6 +252,9 @@ fn parse_model(d: &[u8], p: usize, block: Option<u8>) -> RmbObject3D {
         y: i32_at(d, p + 40),
         z: i32_at(d, p + 44),
         rotation_y_deg: i16::from_le_bytes([d[p + 52], d[p + 53]]) as f32 * DA_TO_DEG,
+        rotation_x_deg: i16::from_le_bytes([d[p + 48], d[p + 49]]) as f32 * DA_TO_DEG,
+        rotation_z_deg: i16::from_le_bytes([d[p + 56], d[p + 57]]) as f32 * DA_TO_DEG,
+        tail: std::array::from_fn(|k| i16::from_le_bytes([d[p + 46 + k * 2], d[p + 47 + k * 2]])),
         block,
     }
 }
@@ -305,19 +428,15 @@ impl RmbBlock {
     }
 
     /// Posizioni nel blocco di tutti gli oggetti 3D.
+    ///
+    /// Vedi `n_of_misc` e `rotation_sign` per il comportamento configurabile.
     pub fn placed_models(&self) -> Vec<PlacedModel> {
-        // Conversione Z consistente: calcola sempre la distanza dal bordo Sud (0..4096)
-        let n_of = |z_raw: f32| -> f32 {
-            if Z_FROM_NORTH_EDGE {
-                if z_raw < 0.0 {
-                    BLOCK_UNITS + z_raw
-                } else {
-                    BLOCK_UNITS - z_raw
-                }
-            } else {
-                z_raw.abs()
-            }
-        };
+        let sign = rotation_sign();
+        let z_mode = misc_z_mode();
+
+        // Per i misc objects, `n_of_misc` sceglie come interpretare `o.z`.
+        // Il default (`Abs`) è il Fix 1.
+        let n_of = |z_raw: f32| -> f32 { n_of_misc(z_raw, z_mode) };
 
         self.objects_3d
         .iter()
@@ -328,7 +447,10 @@ impl RmbBlock {
                 x: o.x as f32,
                 n: n_of(o.z as f32),
              y: o.y,
-             rotation_deg: o.rotation_y_deg * ROTATION_SIGN,
+             rotation_deg: o.rotation_y_deg * sign,
+             rotation_x_deg: o.rotation_x_deg * sign,
+             rotation_z_deg: o.rotation_z_deg * sign,
+             tail: o.tail,
              is_building: false,
              subrecord: None,
             },
@@ -339,7 +461,7 @@ impl RmbBlock {
                 } else {
                     (s.z as f32).abs()
                 };
-                let phi = (s.rotation_deg * ROTATION_SIGN).to_radians();
+                let phi = (s.rotation_deg * sign).to_radians();
                 let (sn, cs) = phi.sin_cos();
                 let lx = o.x as f32;
                 let ln = if Z_FROM_NORTH_EDGE { o.z as f32 } else { -(o.z as f32) };
@@ -349,12 +471,53 @@ impl RmbBlock {
                     x: s.x as f32 + lx * cs - ln * sn,
                     n: anchor_n + lx * sn + ln * cs,
                     y: o.y,
-                    rotation_deg: (s.rotation_deg + o.rotation_y_deg) * ROTATION_SIGN,
+                    rotation_deg: (s.rotation_deg + o.rotation_y_deg) * sign,
+             rotation_x_deg: o.rotation_x_deg * sign,
+             rotation_z_deg: o.rotation_z_deg * sign,
+             tail: o.tail,
              is_building: true,
              subrecord: Some(i),
                 }
             }
         })
         .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn misc_z_modes_are_distinct() {
+        // Verifica che le modalità producano valori diversi per z=+500 e z=-500,
+        // tranne `Orig` che è proprio il bug da correggere.
+        let pos = 500.0f32;
+        let neg = -500.0f32;
+
+        // `Abs`: simmetrico ma esplicito (Fix 1).
+        assert_eq!(n_of_misc(pos, MiscZMode::Abs), 500.0);
+        assert_eq!(n_of_misc(neg, MiscZMode::Abs), 500.0);
+
+        // `Center`: non simmetrico, z relativo al centro.
+        assert_eq!(n_of_misc(pos, MiscZMode::Center), 500.0 + 2048.0);
+        assert_eq!(n_of_misc(neg, MiscZMode::Center), -500.0 + 2048.0);
+
+        // `Flip`: non simmetrico, z = distanza dal nord.
+        assert_eq!(n_of_misc(pos, MiscZMode::Flip), 4096.0 - 500.0);
+        assert_eq!(n_of_misc(neg, MiscZMode::Flip), 4096.0 - (-500.0));
+
+        // `Raw`: non simmetrico, z = distanza dal sud.
+        assert_eq!(n_of_misc(pos, MiscZMode::Raw), 500.0);
+        assert_eq!(n_of_misc(neg, MiscZMode::Raw), -500.0);
+
+        // `Orig`: simmetrico (il bug).
+        assert_eq!(n_of_misc(pos, MiscZMode::Orig), 4096.0 - 500.0);
+        assert_eq!(n_of_misc(neg, MiscZMode::Orig), 4096.0 + (-500.0));
+        // I due valori sono identici: è il bug che Fix 1 corregge con Abs.
+        assert_eq!(
+            n_of_misc(pos, MiscZMode::Orig),
+                   n_of_misc(neg, MiscZMode::Orig)
+        );
     }
 }

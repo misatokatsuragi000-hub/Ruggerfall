@@ -15,6 +15,7 @@ pub const UNSET_TILE: u8 = 0xFF;
 const MAX_WORLD_TILE_COORD_Z: i32 = 64000;
 const SEED: i32 = 417028;
 
+#[allow(dead_code)]
 const WATER: u8 = 0;
 const DIRT: u8 = 1;
 const GRASS: u8 = 2;
@@ -159,8 +160,9 @@ fn generate_tile_data(
         let hy = (hdim as f32 * (y as f32 / TILE_DATA_DIM as f32)).clamp(0.0, (hdim - 1) as f32) as usize;
         let height = samples.get(hx, hy) * MAX_TERRAIN_HEIGHT;
 
+        // Fondale: tile di terra (la superficie è un piano d'acqua separato).
         if height <= OCEAN_ELEVATION {
-            *out = WATER;
+            *out = DIRT;
             continue;
         }
         if height <= BEACH_ELEVATION + jitter(index as u32) {

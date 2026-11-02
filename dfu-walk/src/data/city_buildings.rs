@@ -17,6 +17,17 @@
 //! Ora le gilde ei templi procedurali si applicano **solo** agli edifici che la
 //! mappa stessa riconosce come tali (`is_guild_sub` / `is_temple_sub`). Il
 //! resto resta ARCH3D originale.
+//!
+//! ## Mura, bastioni e sgombero della via reale
+//!
+//! - I bastioni d'angolo del perimetro (`bx == 0`/`bw-1` e `by == 0`/`bh-1`)
+//!   vengono ingranditi (1.8× in pianta, altezza ≥ 35 m) e classificati come
+//!   `WallKind::Tower`.
+//! - Le mura normali di Daggerfall hanno altezza minima 18 m.
+//! - La porta sud ha altezza minima 18 m.
+//! - Gli edifici (`pm.is_building`) che cadono sulla via reale (avenue) vengono
+//!   scartati, per evitare che case/gilde/templi si sovrappongano al viale
+//!   centrale. Il viale è largo 12 m (22 m a nord).
 use std::collections::HashMap;
 
 use super::arch3d::{Arch3dModel, BuildingTextures};
@@ -84,6 +95,8 @@ pub fn build_city_buildings(
     -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5) + 32.0;
 
     let avenue_active = PROCEDURAL_LANDMARKS && is_daggerfall_city;
+    // Larghezza del viale reale: 12 m (22 m a nord del palazzo). Gli edifici che
+    // cadono dentro questa fascia vengono scartati per non finire sulla strada.
     let is_on_avenue_strict = |x: f32, z: f32| -> bool {
         if !avenue_active {
             return false;
@@ -92,16 +105,20 @@ pub fn build_city_buildings(
             return false;
         }
         let dist_x = (x - road_x).abs();
-        dist_x < 22.0 || (z <= road_z_north && dist_x < 42.0)
+        dist_x < 12.0 || (z <= road_z_north && dist_x < 22.0)
     };
 
     let model_debug = std::env::var_os("DF_MODEL_DEBUG").is_some();
     let block_debug = std::env::var("DF_MODEL_DEBUG_BLOCK").ok().map(|v| v.to_ascii_uppercase());
     // DF_MODEL_DUMP=750,753: stampa una volta sola l'intera geometria di quei modelli.
     let dump_ids: Vec<u32> = std::env::var("DF_MODEL_DUMP")
-        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
-        .unwrap_or_default();
+    .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+    .unwrap_or_default();
     let mut dumped: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // DF_SUBREC_DEBUG=GENRAS02: dati grezzi dei sottoblocchi (edifici) e dei loro oggetti 3D, con
+    // dove finiscono nel blocco. Serve a capire se pali e travi seguono la posizione dell'edificio.
+    let subrec_debug = std::env::var("DF_SUBREC_DEBUG").ok().map(|v| v.to_ascii_uppercase());
+    let mut subrec_dumped: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for by in 0..bh {
         for bx in 0..bw {
@@ -197,6 +214,47 @@ pub fn build_city_buildings(
                 // veniva invocata più volte (una per il landmark_pm_index rimosso,
                 // una per il loop). `pm_idx` non serve più.
                 let placed_models = rmb.placed_models();
+                if let Some(filter) = subrec_debug.as_deref() {
+                    if upper_name.contains(filter) && subrec_dumped.insert(upper_name.clone()) {
+                        eprintln!("SUBREC {name}: {} sottoblocchi, {} oggetti 3D | PROCEDURAL_HOUSES={PROCEDURAL_HOUSES} PROCEDURAL_WALLS={PROCEDURAL_WALLS}", rmb.subrecords.len(), rmb.objects_3d.len());
+                        for (i, sr) in rmb.subrecords.iter().enumerate() {
+                            let b = rmb.buildings.get(i);
+                            eprintln!(
+                                "  sub {i}: ancora x {} z {} rot {:.1} gradi | edificio tipo {:?} fazione {:?} qualita' {:?}",
+                                sr.x, sr.z, sr.rotation_deg, b.map(|b| b.building_type), b.map(|b| b.faction_id), b.map(|b| b.quality),
+                            );
+                        }
+                        for (k, (o, pm)) in rmb.objects_3d.iter().zip(placed_models.iter()).enumerate() {
+                            // Ingombro del modello (metri, nel suo riferimento) e posizione locale in metri:
+                            // permette di confrontare dove stanno pali e casa dentro lo stesso sottoblocco.
+                            let bb = arch3d_bsa
+                                .get_by_id(o.model_id)
+                                .and_then(|raw| Arch3dModel::parse(o.model_id, raw).ok())
+                                .map(|m| {
+                                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                                    for v in &m.vertices {
+                                        for a in 0..3 {
+                                            lo[a] = lo[a].min(v[a]);
+                                            hi[a] = hi[a].max(v[a]);
+                                        }
+                                    }
+                                    (lo, hi)
+                                });
+                            if let Some((lo, hi)) = bb {
+                                eprintln!(
+                                    "           ingombro modello x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] m | locale in m: x {:.2} y {:.2} z {:.2}",
+                                    lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
+                                    o.x as f32 * DF_UNIT, o.y as f32 * DF_UNIT, o.z as f32 * DF_UNIT,
+                                );
+                            }
+                            eprintln!(
+                                "  ogg {k:>3}: sub {:?} modello {} tipo {} | locale x {} y {} z {} | pivot {:?} | rot Y {:.1} X {:.1} Z {:.1} | -> blocco x {:.0} n {:.0} rot {:.1}",
+                                o.block, o.model_id, o.object_type, o.x, o.y, o.z, o.pivot,
+                                o.rotation_y_deg, o.rotation_x_deg, o.rotation_z_deg, pm.x, pm.n, pm.rotation_deg,
+                            );
+                        }
+                    }
+                }
                 for pm in placed_models.iter() {
                     stats.objects += 1;
 
@@ -211,16 +269,16 @@ pub fn build_city_buildings(
                         };
                         let m = match Arch3dModel::parse(pm.model_id, raw) {
                             Ok(m) => m,
-                            Err(e) => {
-                                if model_debug {
-                                    eprintln!(
-                                        "ARCH3D modello {}: parse fallito ({e}), {} byte (blocco {name})",
-                                        pm.model_id,
-                                        raw.len()
-                                    );
-                                }
-                                return None;
-                            }
+                                                                                                Err(e) => {
+                                                                                                    if model_debug {
+                                                                                                        eprintln!(
+                                                                                                            "ARCH3D modello {}: parse fallito ({e}), {} byte (blocco {name})",
+                                                                                                                  pm.model_id,
+                                                                                                                  raw.len()
+                                                                                                        );
+                                                                                                    }
+                                                                                                    return None;
+                                                                                                }
                         };
                         let fp = Footprint::from_model(&m);
                         let btex = m.building_textures();
@@ -259,13 +317,13 @@ pub fn build_city_buildings(
                             }
                             eprintln!(
                                 "BLOCCO {name}: modello {} a ({:.1}, {:.1}) rot {:.0} | {} vertici, {} facce (punti per faccia: {by_len:?}) | texture {textures:?} | edificio: {}",
-                                pm.model_id,
-                                pm.x,
-                                pm.n,
-                                pm.rotation_deg,
-                                model.vertices.len(),
-                                model.faces.len(),
-                                pm.is_building,
+                                      pm.model_id,
+                                      pm.x,
+                                      pm.n,
+                                      pm.rotation_deg,
+                                      model.vertices.len(),
+                                      model.faces.len(),
+                                      pm.is_building,
                             );
                         }
                     }
@@ -280,17 +338,43 @@ pub fn build_city_buildings(
                         (px + f.cx * c + f.cz * s, pz - f.cx * s + f.cz * c)
                     });
 
+                    // --- Sgombero della via reale ---
+                    // Se è un edificio (non un muro o un flat) e cade dentro la
+                    // fascia del viale, saltalo: case, gilde e templi non devono
+                    // sovrapporsi alla strada principale di Daggerfall.
+                    if pm.is_building && is_on_avenue_strict(wx, wz) {
+                        stats.skipped += 1;
+                        continue;
+                    }
+                    // ---------------------------------
+
                     // Mura procedurali
                     if is_wall_block && PROCEDURAL_WALLS && !is_special_block {
-                        if let Some(wfp) = fp.as_ref().map(wall_footprint) {
+                        if let Some(mut wfp) = fp.as_ref().map(wall_footprint) {
                             let is_wall_model = pm.model_id == 446 || classify_wall(&wfp).is_some();
+
+                            // --- Bastioni angolari e mura alte a Daggerfall ---
+                            // I bastioni d'angolo del perimetro diventano più larghi,
+                            // profondi e alti; le mura normali di Daggerfall vengono
+                            // alzate per dare un aspetto più imponente al viale.
+                            let is_corner = (bx == 0 || bx == bw.saturating_sub(1))
+                            && (by == 0 || by == bh.saturating_sub(1));
+
+                            if is_corner {
+                                wfp.width *= 1.8;
+                                wfp.depth *= 1.8;
+                                wfp.height = wfp.height.max(35.0);
+                            } else if is_daggerfall_city {
+                                wfp.height = wfp.height.max(18.0);
+                            }
+                            // ----------------------------------------------
 
                             if is_south_gate_block && is_wall_model {
                                 if !south_gate_spawned {
                                     let mut gate_fp = wfp;
                                     gate_fp.width = BLOCK_SIZE_M;
                                     gate_fp.depth = gate_fp.depth.max(3.0);
-                                    gate_fp.height = gate_fp.height.max(11.0);
+                                    gate_fp.height = gate_fp.height.max(18.0);
                                     let seed = seed_for(
                                         pm.model_id,
                                         gx as i32 * 4096 + 2048,
@@ -308,6 +392,8 @@ pub fn build_city_buildings(
 
                             let maybe_wkind = if pm.model_id == 446 {
                                 Some(WallKind::Gate)
+                            } else if is_corner {
+                                Some(WallKind::Tower)
                             } else {
                                 classify_wall(&wfp)
                             };
@@ -373,13 +459,10 @@ pub fn build_city_buildings(
                     && pm.model_id != 74
                     && fp.as_ref().map_or(false, |f| f.classify().is_some());
 
-                    // Case procedurali
+                    // Case procedurali (il check avenue è già stato fatto sopra,
+                    // prima delle mura: qui non serve ripeterlo).
                     if PROCEDURAL_HOUSES && is_procedural_house_candidate {
                         let Some(fp_ref) = fp.as_ref() else { continue };
-                        if is_on_avenue_strict(wx, wz) {
-                            stats.skipped += 1;
-                            continue;
-                        }
 
                         let kind = fp_ref.classify().unwrap();
                         let front = choose_front_side(
@@ -489,7 +572,7 @@ pub fn build_city_buildings(
                     let tilted = pm.rotation_x_deg.abs() > 0.5 || pm.rotation_z_deg.abs() > 0.5;
                     let full = obj_full_transform() && (tilted || pm.y != 0);
                     let final_y = if full {
-                        gy + obj_y_sign() * pm.y as f32 * DF_UNIT
+                        gy + obj_y_sign() * pm.y as f32 * DF_UNIT + obj_y_offset()
                     } else {
                         gy - min_model_y
                     };
@@ -504,11 +587,11 @@ pub fn build_city_buildings(
                         }
                         eprintln!(
                             "PIAZZATO {name}: modello {} -> mondo ({px:.1}, {final_y:.2}, {pz:.1}) rot {rot:.0} | terreno {gy:.2}, y minima modello {min_model_y:.2} | ingombro x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] m",
-                            pm.model_id, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
+                                  pm.model_id, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
                         );
                         eprintln!(
-                            "   grezzi: y {} | rot Y {:.1} X {:.1} Z {:.1} gradi | usata trasformazione completa: {full} | tail(+46..+66) {:?}",
-                            pm.y, pm.rotation_deg, pm.rotation_x_deg, pm.rotation_z_deg, pm.tail,
+                            "   grezzi: y {} ({:.2} m) | centro del modello a {:.2} m dal terreno | rot Y {:.1} X {:.1} Z {:.1} gradi | trasformazione completa: {full} | tail(+46..+66) {:?}",
+                                  pm.y, pm.y as f32 * DF_UNIT, final_y - gy, pm.rotation_deg, pm.rotation_x_deg, pm.rotation_z_deg, pm.tail,
                         );
                     }
                     if full {
@@ -516,8 +599,8 @@ pub fn build_city_buildings(
                             &model,
                             rot,
                             pm.rotation_x_deg * tilt_sign(),
-                            pm.rotation_z_deg * tilt_sign(),
-                            [px, final_y, pz],
+                                                           pm.rotation_z_deg * tilt_sign(),
+                                                           [px, final_y, pz],
                         );
                     } else {
                         builder.add_arch3d_instance(&model, rot, [px, final_y, pz]);
@@ -540,6 +623,13 @@ fn obj_full_transform() -> bool {
 fn obj_y_sign() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("DF_OBJ_Y_SIGN").ok().and_then(|v| v.parse().ok()).unwrap_or(-1.0))
+}
+
+/// Spostamento verticale in metri applicato agli oggetti con quota (`DF_OBJ_Y_OFFSET`, default 0).
+/// Serve a calibrare a occhio la quota dei pali: per esempio -3.2 li abbassa di un piano.
+fn obj_y_offset() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("DF_OBJ_Y_OFFSET").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
 }
 
 /// Moltiplicatore del verso delle inclinazioni X/Z (`DF_TILT_SIGN`, default 1: segue gia' il

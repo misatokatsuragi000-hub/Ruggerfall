@@ -61,6 +61,14 @@ pub const DA_TO_DEG: f32 = 360.0 / 2048.0;
 ///
 /// Se le case si rompono con `DF_ROTATION_SIGN=1`, il segno corretto per
 /// il tuo asset è `-1.0` (default) e il problema dei pali è altrove.
+/// Verso della componente Z dell'offset locale degli oggetti dentro un sottoblocco (edificio):
+/// `DF_SUBREC_LZ_SIGN=-1` la specchia. Le case hanno offset (0,0), quindi non lo mostrano; pali,
+/// travi e insegne si': se finiscono sul lato sbagliato dell'edificio, provare -1.
+pub fn subrec_lz_sign() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("DF_SUBREC_LZ_SIGN").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
+}
+
 pub fn rotation_sign() -> f32 {
     static SIGN: OnceLock<f32> = OnceLock::new();
     *SIGN.get_or_init(|| {
@@ -464,7 +472,7 @@ impl RmbBlock {
                 let phi = (s.rotation_deg * sign).to_radians();
                 let (sn, cs) = phi.sin_cos();
                 let lx = o.x as f32;
-                let ln = if Z_FROM_NORTH_EDGE { o.z as f32 } else { -(o.z as f32) };
+                let ln = (if Z_FROM_NORTH_EDGE { o.z as f32 } else { -(o.z as f32) }) * subrec_lz_sign();
                 PlacedModel {
                     model_id: o.model_id,
                     object_type: o.object_type,

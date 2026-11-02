@@ -14,12 +14,15 @@ pub const OCEAN_ELEVATION: f32 = 3.4 * BASE_HEIGHT_SCALE;
 pub const BEACH_ELEVATION: f32 = 5.0 * BASE_HEIGHT_SCALE;
 const MAX_MAP_PIXEL_Y: i32 = 500;
 
+/// Profondità aggiuntiva del fondale sotto il livello del mare (m).
+/// Aumentato a 30 metri per staccare brutalmente il fondale dalla superficie
+/// e impedire lo z-fighting con il piano d'acqua.
+pub const SEABED_EXTRA_DEPTH: f32 = 30.0;
+
 /// Funzione di rumore 2D in [0, 1], sostituibile (vedi `perlin`).
 pub type NoiseFn = fn(f32, f32) -> f32;
 
 /// Campioni 0..1 (altezza / `MAX_TERRAIN_HEIGHT`) di `dim` x `dim` punti.
-/// Come in DFU il campione (riga `y`, colonna `x`) sta in `data[y + x * dim]`:
-/// è la `x` a variare più lentamente.
 #[derive(Clone, Debug)]
 pub struct HeightSamples {
     pub dim: usize,
@@ -31,7 +34,6 @@ impl HeightSamples {
         self.data[y + x * self.dim]
     }
 
-    /// Altezza in unità di DFU (campione * `MAX_TERRAIN_HEIGHT`).
     pub fn height(&self, x: usize, y: usize) -> f32 {
         self.get(x, y) * MAX_TERRAIN_HEIGHT
     }
@@ -74,7 +76,6 @@ pub fn generate_samples(
 ) -> Result<HeightSamples> {
     let div = (dim - 1) as f32 / 3.0;
 
-    // 4x4 altezze attorno al map pixel (base) e 9x9 altezze di dettaglio (rumore).
     let shm = woods.height_values_range_1dim(map_pixel_x - 2, map_pixel_y - 2, 4);
     let lhm = woods.large_height_values_range(map_pixel_x - 1, map_pixel_y, 3)?;
     let s = |x: usize, y: usize| shm[x + y * 4] as f32;
@@ -94,7 +95,6 @@ pub fn generate_samples(
         let fracx = (x as f32 - ix as f32 * div) / div;
         let fracy = (y as f32 - iy as f32 * div) / div;
 
-        // Base: interpolazione bicubica della mappa piccola.
         let x1 = cubic_interpolator(s(0, 3), s(1, 3), s(2, 3), s(3, 3), sfracx);
         let x2 = cubic_interpolator(s(0, 2), s(1, 2), s(2, 2), s(3, 2), sfracx);
         let x3 = cubic_interpolator(s(0, 1), s(1, 1), s(2, 1), s(3, 1), sfracx);
@@ -102,35 +102,42 @@ pub fn generate_samples(
         let base = cubic_interpolator(x1, x2, x3, x4, sfracy);
         let mut scaled = base * BASE_HEIGHT_SCALE;
 
-        // Maschera di rumore: interpolazione bicubica della mappa di dettaglio.
         let row = |j: usize| {
             cubic_interpolator(
                 l(ix, iy + j),
-                l(ix + 1, iy + j),
-                l(ix + 2, iy + j),
-                l(ix + 3, iy + j),
-                fracx,
+                               l(ix + 1, iy + j),
+                               l(ix + 2, iy + j),
+                               l(ix + 3, iy + j),
+                               fracx,
             )
         };
         let detail = cubic_interpolator(row(0), row(1), row(2), row(3), fracy);
         scaled += detail * NOISE_MAP_SCALE;
 
-        // Microrilievo a livello del suolo.
         let noisex = map_pixel_x * (dim as i32 - 1) + x as i32;
         let noisey = (MAX_MAP_PIXEL_Y - map_pixel_y) * (dim as i32 - 1) + y as i32;
         let low = get_noise(noise, noisex, noisey, 0.3, 0.5, 0.5, 1, 0);
         let high = get_noise(noise, noisex, noisey, 0.9, 0.5, 0.5, 1, 0);
         scaled += (low * high) * EXTRA_NOISE_SCALE;
 
+        // --- GESTIONE DELLA PROFONDITÀ DEL FONDALE ---
         if scaled < OCEAN_ELEVATION {
-            scaled = OCEAN_ELEVATION;
+            let depth = OCEAN_ELEVATION - scaled;
+
+            // Crollo rapido: entro 50 cm di profondità dall'acqua, il fondale
+            // scende di colpo a -SEABED_EXTRA_DEPTH. Questo crea una "scarpata"
+            // sottomarina che allontana istantaneamente il terreno dal pelo dell'acqua.
+            let t = (depth / 0.5).min(1.0);
+            let smooth_t = t * t * (3.0 - 2.0 * t); // curva smoothstep
+
+            let drop = SEABED_EXTRA_DEPTH * smooth_t;
+            scaled = OCEAN_ELEVATION - depth - drop;
         }
         *out = (scaled / MAX_TERRAIN_HEIGHT).clamp(0.0, 1.0);
     }
     Ok(HeightSamples { dim, data })
 }
 
-/// Come `generate_samples` con la risoluzione e il rumore predefiniti.
 pub fn generate_default_samples(woods: &WoodsFile, map_pixel_x: i32, map_pixel_y: i32) -> Result<HeightSamples> {
     generate_samples(woods, map_pixel_x, map_pixel_y, DEFAULT_HEIGHTMAP_DIM, perlin_noise)
 }
@@ -145,17 +152,19 @@ mod tests {
     }
 
     #[test]
-    fn flat_zero_world_is_clamped_to_ocean() {
+    fn flat_zero_world_stays_below_sea_level() {
         let w = WoodsFile::from_bytes("WOODS.WLD", build_woods_filled(|_, _| 0, &[], 0)).unwrap();
         let s = generate_default_samples(&w, 100, 200).unwrap();
         assert_eq!(s.data.len(), 129 * 129);
-        let ocean = OCEAN_ELEVATION / MAX_TERRAIN_HEIGHT;
-        assert!(s.data.iter().all(|&v| (v - ocean).abs() < 1e-6));
+        // il fondale ora crolla molto in basso
+        assert!(s.data.iter().all(|&v| {
+            let h = v * MAX_TERRAIN_HEIGHT;
+            h < OCEAN_ELEVATION - 20.0
+        }));
     }
 
     #[test]
     fn constant_world_without_noise_is_exact() {
-        // base 100*8 + dettaglio 50*4 = 1000
         let w = WoodsFile::from_bytes("WOODS.WLD", build_woods_filled(|_, _| 100, &[], 50)).unwrap();
         let s = generate_samples(&w, 300, 250, 129, no_noise).unwrap();
         for &v in &s.data {
@@ -179,7 +188,6 @@ mod tests {
 
     #[test]
     fn x_axis_spans_pixel_minus_one_to_pixel() {
-        // altezza = x/2: il pixel 99 vale 49, il pixel 100 vale 50.
         let w = WoodsFile::from_bytes("WOODS.WLD", build_woods_filled(|x, _| (x / 2) as u8, &[], 0)).unwrap();
         let s = generate_samples(&w, 100, 250, 129, no_noise).unwrap();
         assert!((s.height(0, 64) - 49.0 * 8.0).abs() < 0.01);

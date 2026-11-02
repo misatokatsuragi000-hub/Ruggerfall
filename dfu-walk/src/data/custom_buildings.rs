@@ -1082,7 +1082,7 @@ pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMe
     let iron_bar_c = [0.03, 0.03, 0.035, 1.0];
 
     let r = (fp.width.min(fp.depth) * 0.5).max(7.0);
-    let total_h = fp.height.max(46.0);
+    let total_h = fp.height.max(92.0);
     // Ottagono: lati piatti come nelle torri dei maghi di Daggerfall.
     let sides = 8;
 
@@ -1102,7 +1102,7 @@ pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMe
               trim_c, 2.0, angle_offset, Some(door_side_idx));
 
     // ===== CORPO A 7 PIANI =====
-    const N_FLOORS: usize = 10;
+    const N_FLOORS: usize = 20;
     let y_floor = 0.0;
     let floor_h = total_h / N_FLOORS as f32;
     let mut floor_ys = Vec::with_capacity(N_FLOORS + 1);

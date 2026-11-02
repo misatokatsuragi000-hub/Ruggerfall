@@ -109,7 +109,7 @@ pub fn build_terrain_mesh(samples: &HeightSamples, tilemap: &[u8], tile_px: (usi
                 mesh.positions.push([
                     gx as f32 * CELL_SIZE,
                     grid_height(samples, gx, gy),
-                    -(gy as f32 * CELL_SIZE),
+                                    -(gy as f32 * CELL_SIZE),
                 ]);
                 mesh.normals.push(normal_at(gx, gy));
 
@@ -120,7 +120,7 @@ pub fn build_terrain_mesh(samples: &HeightSamples, tilemap: &[u8], tile_px: (usi
                 mesh.uvs.push([(col * tw + px) / atlas_w, (row * th + py) / atlas_h]);
             }
             mesh.indices
-                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
     }
     mesh

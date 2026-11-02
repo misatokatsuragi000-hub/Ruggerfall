@@ -4,9 +4,9 @@ use super::building_gen::{BuildingMesh, Footprint, MeshPart, Rng};
 use std::f32::consts::PI;
 
 pub const WALL_MIN_HEIGHT: f32 = 1.2;
-pub const WALL_MAX_HEIGHT: f32 = 16.0;
+pub const WALL_MAX_HEIGHT: f32 = 32.0;
 pub const TOWER_MIN_HEIGHT: f32 = 1.2;
-pub const TOWER_MAX_HEIGHT: f32 = 22.0;
+pub const TOWER_MAX_HEIGHT: f32 = 36.0;
 pub const TOWER_MAX_ASPECT: f32 = 1.8;
 pub const TOWER_MIN_SIDE: f32 = 2.0;
 pub const WALL_MIN_THICKNESS: f32 = 0.7;

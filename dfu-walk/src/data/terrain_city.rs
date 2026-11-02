@@ -16,7 +16,7 @@ use super::tilemap::UNSET_TILE;
 ///   blocchi e l'interno del blocco resta com'è.
 ///
 /// Se la città appare specchiata nord/sud rispetto agli edifici, cambia questo valore.
-const TILEMAP_Y_SOUTHWARD: bool = true;
+const TILEMAP_Y_SOUTHWARD: bool = false;
 
 /// Un tile RMB è valido se il record (6 bit bassi) è < 56. Il record 0 è acqua
 /// (fossati, canali): va mantenuto. I valori > 55 indicano "blend con il terreno".

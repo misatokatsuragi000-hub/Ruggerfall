@@ -2,8 +2,9 @@
 //!
 //! Bevy 0.15 non permette di cambiare la texture del cursore di sistema, ma
 //! possiamo nasconderlo e disegnare un `ImageNode` UI che segue la posizione
-//! del mouse. Lo facciamo solo quando serve un cursore libero (dialogo,
-//! equipaggiamento): nel gioco normale il cursore è lockato e invisibile.
+//! del mouse. Lo facciamo quando serve un cursore libero: dialogo,
+//! equipaggiamento, **mappa del viaggio rapido**. Nel gioco normale il cursore
+//! è lockato e invisibile.
 //!
 //! La texture viene letta da `<textures_dir>/cursor.png` (PNG con alpha).
 //! Se il file manca o non si legge, si usa una freccia bianca procedurale.
@@ -16,14 +17,18 @@
 //! `tuning_menu::apply_menu_state` e `savegame::apply_save_menu_state`) e
 //! nascondiamo il nostro.
 //!
-//! Il controllo è doppio:
+//! Il controllo è triplo:
 //! - `menu: Option<Res<TuningMenuState>>` — se il plugin del tuning menu non è
 //!   caricato, il gioco funziona come prima.
 //! - `save_menu: Option<Res<SaveMenuState>>` — se il plugin del salvataggio
 //!   non è caricato, stessa cosa.
+//! - `fast_travel: Option<Res<FastTravelState>>` — se il plugin del viaggio
+//!   rapido non è caricato, stessa cosa. Quando la mappa è aperta vogliamo il
+//!   cursore custom sopra la mappa, che ha `GlobalZIndex(100)`; il nostro ha
+//!   `GlobalZIndex(9999)`, quindi sta sopra.
 //!
-//! Se uno dei due è `Some` e ha `open == true`, `want_custom` diventa false e
-//! non tocchiamo `window.cursor_options.visible` (lo gestisce il menu stesso).
+//! Se uno dei menu è aperto, `want_custom` diventa false e non tocchiamo
+//! `window.cursor_options.visible` (lo gestisce il menu stesso).
 
 use std::path::PathBuf;
 
@@ -64,7 +69,6 @@ impl Default for CustomCursorPlugin {
 
 impl Plugin for CustomCursorPlugin {
     fn build(&self, app: &mut App) {
-        // Il setup vuole il percorso: lo mettiamo in una risorsa interna.
         app.insert_resource(CursorSource {
             path: self.cursor_path.clone(),
         })
@@ -120,7 +124,6 @@ fn setup_custom_cursor(
     mut images: ResMut<Assets<Image>>,
     source: Res<CursorSource>,
 ) {
-    // Prova a caricare il PNG, altrimenti fallback procedurale.
     let (image, source_size) = if let Some(img) = load_cursor_image(source.path.as_ref()) {
         let size = img.texture_descriptor.size;
         (img, Vec2::new(size.width as f32, size.height as f32))
@@ -158,7 +161,11 @@ fn setup_custom_cursor(
 fn update_custom_cursor(
     dialog: Res<crate::dialog::DialogState>,
     equipment: Res<crate::equipment::EquipmentState>,
-    // Opzionale: se il plugin del menu F1 non è caricato, il gioco funziona come prima.
+    // Mappa del viaggio rapido (T). Opzionale: se il plugin non è caricato,
+    // il gioco funziona come prima.
+    fast_travel: Option<Res<crate::fast_travel::FastTravelState>>,
+    // Opzionale: se il plugin del menu F1 non è caricato, il gioco funziona
+    // come prima.
     menu: Option<Res<crate::tuning_menu::TuningMenuState>>,
     // Anche la finestra Salva/Carica (F2) usa egui, quindi ha gli stessi
     // problemi del menu F1: cursore custom coperto, cursore di sistema da
@@ -174,11 +181,13 @@ fn update_custom_cursor(
     // (F1 tuning o F2 salvataggio): bevy_egui disegna la sua finestra *dopo*
     // Bevy UI, quindi coprirebbe il nostro `ImageNode` e resteremmo senza
     // cursore visibile. In quel caso lasciamo il cursore di sistema visibile
-    // (gestito da `tuning_menu::apply_menu_state` o `savegame::apply_save_menu_state`).
+    // (gestito da `tuning_menu::apply_menu_state` o
+    // `savegame::apply_save_menu_state`).
     let tuning_open = menu.as_ref().is_some_and(|m| m.open);
     let save_open = save_menu.as_ref().is_some_and(|m| m.open);
     let egui_open = tuning_open || save_open;
-    let want_custom = (dialog.open || equipment.open) && !egui_open;
+    let fast_travel_open = fast_travel.as_ref().is_some_and(|f| f.is_open);
+    let want_custom = (dialog.open || equipment.open || fast_travel_open) && !egui_open;
 
     let Ok(mut window) = windows.get_single_mut() else { return };
     let mouse = window.cursor_position();

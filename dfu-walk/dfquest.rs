@@ -43,10 +43,10 @@ impl Message {
     /// Le varianti come testo semplice: righe unite con uno spazio, spazi ridotti a uno.
     pub fn plain_variants(&self) -> Vec<String> {
         self.variants
-            .iter()
-            .map(|lines| lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
-            .filter(|t| !t.is_empty())
-            .collect()
+        .iter()
+        .map(|lines| lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
+        .filter(|t| !t.is_empty())
+        .collect()
     }
 }
 
@@ -106,6 +106,8 @@ pub struct ItemDef {
     pub kind: String,
     /// `used 1010`: testo mostrato quando si usa l'oggetto.
     pub used_message: Option<u32>,
+    /// `range 100 to 100` (oggetti `gold`): quantita' minima e massima.
+    pub range: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -332,6 +334,14 @@ fn parse_item(tokens: &[&str]) -> Option<ItemDef> {
     if let Some(pos) = tokens.iter().position(|t| t.eq_ignore_ascii_case("used")) {
         it.used_message = tokens.get(pos + 1).and_then(|v| v.parse().ok());
     }
+    if let Some(pos) = tokens.iter().position(|t| t.eq_ignore_ascii_case("range")) {
+        let lo = tokens.get(pos + 1).and_then(|v| v.parse::<u32>().ok());
+        // `range 100 to 100`: il secondo numero e' dopo "to"
+        let hi = tokens.get(pos + 3).and_then(|v| v.parse::<u32>().ok());
+        if let Some(lo) = lo {
+            it.range = Some((lo, hi.unwrap_or(lo).max(lo)));
+        }
+    }
     Some(it)
 }
 
@@ -365,8 +375,8 @@ impl QuestScript {
         fn finish_message(
             s: &mut QuestScript,
             current: &mut Option<(Option<String>, u32)>,
-            variants: &mut Vec<Vec<String>>,
-            acc: &mut Vec<String>,
+                          variants: &mut Vec<Vec<String>>,
+                          acc: &mut Vec<String>,
         ) {
             if let Some((name, id)) = current.take() {
                 variants.push(trim_blank(std::mem::take(acc)));
@@ -457,9 +467,9 @@ impl QuestScript {
                         first if tokens.len() == 2 && is_symbol(tokens[1]) => {
                             s.tasks.push(Task {
                                 symbol: tokens[1].to_string(),
-                                kind: TaskKind::Global,
-                                global_name: Some(first.to_string()),
-                                statements: vec![],
+                                         kind: TaskKind::Global,
+                                         global_name: Some(first.to_string()),
+                                         statements: vec![],
                             });
                             task = Some(s.tasks.len() - 1);
                         }
@@ -503,12 +513,12 @@ impl QuestScript {
     /// Argomenti abilitati subito all'avvio (`dialog link for ...` nel blocco di avvio).
     pub fn startup_topics(&self) -> Vec<TopicRef> {
         self.startup
-            .iter()
-            .filter_map(|s| match Stmt::parse(s) {
-                Stmt::DialogLink(t) => Some(t),
-                _ => None,
-            })
-            .collect()
+        .iter()
+        .filter_map(|s| match Stmt::parse(s) {
+            Stmt::DialogLink(t) => Some(t),
+                    _ => None,
+        })
+        .collect()
     }
 
     /// Tutti gli argomenti su cui un PNG sa dire qualcosa (persone e luoghi con `anyInfo`).
@@ -531,11 +541,11 @@ impl QuestScript {
             QuestPhase::Active => {
                 let mut v = named("RumorsDuringQuest");
                 let extra = self
-                    .persons
-                    .iter()
-                    .filter_map(|p| p.rumors)
-                    .chain(self.places.iter().filter_map(|p| p.rumors))
-                    .filter_map(|id| self.message(id));
+                .persons
+                .iter()
+                .filter_map(|p| p.rumors)
+                .chain(self.places.iter().filter_map(|p| p.rumors))
+                .filter_map(|id| self.message(id));
                 for m in extra {
                     v.extend(m.plain_variants());
                 }
@@ -689,8 +699,8 @@ impl QuestPhase {
 
     pub fn from_key(k: &str) -> Option<QuestPhase> {
         [QuestPhase::NotStarted, QuestPhase::Active, QuestPhase::Failed, QuestPhase::Completed]
-            .into_iter()
-            .find(|p| p.key() == k)
+        .into_iter()
+        .find(|p| p.key() == k)
     }
 }
 
@@ -930,7 +940,7 @@ fn fnv1a(s: &str) -> u64 {
 
 const GENERIC_WORDS: [&str; 14] = [
     "the", "prince", "princess", "queen", "king", "lord", "lady", "sir", "castle", "fortress", "tower", "temple",
-    "dungeon", "crypt",
+"dungeon", "crypt",
 ];
 
 /// La domanda parla di `subject`? (nome intero, oppure una sua parola significativa)
@@ -1060,398 +1070,406 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = "-- Quest: C:\\QUESTS\\WORKING\\S0000001.Qbn.
--- Main story quest.
--- QuestId: 1
-Messages: 6
-Quest: S0000001
-DisplayName: Missing Prince
--- Message panels
-QRC:
+    -- Main story quest.
+    -- QuestId: 1
+    Messages: 6
+    Quest: S0000001
+    DisplayName: Missing Prince
+    -- Message panels
+    QRC:
 
-QuestorOffer:  [1000]
-<ce>                  Welcome to Sentinel, %pcf. I guess
-<ce>         you must have received my letter.
+    QuestorOffer:  [1000]
+    <ce>                  Welcome to Sentinel, %pcf. I guess
+    <ce>         you must have received my letter.
 
-RefuseQuest:  [1001]
-<ce>                         %oth, %pcf, I thought
-<ce>                 you were a hero.
+    RefuseQuest:  [1001]
+    <ce>                         %oth, %pcf, I thought
+    <ce>                 you were a hero.
 
-RumorsDuringQuest:  [1005]
-Poor Prince Lhotun is in one of his moods. He's so different from Greklith.
-<--->
-Queen Akorithi doesn't know what to do with Prince Lhotun.
+    RumorsDuringQuest:  [1005]
+    Poor Prince Lhotun is in one of his moods. He's so different from Greklith.
+    <--->
+    Queen Akorithi doesn't know what to do with Prince Lhotun.
 
-RumorsPostsuccess:  [1007]
-Prince Lhotun's mood has gotten better.
+    RumorsPostsuccess:  [1007]
+    Prince Lhotun's mood has gotten better.
 
-Message:  1013
-The Underking is supposed to be centuries old.
-<--->
-                                     <--->
-I heard he kidnapped Prince _brother_.
+    Message:  1013
+    The Underking is supposed to be centuries old.
+    <--->
+    <--->
+    I heard he kidnapped Prince _brother_.
 
-Message:  1015
-___ukcrypt_ used to be the Underking's crypt, but now it's a Sentilian prison.
-<--->
-___ukcrypt_ is just %di of here. Some say it's still a crypt of the Underking.
+    Message:  1015
+    ___ukcrypt_ used to be the Underking's crypt, but now it's a Sentilian prison.
+    <--->
+    ___ukcrypt_ is just %di of here. Some say it's still a crypt of the Underking.
 
-Message:  1016
-___ukcrypt_ is directly %di of here.
+    Message:  1016
+    ___ukcrypt_ is directly %di of here.
 
-Message:  1030
-_brother_ was a prince of Sentinel. He died years ago.
+    Message:  1030
+    _brother_ was a prince of Sentinel. He died years ago.
 
-Message:  1031
-I heard that _brother_'s former nursemaid was sent to Skyrim with a chest full of gold.
+    Message:  1031
+    I heard that _brother_'s former nursemaid was sent to Skyrim with a chest full of gold.
 
-Message:  1050
-Lord Castellian is the most powerful of Wayrest's councilors.
+    Message:  1050
+    Lord Castellian is the most powerful of Wayrest's councilors.
 
--- Symbols used in the QRC file:
---
---              %di occurs 4 times.
+    -- Symbols used in the QRC file:
+    --
+    --              %di occurs 4 times.
 
-QBN:
-Item deathCertificate letter used 1010
-Item _magicitem_ magic_item
+    QBN:
+    Item deathCertificate letter used 1010
+    Item _magicitem_ magic_item
 
-Person _lhotun_ named Prince_Lhotun atHome
-Person _brother_ face 5 faction Children male remote anyInfo 1030 rumors 1031
-Person _underking_ face 1 named The_Underking anyInfo 1013
+    Person _lhotun_ named Prince_Lhotun atHome
+    Person _brother_ face 5 faction Children male remote anyInfo 1030 rumors 1031
+    Person _underking_ face 1 named The_Underking anyInfo 1013
 
-Place _ukcrypt_ randompermanent Castle_Faallem,Fortress_Fhojum anyInfo 1015 rumors 1016
-Place _dirennitower_ permanent DirenniTowerEntry
-Place _agentplace_ remote tavern
+    Place _ukcrypt_ randompermanent Castle_Faallem,Fortress_Fhojum anyInfo 1015 rumors 1016
+    Place _dirennitower_ permanent DirenniTowerEntry
+    Place _agentplace_ remote tavern
 
-Clock _S.13_ 3.00:00 7.00:00
-Clock _1stparton_ 00:00 0 flag 17 range 0 2
-Foe _F.00_ is Knight
+    Clock _S.13_ 3.00:00 7.00:00
+    Clock _1stparton_ 00:00 0 flag 17 range 0 2
+    Foe _F.00_ is Knight
 
---	Quest start-up:
-	dialog link for location _ukcrypt_
-	prompt QuestorOffer yes yes no _no_
-	place npc _agentuk_ at _agentplace_
+    --	Quest start-up:
+    dialog link for location _ukcrypt_
+    prompt QuestorOffer yes yes no _no_
+    place npc _agentuk_ at _agentplace_
 
-_S.00_ task:
-	toting deathCertificate and _lhotun_ clicked
-	give pc _magicitem_
-	add dialog for location _dirennitower_
---added additional remove log.
-	start quest 17 17
+    _S.00_ task:
+    toting deathCertificate and _lhotun_ clicked
+    give pc _magicitem_
+    add dialog for location _dirennitower_
+    --added additional remove log.
+    start quest 17 17
 
-variable _S.01_
-yes task:
-	log 1019 step 0
-	say AcceptQuest
+    variable _S.01_
+    yes task:
+    log 1019 step 0
+    say AcceptQuest
 
-LiftedCurse _S.09_
-MedoraGotHorn _S.10_
-	toting horn and _medora_ clicked
-	end quest
-";
+    LiftedCurse _S.09_
+    MedoraGotHorn _S.10_
+    toting horn and _medora_ clicked
+    end quest
+    ";
 
-    fn script() -> QuestScript {
-        QuestScript::parse(SAMPLE).unwrap()
-    }
+fn script() -> QuestScript {
+    QuestScript::parse(SAMPLE).unwrap()
+}
 
-    #[test]
-    fn header_and_messages_are_read() {
-        let s = script();
-        assert_eq!((s.id.as_str(), s.display_name.as_str(), s.quest_id), ("S0000001", "Missing Prince", Some(1)));
-        assert_eq!(s.messages.len(), 11);
-        let offer = s.message_named("QuestorOffer").unwrap();
-        assert_eq!(offer.id, 1000);
-        assert_eq!(offer.plain_variants(), vec!["Welcome to Sentinel, %pcf. I guess you must have received my letter."]);
-        // numero senza parentesi e senza nome
-        assert_eq!(s.message(1013).unwrap().name, None);
-        // le varianti vuote (riga <---> in mezzo) si scartano
-        assert_eq!(s.message(1013).unwrap().plain_variants().len(), 2);
-        assert_eq!(s.message(1005).unwrap().plain_variants().len(), 2);
-        assert_eq!(s.message_named("rumorsduringquest").unwrap().id, 1005); // nome senza badare alle maiuscole
-        // il commento finale e l'elenco dei simboli non finiscono nell'ultimo messaggio
-        assert_eq!(s.message(1050).unwrap().plain_variants(), vec!["Lord Castellian is the most powerful of Wayrest's councilors."]);
-    }
+#[test]
+fn header_and_messages_are_read() {
+    let s = script();
+    assert_eq!((s.id.as_str(), s.display_name.as_str(), s.quest_id), ("S0000001", "Missing Prince", Some(1)));
+    assert_eq!(s.messages.len(), 11);
+    let offer = s.message_named("QuestorOffer").unwrap();
+    assert_eq!(offer.id, 1000);
+    assert_eq!(offer.plain_variants(), vec!["Welcome to Sentinel, %pcf. I guess you must have received my letter."]);
+    // numero senza parentesi e senza nome
+    assert_eq!(s.message(1013).unwrap().name, None);
+    // le varianti vuote (riga <---> in mezzo) si scartano
+    assert_eq!(s.message(1013).unwrap().plain_variants().len(), 2);
+    assert_eq!(s.message(1005).unwrap().plain_variants().len(), 2);
+    assert_eq!(s.message_named("rumorsduringquest").unwrap().id, 1005); // nome senza badare alle maiuscole
+    // il commento finale e l'elenco dei simboli non finiscono nell'ultimo messaggio
+    assert_eq!(s.message(1050).unwrap().plain_variants(), vec!["Lord Castellian is the most powerful of Wayrest's councilors."]);
+}
 
-    #[test]
-    fn definitions_are_read() {
-        let s = script();
-        assert_eq!(s.items.len(), 2);
-        assert_eq!(s.items[0], ItemDef { symbol: "deathCertificate".into(), kind: "letter".into(), used_message: Some(1010) });
-        let lhotun = s.person("_lhotun_").unwrap();
-        assert_eq!((lhotun.name.as_deref(), lhotun.any_info), (Some("Prince Lhotun"), None));
-        assert_eq!(lhotun.flags, vec!["atHome"]);
-        let brother = s.person("_brother_").unwrap();
-        assert_eq!(
-            (brother.name.clone(), brother.face, brother.faction.as_deref(), brother.gender.as_deref(), brother.any_info, brother.rumors),
-            (None, Some(5), Some("Children"), Some("male"), Some(1030), Some(1031))
-        );
-        assert_eq!(brother.flags, vec!["remote"]);
-        let crypt = s.place("_ukcrypt_").unwrap();
-        assert_eq!(crypt.kind, "randompermanent");
-        assert_eq!(crypt.targets, vec!["Castle_Faallem", "Fortress_Fhojum"]);
-        assert_eq!((crypt.any_info, crypt.rumors), (Some(1015), Some(1016)));
-        assert_eq!(s.place("_agentplace_").unwrap().targets, vec!["tavern"]);
-        assert_eq!(s.place("_dirennitower_").unwrap().targets, vec!["DirenniTowerEntry"]);
-        assert_eq!(s.clocks.len(), 2);
-        assert_eq!(s.clocks[1].spec, "00:00 0 flag 17 range 0 2");
-        assert_eq!(s.foes, vec![FoeDef { symbol: "_F.00_".into(), template: "Knight".into() }]);
-        assert!(s.unknown.is_empty(), "{:?}", s.unknown);
-    }
+#[test]
+fn definitions_are_read() {
+    let s = script();
+    assert_eq!(s.items.len(), 2);
+    assert_eq!(
+        s.items[0],
+        ItemDef {
+            symbol: "deathCertificate".into(),
+               kind: "letter".into(),
+               used_message: Some(1010),
+               range: None,
+        }
+    );
+    let lhotun = s.person("_lhotun_").unwrap();
+    assert_eq!((lhotun.name.as_deref(), lhotun.any_info), (Some("Prince Lhotun"), None));
+    assert_eq!(lhotun.flags, vec!["atHome"]);
+    let brother = s.person("_brother_").unwrap();
+    assert_eq!(
+        (brother.name.clone(), brother.face, brother.faction.as_deref(), brother.gender.as_deref(), brother.any_info, brother.rumors),
+               (None, Some(5), Some("Children"), Some("male"), Some(1030), Some(1031))
+    );
+    assert_eq!(brother.flags, vec!["remote"]);
+    let crypt = s.place("_ukcrypt_").unwrap();
+    assert_eq!(crypt.kind, "randompermanent");
+    assert_eq!(crypt.targets, vec!["Castle_Faallem", "Fortress_Fhojum"]);
+    assert_eq!((crypt.any_info, crypt.rumors), (Some(1015), Some(1016)));
+    assert_eq!(s.place("_agentplace_").unwrap().targets, vec!["tavern"]);
+    assert_eq!(s.place("_dirennitower_").unwrap().targets, vec!["DirenniTowerEntry"]);
+    assert_eq!(s.clocks.len(), 2);
+    assert_eq!(s.clocks[1].spec, "00:00 0 flag 17 range 0 2");
+    assert_eq!(s.foes, vec![FoeDef { symbol: "_F.00_".into(), template: "Knight".into() }]);
+    assert!(s.unknown.is_empty(), "{:?}", s.unknown);
+}
 
-    #[test]
-    fn startup_tasks_variables_and_globals_are_read() {
-        let s = script();
-        assert_eq!(s.startup.len(), 3);
-        assert_eq!(s.startup_topics(), vec![TopicRef { kind: TopicKind::Location, symbol: "_ukcrypt_".into() }]);
-        let kinds: Vec<(&str, TaskKind)> = s.tasks.iter().map(|t| (t.symbol.as_str(), t.kind)).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                ("_S.00_", TaskKind::Task),
-                ("_S.01_", TaskKind::Variable),
-                ("yes", TaskKind::Task),
-                ("_S.09_", TaskKind::Global),
-                ("_S.10_", TaskKind::Global),
-            ]
-        );
-        let s00 = &s.tasks[0];
-        assert_eq!(s00.statements.len(), 4); // il commento a colonna 0 non conta
-        assert_eq!(s00.stmts()[2], Stmt::AddDialog(TopicRef { kind: TopicKind::Location, symbol: "_dirennitower_".into() }));
-        assert_eq!(s00.stmts()[3], Stmt::StartQuest(vec![17, 17]));
-        assert_eq!(s.tasks[3].global_name.as_deref(), Some("LiftedCurse"));
-        assert!(s.tasks[3].statements.is_empty()); // variabile globale senza corpo
-        assert_eq!(s.tasks[4].global_name.as_deref(), Some("MedoraGotHorn"));
-        assert_eq!(s.tasks[4].stmts().last(), Some(&Stmt::EndQuest));
-    }
+#[test]
+fn startup_tasks_variables_and_globals_are_read() {
+    let s = script();
+    assert_eq!(s.startup.len(), 3);
+    assert_eq!(s.startup_topics(), vec![TopicRef { kind: TopicKind::Location, symbol: "_ukcrypt_".into() }]);
+    let kinds: Vec<(&str, TaskKind)> = s.tasks.iter().map(|t| (t.symbol.as_str(), t.kind)).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("_S.00_", TaskKind::Task),
+               ("_S.01_", TaskKind::Variable),
+               ("yes", TaskKind::Task),
+               ("_S.09_", TaskKind::Global),
+               ("_S.10_", TaskKind::Global),
+        ]
+    );
+    let s00 = &s.tasks[0];
+    assert_eq!(s00.statements.len(), 4); // il commento a colonna 0 non conta
+    assert_eq!(s00.stmts()[2], Stmt::AddDialog(TopicRef { kind: TopicKind::Location, symbol: "_dirennitower_".into() }));
+    assert_eq!(s00.stmts()[3], Stmt::StartQuest(vec![17, 17]));
+    assert_eq!(s.tasks[3].global_name.as_deref(), Some("LiftedCurse"));
+    assert!(s.tasks[3].statements.is_empty()); // variabile globale senza corpo
+    assert_eq!(s.tasks[4].global_name.as_deref(), Some("MedoraGotHorn"));
+    assert_eq!(s.tasks[4].stmts().last(), Some(&Stmt::EndQuest));
+}
 
-    #[test]
-    fn statements_are_parsed() {
-        assert_eq!(Stmt::parse("say 1018"), Stmt::Say(MsgRef::Id(1018)));
-        assert_eq!(Stmt::parse("say AcceptQuest"), Stmt::Say(MsgRef::Name("AcceptQuest".into())));
-        assert_eq!(Stmt::parse("log 1019 step 0 "), Stmt::Log { message: MsgRef::Id(1019), step: 0 });
-        assert_eq!(
-            Stmt::parse("dialog link for person Castellian"),
-            Stmt::DialogLink(TopicRef { kind: TopicKind::Person, symbol: "Castellian".into() })
-        );
-        assert_eq!(Stmt::parse("start quest 11 11"), Stmt::StartQuest(vec![11, 11]));
-        assert_eq!(Stmt::parse("end quest"), Stmt::EndQuest);
-        assert_eq!(Stmt::parse("give pc _magicitem_"), Stmt::Other("give pc _magicitem_".into()));
-        assert_eq!(Stmt::parse("log 1019 step x"), Stmt::Other("log 1019 step x".into()));
-        assert_eq!(Stmt::parse(""), Stmt::Other(String::new()));
-    }
+#[test]
+fn statements_are_parsed() {
+    assert_eq!(Stmt::parse("say 1018"), Stmt::Say(MsgRef::Id(1018)));
+    assert_eq!(Stmt::parse("say AcceptQuest"), Stmt::Say(MsgRef::Name("AcceptQuest".into())));
+    assert_eq!(Stmt::parse("log 1019 step 0 "), Stmt::Log { message: MsgRef::Id(1019), step: 0 });
+    assert_eq!(
+        Stmt::parse("dialog link for person Castellian"),
+               Stmt::DialogLink(TopicRef { kind: TopicKind::Person, symbol: "Castellian".into() })
+    );
+    assert_eq!(Stmt::parse("start quest 11 11"), Stmt::StartQuest(vec![11, 11]));
+    assert_eq!(Stmt::parse("end quest"), Stmt::EndQuest);
+    assert_eq!(Stmt::parse("give pc _magicitem_"), Stmt::Other("give pc _magicitem_".into()));
+    assert_eq!(Stmt::parse("log 1019 step x"), Stmt::Other("log 1019 step x".into()));
+    assert_eq!(Stmt::parse(""), Stmt::Other(String::new()));
+}
 
-    #[test]
-    fn a_script_without_quest_line_is_rejected() {
-        assert!(QuestScript::parse("QRC:\nQBN:\n").is_err());
-        assert!(QuestScript::parse("Quest: S1\nQRC:\n").is_ok()); // senza QBN va bene
-    }
+#[test]
+fn a_script_without_quest_line_is_rejected() {
+    assert!(QuestScript::parse("QRC:\nQBN:\n").is_err());
+    assert!(QuestScript::parse("Quest: S1\nQRC:\n").is_ok()); // senza QBN va bene
+}
 
-    // ----------------------------------------------------------------- macro
+// ----------------------------------------------------------------- macro
 
-    #[test]
-    fn macros_are_found_with_their_level() {
-        let mut found = Vec::new();
-        let text = "Hi %pcf, ___ukcrypt_ in __castfort_ with _brother_'s letter, in =1stparton_ days. 100% sure, snake_case_x, 3=4.";
-        let out = expand_macros(text, &mut |m| {
-            found.push(m.clone());
-            Some("X".into())
-        });
-        assert_eq!(
-            found,
-            vec![
-                Macro::Percent("pcf".into()),
-                Macro::Symbol { name: "_ukcrypt_".into(), level: 3 },
-                Macro::Symbol { name: "_castfort_".into(), level: 2 },
-                Macro::Symbol { name: "_brother_".into(), level: 1 },
-                Macro::Clock("_1stparton_".into()),
-            ]
-        );
-        assert_eq!(out, "Hi X, X in X with X's letter, in X days. 100% sure, snake_case_x, 3=4.");
-        // macro non risolta: resta com'e'
-        assert_eq!(expand_macros("a %pcf b", &mut |_| None), "a %pcf b");
-        assert_eq!(expand_macros("", &mut |_| None), "");
-        assert_eq!(expand_macros("%", &mut |_| None), "%");
-        assert_eq!(expand_macros("__", &mut |_| None), "__");
-    }
+#[test]
+fn macros_are_found_with_their_level() {
+    let mut found = Vec::new();
+    let text = "Hi %pcf, ___ukcrypt_ in __castfort_ with _brother_'s letter, in =1stparton_ days. 100% sure, snake_case_x, 3=4.";
+    let out = expand_macros(text, &mut |m| {
+        found.push(m.clone());
+        Some("X".into())
+    });
+    assert_eq!(
+        found,
+        vec![
+            Macro::Percent("pcf".into()),
+               Macro::Symbol { name: "_ukcrypt_".into(), level: 3 },
+               Macro::Symbol { name: "_castfort_".into(), level: 2 },
+               Macro::Symbol { name: "_brother_".into(), level: 1 },
+               Macro::Clock("_1stparton_".into()),
+        ]
+    );
+    assert_eq!(out, "Hi X, X in X with X's letter, in X days. 100% sure, snake_case_x, 3=4.");
+    // macro non risolta: resta com'e'
+    assert_eq!(expand_macros("a %pcf b", &mut |_| None), "a %pcf b");
+    assert_eq!(expand_macros("", &mut |_| None), "");
+    assert_eq!(expand_macros("%", &mut |_| None), "%");
+    assert_eq!(expand_macros("__", &mut |_| None), "__");
+}
 
-    fn lib_with_sample() -> Library {
-        let mut lib = Library::default();
-        lib.insert(script());
-        lib
-    }
+fn lib_with_sample() -> Library {
+    let mut lib = Library::default();
+    lib.insert(script());
+    lib
+}
 
-    #[test]
-    fn default_expansion_never_leaks_placeholders() {
-        let lib = lib_with_sample();
-        let st = QuestStates::default();
-        let t = lib.expand("S0000001", &st, "%oth, %pcf! ___ukcrypt_ is just %di of here. _brother_ and _lhotun_ in __ukcrypt_. =1stparton_ days. %qdt:");
-        assert_eq!(t, "Oh, traveler! Castle Faallem is just a short distance of here. a certain person and Prince Lhotun in the town. a few days. :");
-        assert!(!t.contains('%') && !t.contains("_ukcrypt_") && !t.contains("_brother_"));
-        // luogo "remote tavern"
-        assert_eq!(lib.expand("S0000001", &st, "meet me at _agentplace_"), "meet me at the tavern");
-    }
+#[test]
+fn default_expansion_never_leaks_placeholders() {
+    let lib = lib_with_sample();
+    let st = QuestStates::default();
+    let t = lib.expand("S0000001", &st, "%oth, %pcf! ___ukcrypt_ is just %di of here. _brother_ and _lhotun_ in __ukcrypt_. =1stparton_ days. %qdt:");
+    assert_eq!(t, "Oh, traveler! Castle Faallem is just a short distance of here. a certain person and Prince Lhotun in the town. a few days. :");
+    assert!(!t.contains('%') && !t.contains("_ukcrypt_") && !t.contains("_brother_"));
+    // luogo "remote tavern"
+    assert_eq!(lib.expand("S0000001", &st, "meet me at _agentplace_"), "meet me at the tavern");
+}
 
-    #[test]
-    fn names_chosen_by_the_game_override_the_defaults() {
-        let lib = lib_with_sample();
-        let mut st = QuestStates::default();
-        st.set_symbol("S0000001", "_ukcrypt_", "Fortress Fhojum", Some("Sentinel"));
-        st.set_symbol("S0000001", "_brother_", "Prince Zelmo", None);
-        assert_eq!(
-            lib.expand("S0000001", &st, "___ukcrypt_ near __ukcrypt_; _brother_ died."),
-            "Fortress Fhojum near Sentinel; Prince Zelmo died."
-        );
-        // un altro quest non ne risente
-        assert_eq!(lib.expand("S0000002", &st, "_brother_"), "someone");
-    }
+#[test]
+fn names_chosen_by_the_game_override_the_defaults() {
+    let lib = lib_with_sample();
+    let mut st = QuestStates::default();
+    st.set_symbol("S0000001", "_ukcrypt_", "Fortress Fhojum", Some("Sentinel"));
+    st.set_symbol("S0000001", "_brother_", "Prince Zelmo", None);
+    assert_eq!(
+        lib.expand("S0000001", &st, "___ukcrypt_ near __ukcrypt_; _brother_ died."),
+               "Fortress Fhojum near Sentinel; Prince Zelmo died."
+    );
+    // un altro quest non ne risente
+    assert_eq!(lib.expand("S0000002", &st, "_brother_"), "someone");
+}
 
-    // ---------------------------------------------------------------- stato
+// ---------------------------------------------------------------- stato
 
-    #[test]
-    fn states_round_trip_through_text() {
-        let s = script();
-        let mut st = QuestStates::default();
-        assert_eq!(st.phase("S0000001"), QuestPhase::NotStarted);
-        st.set_phase(&s, QuestPhase::Active);
-        assert!(st.is_topic_enabled("S0000001", "_ukcrypt_")); // dal blocco di avvio
-        assert!(!st.is_topic_enabled("S0000001", "_dirennitower_"));
-        st.enable_topic("S0000001", "_dirennitower_");
-        st.set_symbol("S0000001", "_ukcrypt_", "Castle Faallem", Some("Sentinel"));
-        let text = st.to_text();
-        assert_eq!(QuestStates::from_text(&text), st);
-        // un file scritto a mano, con righe sbagliate
-        let hand = "# prova\nphase S0000002 ACTIVE\nphase S0000003 boh\ntopic S0000002 Castellian\nrumore\n\nsymbol S0000002 _castfort_ Lord's Hold\n";
-        let st2 = QuestStates::from_text(hand);
-        assert_eq!(st2.phase("S0000002"), QuestPhase::Active);
-        assert_eq!(st2.phase("S0000003"), QuestPhase::NotStarted);
-        assert!(st2.is_topic_enabled("S0000002", "Castellian"));
-        assert_eq!(st2.symbols.get(&("S0000002".into(), "_castfort_".into())).map(String::as_str), Some("Lord's Hold"));
-    }
+#[test]
+fn states_round_trip_through_text() {
+    let s = script();
+    let mut st = QuestStates::default();
+    assert_eq!(st.phase("S0000001"), QuestPhase::NotStarted);
+    st.set_phase(&s, QuestPhase::Active);
+    assert!(st.is_topic_enabled("S0000001", "_ukcrypt_")); // dal blocco di avvio
+    assert!(!st.is_topic_enabled("S0000001", "_dirennitower_"));
+    st.enable_topic("S0000001", "_dirennitower_");
+    st.set_symbol("S0000001", "_ukcrypt_", "Castle Faallem", Some("Sentinel"));
+    let text = st.to_text();
+    assert_eq!(QuestStates::from_text(&text), st);
+    // un file scritto a mano, con righe sbagliate
+    let hand = "# prova\nphase S0000002 ACTIVE\nphase S0000003 boh\ntopic S0000002 Castellian\nrumore\n\nsymbol S0000002 _castfort_ Lord's Hold\n";
+    let st2 = QuestStates::from_text(hand);
+    assert_eq!(st2.phase("S0000002"), QuestPhase::Active);
+    assert_eq!(st2.phase("S0000003"), QuestPhase::NotStarted);
+    assert!(st2.is_topic_enabled("S0000002", "Castellian"));
+    assert_eq!(st2.symbols.get(&("S0000002".into(), "_castfort_".into())).map(String::as_str), Some("Lord's Hold"));
+}
 
-    #[test]
-    fn rumors_depend_on_the_quest_phase() {
-        let s = script();
-        assert!(s.rumor_variants(QuestPhase::NotStarted).is_empty());
-        let active = s.rumor_variants(QuestPhase::Active);
-        // 2 voci della quest + 2 di _brother_ (1031) + 1 di _ukcrypt_ (1016)
-        assert_eq!(active.len(), 2 + 1 + 1);
-        assert!(active.iter().any(|r| r.contains("Greklith")));
-        assert!(active.iter().any(|r| r.contains("nursemaid")));
-        assert_eq!(s.rumor_variants(QuestPhase::Completed), vec!["Prince Lhotun's mood has gotten better."]);
-        assert!(s.rumor_variants(QuestPhase::Failed).is_empty()); // questo script non ne ha
-    }
+#[test]
+fn rumors_depend_on_the_quest_phase() {
+    let s = script();
+    assert!(s.rumor_variants(QuestPhase::NotStarted).is_empty());
+    let active = s.rumor_variants(QuestPhase::Active);
+    // 2 voci della quest + 2 di _brother_ (1031) + 1 di _ukcrypt_ (1016)
+    assert_eq!(active.len(), 2 + 1 + 1);
+    assert!(active.iter().any(|r| r.contains("Greklith")));
+    assert!(active.iter().any(|r| r.contains("nursemaid")));
+    assert_eq!(s.rumor_variants(QuestPhase::Completed), vec!["Prince Lhotun's mood has gotten better."]);
+    assert!(s.rumor_variants(QuestPhase::Failed).is_empty()); // questo script non ne ha
+}
 
-    // ------------------------------------------------------------ conoscenza
+// ------------------------------------------------------------ conoscenza
 
-    fn active_states() -> (Library, QuestStates) {
-        let lib = lib_with_sample();
-        let mut st = QuestStates::default();
-        st.set_phase(lib.get("S0000001").unwrap(), QuestPhase::Active);
-        (lib, st)
-    }
+fn active_states() -> (Library, QuestStates) {
+    let lib = lib_with_sample();
+    let mut st = QuestStates::default();
+    st.set_phase(lib.get("S0000001").unwrap(), QuestPhase::Active);
+    (lib, st)
+}
 
-    #[test]
-    fn questions_are_matched_to_topics() {
-        assert!(mentions("Do you know anything about the Underking?", "The Underking"));
-        assert!(mentions("what happened to lhotun", "Prince Lhotun"));
-        assert!(mentions("Who is PRINCE Lhotun?", "Prince Lhotun"));
-        assert!(!mentions("Where is the prince?", "Prince Lhotun")); // "prince" e' un titolo, non il nome
-        assert!(!mentions("Where is the inn?", "Castle Faallem"));
-        assert!(mentions("Is Castle Faallem far?", "Castle Faallem"));
-        assert!(mentions("tell me about faallem", "Castle Faallem"));
-        assert!(!mentions("anything", ""));
-    }
+#[test]
+fn questions_are_matched_to_topics() {
+    assert!(mentions("Do you know anything about the Underking?", "The Underking"));
+    assert!(mentions("what happened to lhotun", "Prince Lhotun"));
+    assert!(mentions("Who is PRINCE Lhotun?", "Prince Lhotun"));
+    assert!(!mentions("Where is the prince?", "Prince Lhotun")); // "prince" e' un titolo, non il nome
+    assert!(!mentions("Where is the inn?", "Castle Faallem"));
+    assert!(mentions("Is Castle Faallem far?", "Castle Faallem"));
+    assert!(mentions("tell me about faallem", "Castle Faallem"));
+    assert!(!mentions("anything", ""));
+}
 
-    #[test]
-    fn knowledge_needs_an_active_quest_and_an_enabled_topic() {
-        let lib = lib_with_sample();
-        let opts = KnowledgeOptions::default();
-        // nessuna quest attiva: niente
-        assert_eq!(knowledge_block(&lib, &QuestStates::default(), "Tell me about the Underking", "npc1", &opts), "");
-        let (lib, mut st) = active_states();
-        // _underking_ non e' abilitato (non c'e' un `dialog link` per lui nell'avvio)
-        let k = knowledge_block(&lib, &st, "Tell me about the Underking", "npc1", &opts);
-        assert!(!k.contains("About The Underking"), "{k}");
-        // abilitato: si
-        st.enable_topic("S0000001", "_underking_");
-        let k = knowledge_block(&lib, &st, "Tell me about the Underking", "npc1", &opts);
-        assert!(k.starts_with("\nTHINGS YOU HAVE HEARD"), "{k}");
-        assert!(k.contains("- About The Underking: "), "{k}");
-        assert!(k.contains("centuries old") || k.contains("kidnapped Prince a certain person"), "{k}");
-        assert!(!k.contains('%') && !k.contains("_brother_"));
-        // la domanda non lo cita: restano solo le voci in giro
-        let k = knowledge_block(&lib, &st, "Where is the inn?", "npc1", &opts);
-        assert!(!k.contains("About "), "{k}");
-        assert!(k.contains("Talk going around: "), "{k}");
-    }
+#[test]
+fn knowledge_needs_an_active_quest_and_an_enabled_topic() {
+    let lib = lib_with_sample();
+    let opts = KnowledgeOptions::default();
+    // nessuna quest attiva: niente
+    assert_eq!(knowledge_block(&lib, &QuestStates::default(), "Tell me about the Underking", "npc1", &opts), "");
+    let (lib, mut st) = active_states();
+    // _underking_ non e' abilitato (non c'e' un `dialog link` per lui nell'avvio)
+    let k = knowledge_block(&lib, &st, "Tell me about the Underking", "npc1", &opts);
+    assert!(!k.contains("About The Underking"), "{k}");
+    // abilitato: si
+    st.enable_topic("S0000001", "_underking_");
+    let k = knowledge_block(&lib, &st, "Tell me about the Underking", "npc1", &opts);
+    assert!(k.starts_with("\nTHINGS YOU HAVE HEARD"), "{k}");
+    assert!(k.contains("- About The Underking: "), "{k}");
+    assert!(k.contains("centuries old") || k.contains("kidnapped Prince a certain person"), "{k}");
+    assert!(!k.contains('%') && !k.contains("_brother_"));
+    // la domanda non lo cita: restano solo le voci in giro
+    let k = knowledge_block(&lib, &st, "Where is the inn?", "npc1", &opts);
+    assert!(!k.contains("About "), "{k}");
+    assert!(k.contains("Talk going around: "), "{k}");
+}
 
-    #[test]
-    fn a_place_chosen_at_random_is_a_topic_only_once_the_game_names_it() {
-        let (lib, st) = active_states();
-        let opts = KnowledgeOptions::default();
-        // _ukcrypt_ e' abilitato dall'avvio ma ha due luoghi possibili: finche' il gioco non sceglie, nessun nome
-        let k = knowledge_block(&lib, &st, "Where is Castle Faallem?", "npc1", &opts);
-        assert!(!k.contains("About Castle Faallem"), "{k}");
-        let mut st = st;
-        st.set_symbol("S0000001", "_ukcrypt_", "Castle Faallem", Some("Sentinel"));
-        let k = knowledge_block(&lib, &st, "Where is Castle Faallem?", "npc1", &opts);
-        assert!(k.contains("About Castle Faallem: Castle Faallem "), "{k}");
-    }
+#[test]
+fn a_place_chosen_at_random_is_a_topic_only_once_the_game_names_it() {
+    let (lib, st) = active_states();
+    let opts = KnowledgeOptions::default();
+    // _ukcrypt_ e' abilitato dall'avvio ma ha due luoghi possibili: finche' il gioco non sceglie, nessun nome
+    let k = knowledge_block(&lib, &st, "Where is Castle Faallem?", "npc1", &opts);
+    assert!(!k.contains("About Castle Faallem"), "{k}");
+    let mut st = st;
+    st.set_symbol("S0000001", "_ukcrypt_", "Castle Faallem", Some("Sentinel"));
+    let k = knowledge_block(&lib, &st, "Where is Castle Faallem?", "npc1", &opts);
+    assert!(k.contains("About Castle Faallem: Castle Faallem "), "{k}");
+}
 
-    #[test]
-    fn same_npc_same_answer_different_npcs_vary() {
-        let (lib, mut st) = active_states();
-        st.enable_topic("S0000001", "_underking_");
-        let opts = KnowledgeOptions::default();
-        let q = "What about the Underking?";
-        assert_eq!(knowledge_block(&lib, &st, q, "npc7", &opts), knowledge_block(&lib, &st, q, "npc7", &opts));
-        let all: HashSet<String> = (0..40).map(|i| knowledge_block(&lib, &st, q, &format!("npc{i}"), &opts)).collect();
-        assert!(all.len() >= 2, "tutti i PNG dicono la stessa cosa");
-        let rumors: HashSet<String> = (0..40).filter_map(|i| rumor_for(&lib, &st, &format!("npc{i}"))).collect();
-        assert!(rumors.len() >= 3, "{rumors:?}");
-    }
+#[test]
+fn same_npc_same_answer_different_npcs_vary() {
+    let (lib, mut st) = active_states();
+    st.enable_topic("S0000001", "_underking_");
+    let opts = KnowledgeOptions::default();
+    let q = "What about the Underking?";
+    assert_eq!(knowledge_block(&lib, &st, q, "npc7", &opts), knowledge_block(&lib, &st, q, "npc7", &opts));
+    let all: HashSet<String> = (0..40).map(|i| knowledge_block(&lib, &st, q, &format!("npc{i}"), &opts)).collect();
+    assert!(all.len() >= 2, "tutti i PNG dicono la stessa cosa");
+    let rumors: HashSet<String> = (0..40).filter_map(|i| rumor_for(&lib, &st, &format!("npc{i}"))).collect();
+    assert!(rumors.len() >= 3, "{rumors:?}");
+}
 
-    #[test]
-    fn knowledge_is_capped_and_empty_when_nothing_fits() {
-        let (lib, mut st) = active_states();
-        st.enable_topic("S0000001", "_underking_");
-        let tiny = KnowledgeOptions { max_chars: 20, ..KnowledgeOptions::default() };
-        assert_eq!(knowledge_block(&lib, &st, "the Underking", "npc1", &tiny), ""); // niente intestazione sola
-        let none = KnowledgeOptions { max_rumors: 0, max_topics: 0, ..KnowledgeOptions::default() };
-        assert_eq!(knowledge_block(&lib, &st, "the Underking", "npc1", &none), "");
-    }
+#[test]
+fn knowledge_is_capped_and_empty_when_nothing_fits() {
+    let (lib, mut st) = active_states();
+    st.enable_topic("S0000001", "_underking_");
+    let tiny = KnowledgeOptions { max_chars: 20, ..KnowledgeOptions::default() };
+    assert_eq!(knowledge_block(&lib, &st, "the Underking", "npc1", &tiny), ""); // niente intestazione sola
+    let none = KnowledgeOptions { max_rumors: 0, max_topics: 0, ..KnowledgeOptions::default() };
+    assert_eq!(knowledge_block(&lib, &st, "the Underking", "npc1", &none), "");
+}
 
-    #[test]
-    fn rumors_after_the_quest_come_from_the_post_messages() {
-        let lib = lib_with_sample();
-        let mut st = QuestStates::default();
-        st.set_phase(lib.get("S0000001").unwrap(), QuestPhase::Completed);
-        assert_eq!(rumor_for(&lib, &st, "x").as_deref(), Some("Prince Lhotun's mood has gotten better."));
-        st.set_phase(lib.get("S0000001").unwrap(), QuestPhase::Failed);
-        assert_eq!(rumor_for(&lib, &st, "x"), None);
-        // le informazioni su persone e luoghi servono solo mentre la quest e' attiva
-        st.enable_topic("S0000001", "_underking_");
-        st.set_phase(lib.get("S0000001").unwrap(), QuestPhase::Completed);
-        assert_eq!(knowledge_block(&lib, &st, "the Underking", "x", &KnowledgeOptions { max_rumors: 0, ..Default::default() }), "");
-    }
+#[test]
+fn rumors_after_the_quest_come_from_the_post_messages() {
+    let lib = lib_with_sample();
+    let mut st = QuestStates::default();
+    st.set_phase(lib.get("S0000001").unwrap(), QuestPhase::Completed);
+    assert_eq!(rumor_for(&lib, &st, "x").as_deref(), Some("Prince Lhotun's mood has gotten better."));
+    st.set_phase(lib.get("S0000001").unwrap(), QuestPhase::Failed);
+    assert_eq!(rumor_for(&lib, &st, "x"), None);
+    // le informazioni su persone e luoghi servono solo mentre la quest e' attiva
+    st.enable_topic("S0000001", "_underking_");
+    st.set_phase(lib.get("S0000001").unwrap(), QuestPhase::Completed);
+    assert_eq!(knowledge_block(&lib, &st, "the Underking", "x", &KnowledgeOptions { max_rumors: 0, ..Default::default() }), "");
+}
 
-    #[test]
-    fn library_loads_only_main_quest_files() {
-        let dir = std::env::temp_dir().join(format!("dfquest_lib_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("S0000001.txt"), SAMPLE).unwrap();
-        std::fs::write(dir.join("s0000002.TXT"), SAMPLE.replace("S0000001", "S0000002")).unwrap();
-        std::fs::write(dir.join("_tutorial_.txt"), SAMPLE).unwrap(); // non e' un quest principale
-        std::fs::write(dir.join("Q0C00Y00.txt"), SAMPLE).unwrap();
-        std::fs::write(dir.join("S0000003.txt"), "niente di valido").unwrap();
-        let (lib, warnings) = Library::load_dir(&dir);
-        assert_eq!(lib.len(), 2);
-        assert!(lib.get("S0000001").is_some() && lib.get("S0000002").is_some());
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("S0000003.txt"), "{warnings:?}");
-        let (empty, w) = Library::load_dir(&dir.join("non_esiste"));
-        assert!(empty.is_empty() && w.len() == 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+#[test]
+fn library_loads_only_main_quest_files() {
+    let dir = std::env::temp_dir().join(format!("dfquest_lib_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("S0000001.txt"), SAMPLE).unwrap();
+    std::fs::write(dir.join("s0000002.TXT"), SAMPLE.replace("S0000001", "S0000002")).unwrap();
+    std::fs::write(dir.join("_tutorial_.txt"), SAMPLE).unwrap(); // non e' un quest principale
+    std::fs::write(dir.join("Q0C00Y00.txt"), SAMPLE).unwrap();
+    std::fs::write(dir.join("S0000003.txt"), "niente di valido").unwrap();
+    let (lib, warnings) = Library::load_dir(&dir);
+    assert_eq!(lib.len(), 2);
+    assert!(lib.get("S0000001").is_some() && lib.get("S0000002").is_some());
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("S0000003.txt"), "{warnings:?}");
+    let (empty, w) = Library::load_dir(&dir.join("non_esiste"));
+    assert!(empty.is_empty() && w.len() == 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
 }

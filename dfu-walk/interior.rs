@@ -2,10 +2,27 @@
 //! Con E vicino alla porta (o Backspace ovunque) si esce.
 //! Riconosce la vera porta d'ingresso/uscita ed esce con certezza premendo E entro 3.5 metri.
 //!
+//! ## Priorità alla porta
+//!
+//! Se il player preme E ed è vicino a una **porta interna raggiungibile**
+//! (`DOOR_REACH`), E apre/chiude la porta e NON esce dall'edificio. Bug del
+//! palazzo reale (e di tutti gli interni con una porta vicino all'ingresso):
+//! E veniva interpretato come "esci" invece di "apri la porta". Per uscire
+//! dall'edificio, usa **Backspace** (o allontanati dalla porta prima di
+//! premere E vicino alla porta d'ingresso).
+//!
+//! L'apertura delle porte interne è gestita da `interior_toggle_doors` e
+//! `animate_doors` (aggiunti in `main.rs`); senza la fix, `interior_toggle_doors`
+//! esisteva ma non era mai stato schedulato, e `interior_enter_exit` non
+//! faceva return, quindi il player non poteva aprire porte interne.
+//!
 //! ## NPC flat vs NPC custom
 //!
 //! - **Flat** (dal BlockData interno): sempre presenti nel loro edificio (salvo `InteriorState::recruited`).
 //! - **Custom** (`npc_*.png` con `.txt`): dipendono da `position` (vedi `NpcPosition`).
+//!   Se il `.txt` contiene `qbn_symbol = <simbolo>`, il custom è il "volto" di un
+//!   PNG di quest QBN: viene spawnato da `qbn_npc.rs` (non qui) e questo modulo
+//!   lo salta sia nel prefetch voci che nello spawn, per evitare doppioni.
 //!
 //! ## Animazioni degli NPC custom
 //!
@@ -22,10 +39,6 @@
 //!
 //! I frame vengono scoperti automaticamente: cerca `_walk_0`, `_walk_1`, ... e
 //! `_idle_0`, `_idle_1`, ... finché esistono consecutivi (partendo da 0).
-//! Il ciclo walk avviene quando l'NPC è follower e si muove; il ciclo idle
-//! alterna periodi statici e periodi animati quando è fermo (vedi
-//! `tiles::CustomIdleAnim`). Se non ci sono `_walk_N` / `_idle_N`, l'NPC
-//! resta statico (retrocompatibile).
 //!
 //! ## Idle per i flat normali
 //!
@@ -34,26 +47,33 @@
 //! `<archive>_<record>-0.png` (es. `182_11-0.png` → `182_11-0_idle_0.png`,
 //! `182_11-0_idle_1.png`, ...). Vengono caricati da `load_flat_idle_frames` e
 //! agganciati al `Follower` con `with_idle`, esattamente come per i custom.
+//!
 //! Stessa cosa per il mood: `mood > 0` mostra staticamente `idle[mood]`.
+//!
 //! Vale anche la camminata: `<archive>_<record>-0_walk_N.png` (`load_flat_walk_frames`).
 //! I txt degli NPC classici (`classic_npc.rs`, `182_3-0.txt`, ...) possono fissare
 //! `walk_fps` e `idle_fps` come i custom.
 //!
 //! ## Aspect ratio
 //!
-//! Ogni frame walk/idle mantiene il proprio aspect ratio. Le dimensioni in
-//! metri di ciascun frame si calcolano in proporzione a quelle dell'idle base:
-//! se il frame ha pixel `(w_px, h_px)` e l'idle base ha pixel
+//! Per i **custom**, ogni frame walk/idle mantiene il proprio aspect ratio:
+//! le dimensioni in metri si calcolano in proporzione a quelle dell'idle base.
+//! Se il frame ha pixel `(w_px, h_px)` e l'idle base ha pixel
 //! `(base_w_px, base_h_px)` e metri `(base_w_m, base_h_m)`, allora
 //! `frame_w_m = base_w_m * w_px / base_w_px` (analogo per l'altezza).
+//!
+//! Per i **flat classici**, invece, la dimensione in metri è **fissa**:
+//! un frame idle HD e uno sprite vanilla sono lo stesso personaggio e devono
+//! occupare la stessa "scatola" in gioco. Senza questo, una mod che fornisce
+//! solo gli idle in HD (2× risoluzione vanilla) farebbe apparire l'idle
+//! **doppio** rispetto al walk e allo sprite base. Vedi `match_base_size`.
 //!
 //! **Case-insensitive**: la scoperta dei frame e del `.txt` non distingue
 //! maiuscole/minuscole.
 //!
 //! Le velocità si configurano nel `.txt`:
 //! - `walk_fps = 8.0` (default 8.0)
-//! - `idle_fps = 4.0` (default 4.0, **non usato** se il frame deve cambiare
-//!   ogni `IDLE_FRAME_SECONDS` fissi in `update_followers`; vedi `tiles.rs`)
+//! - `idle_fps = 4.0` (default 4.0)
 //!
 //! ## Prefetch delle voci
 //!
@@ -69,11 +89,7 @@
 //! - flat con caption:   `flat:182:23@MAGE#3`
 //! - flat senza caption: `face:148@MAGE#5`
 //! - NPC custom:         `custom_Ellie@MAGE` (il nome è già univoco, niente `#N`)
-//!
-//! `dialog::voice_key_for` costruisce la stessa chiave al momento del dialogo,
-//! passando `Some(npc.instance)` per i flat e `None` per i custom. Se le due
-//! chiavi non coincidono, il prefetch genererebbe per `#N` e il dialogo
-//! cercherebbe senza `#N` (o viceversa): doppio giro LLM.
+
 use crate::dialog::DialogState;
 use crate::data::flats::FlatCatalog;
 use crate::mod_textures::ModTextures;
@@ -250,9 +266,7 @@ struct Active {
     /// Prefisso a 4 lettere del nome del blocco RMB (es. `"MAGE"`, `"FIGH"`,
     /// `"THIE"`, `"TEMP"`, ...). Serve a `describe_npc_in` e `classic_npc::resolve`
     /// (via `crate::quests::guild_name_from_prefix`) per riconoscere che questo
-    /// edificio è la sede di una gilda specifica: un membro della Mages Guild
-    /// deve parlare delle faccende della propria gilda in prima persona, non
-    /// come un estraneo che le ha "sentite dire".
+    /// edificio è la sede di una gilda specifica.
     block_prefix: String,
 }
 
@@ -269,17 +283,14 @@ impl InteriorState {
     pub fn origin(&self) -> Option<Vec3> { self.active.as_ref().map(|a| a.origin) }
     pub fn kind(&self) -> Option<PoiKind> { self.active.as_ref().map(|a| a.kind) }
 
-    /// Posizione esterna prima di entrare nell'edificio corrente.
     pub fn outside_pos(&self) -> Option<Vec3> {
         self.active.as_ref().map(|a| a.saved_translation)
     }
 
-    /// Quota dei piedi all'esterno prima di entrare nell'edificio corrente.
     pub fn outside_feet(&self) -> Option<f32> {
         self.active.as_ref().map(|a| a.saved_feet_y)
     }
 
-    /// Rotazione (yaw) all'esterno prima di entrare nell'edificio corrente.
     pub fn outside_yaw(&self) -> Option<f32> {
         self.active.as_ref().map(|a| a.saved_yaw)
     }
@@ -291,12 +302,39 @@ impl InteriorState {
         self.active.as_ref().map(|a| a.block_prefix.as_str())
     }
 
+    /// Entità radice dell'interno corrente. `qbn_npc::spawn_qbn_npcs_in_interior`
+    /// la usa per appendere i PNG di quest QBN come figli della scena.
+    pub fn root(&self) -> Option<Entity> {
+        self.active.as_ref().map(|a| a.root)
+    }
+
+    /// Posizione di spawn del giocatore (coordinate locali alla radice).
+    /// I PNG QBN vengono piazzati tra questo punto e il centro della scena.
+    pub fn scene_spawn(&self) -> Option<Vec3> {
+        self.active.as_ref().map(|a| Vec3::from(a.scene.spawn))
+    }
+
+    /// Centro geometrico della scena (bounds min/max mediati in XZ, spawn.y in Y).
+    pub fn scene_center(&self) -> Option<Vec3> {
+        self.active.as_ref().map(|a| {
+            Vec3::new(
+                (a.scene.bounds_min[0] + a.scene.bounds_max[0]) * 0.5,
+                      a.scene.spawn[1],
+                      (a.scene.bounds_min[2] + a.scene.bounds_max[2]) * 0.5,
+            )
+        })
+    }
+
+    /// Numero di NPC "flat" originali della scena. Serve per la numerazione
+    /// `instance` dei PNG QBN, così la voice key non collide con i flat
+    /// già presenti (`#N` univoco in tutta la scena).
+    pub fn scene_people_count(&self) -> Option<usize> {
+        self.active.as_ref().map(|a| a.scene.people.len())
+    }
+
     /// True se un cerchio di raggio `radius` centrato in `(x, z)` (coordinate
     /// **mondo**, come `Transform`) alla quota `feet_y` (piedi) tocca un muro
     /// dell'edificio corrente (o una porta chiusa).
-    ///
-    /// Usata da `tiles::update_followers` per far fermare i follower sui muri
-    /// degli interni invece di attraversarli.
     pub fn blocked(&self, x: f32, z: f32, feet_y: f32, radius: f32) -> bool {
         match &self.active {
             Some(a) => a.scene.blocked(
@@ -345,20 +383,19 @@ pub struct CustomNpcData {
     pub description: Option<String>,
     pub voice: Option<String>,
     pub position: NpcPosition,
-    /// Stem dei file walk (`npc_ellie_walk_0`, `npc_ellie_walk_1`, ...). Vuoto
-    /// se l'NPC non ha animazione di camminata.
+    /// Se presente, questo NPC è il "volto" di un simbolo QBN (es. `_agentuk_`).
+    /// Spawnato da `qbn_npc.rs` invece che da `interior.rs`, così eredita il pin
+    /// "prima taverna di Sentinel" e il click fa scattare il task QBN.
+    pub qbn_symbol: Option<String>,
     pub walk_stems: Vec<String>,
-    /// FPS dell'animazione camminata (default 8.0).
     pub walk_fps: f32,
-    /// Stem dei file idle (`npc_ellie_idle_0`, `npc_ellie_idle_1`, ...). Vuoto
-    /// se l'NPC non ha idle multiframe (in quel caso l'idle resta statico).
     pub idle_stems: Vec<String>,
-    /// FPS dell'animazione idle (default 4.0). Nota: il ciclo visivo dell'idle
-    /// in `tiles::update_followers` usa `IDLE_FRAME_SECONDS`, non `idle_fps`.
     pub idle_fps: f32,
 }
 
-pub fn parse_custom_txt(content: &str) -> (String, Option<String>, Option<String>, NpcPosition) {
+pub fn parse_custom_txt(
+    content: &str,
+) -> (String, Option<String>, Option<String>, NpcPosition, Option<String>) {
     let mut lines = content.trim_start_matches('\u{feff}').lines();
     let name = lines
     .by_ref()
@@ -369,6 +406,7 @@ pub fn parse_custom_txt(content: &str) -> (String, Option<String>, Option<String
     let mut description = None;
     let mut voice = None;
     let mut position: Option<NpcPosition> = None;
+    let mut qbn_symbol: Option<String> = None;
     for line in lines {
         let line = line.trim();
         let (key, rest) = if let Some(r) = line.strip_prefix("description") {
@@ -377,6 +415,8 @@ pub fn parse_custom_txt(content: &str) -> (String, Option<String>, Option<String
             ("voice", r)
         } else if let Some(r) = line.strip_prefix("position") {
             ("position", r)
+        } else if let Some(r) = line.strip_prefix("qbn_symbol") {
+            ("qbn_symbol", r)
         } else {
             continue;
         };
@@ -394,10 +434,19 @@ pub fn parse_custom_txt(content: &str) -> (String, Option<String>, Option<String
                     warn!("NPC custom: valore di position non riconosciuto: '{}'", value);
                 }
             }
+            "qbn_symbol" if qbn_symbol.is_none() => {
+                qbn_symbol = Some(value.to_string());
+            }
             _ => {}
         }
     }
-    (name, description, voice, position.unwrap_or(NpcPosition::Any))
+    (
+        name,
+     description,
+     voice,
+     position.unwrap_or(NpcPosition::Any),
+     qbn_symbol,
+    )
 }
 
 pub fn parse_walk_fps(content: &str) -> f32 {
@@ -482,7 +531,8 @@ impl CustomNpcCache {
             let Ok(content) = fs::read_to_string(txt_path) else {
                 continue;
             };
-            let (trimmed_name, description, voice, position) = parse_custom_txt(&content);
+            let (trimmed_name, description, voice, position, qbn_symbol) =
+            parse_custom_txt(&content);
             if trimmed_name.is_empty() {
                 continue;
             }
@@ -531,6 +581,7 @@ impl CustomNpcCache {
                       description,
                       voice,
                       position,
+                      qbn_symbol,
                       walk_stems,
                       walk_fps,
                       idle_stems,
@@ -540,23 +591,33 @@ impl CustomNpcCache {
         let specific = npcs.iter().filter(|n| !matches!(n.position, NpcPosition::Any)).count();
         let animated = npcs.iter().filter(|n| !n.walk_stems.is_empty()).count();
         let idle = npcs.iter().filter(|n| !n.idle_stems.is_empty()).count();
+        let qbn = npcs.iter().filter(|n| n.qbn_symbol.is_some()).count();
         info!(
-            "Caricati {} NPC custom ({} con position specifica, {} con walk, {} con idle)",
-              npcs.len(), specific, animated, idle
+            "Caricati {} NPC custom ({} con position specifica, {} con walk, {} con idle, {} QBN)",
+              npcs.len(), specific, animated, idle, qbn
         );
         Self { npcs, dir: textures_dir.to_path_buf() }
     }
 }
 
 /// Carica uno dei set di frame (`stems`) come materiali, calcolando per ogni
-/// frame la dimensione in metri in proporzione all'idle base.
+/// frame la dimensione in metri.
 ///
-/// `base_size_px`: dimensioni in pixel dell'idle base (il PNG che dà il nome
-/// all'NPC o il `<archive>_<record>-0.png` di un flat). Se `x` o `y` sono
-/// <= 0.5, la proporzione è disattivata e ogni frame usa `base_size_m`.
-/// `base_size_m`: dimensioni in metri dell'idle base.
-/// `size_scale`: moltiplicatore finale applicato a ogni frame (1.0 = nessuna
-/// riduzione; 0.5 = metà).
+/// - `base_size_px`: dimensioni in pixel dello sprite base (idle vanilla per i
+///   flat, PNG principale per i custom). Se `x` o `y` sono `<= 0.5`, la
+///   proporzione è disattivata.
+/// - `base_size_m`: dimensioni in metri dell'idle base.
+/// - `size_scale`: moltiplicatore finale applicato a ogni frame (1.0 = nessuna
+///   riduzione; 0.5 = metà).
+/// - `match_base_size`:
+///   - `true` (NPC custom): il frame viene scalato in proporzione a
+///     `frame_size_px / base_size_px`. Utile quando i frame del custom hanno
+///     dimensioni disegnate diverse (braccia aperte, salto, ecc.).
+///   - `false` (flat classici): il frame usa `base_size_m * size_scale` senza
+///     guardare la sua risoluzione. Un frame idle HD e uno sprite vanilla sono
+///     lo **stesso personaggio**: devono occupare la stessa scatola in metri.
+///     Senza questo, una mod che fornisce solo gli idle in HD (2× la
+///     risoluzione vanilla) farebbe apparire l'idle **doppio** in gioco.
 pub(crate) fn load_frames_from_stems(
     stems: &[String],
     npc_name: &str,
@@ -564,6 +625,7 @@ pub(crate) fn load_frames_from_stems(
     base_size_px: Vec2,
     base_size_m: Vec2,
     size_scale: f32,
+    match_base_size: bool,
     mods: &mut ModTextures,
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
@@ -571,11 +633,6 @@ pub(crate) fn load_frames_from_stems(
     if stems.is_empty() {
         return None;
     }
-    let base_size_px = if base_size_px.x > 0.5 && base_size_px.y > 0.5 {
-        base_size_px
-    } else {
-        Vec2::splat(1.0)
-    };
     let scale = size_scale.max(0.05);
     let mut frames = Vec::with_capacity(stems.len());
     let mut sizes = Vec::with_capacity(stems.len());
@@ -584,16 +641,22 @@ pub(crate) fn load_frames_from_stems(
             warn!("{} '{}': manca il frame {label} '{}'", npc_name, label, stem);
             return None;
         };
-        let frame_size_px = mods
-        .image_size(&handle)
-        .or_else(|| images.get(&handle).map(|i| i.size_f32()))
-        .unwrap_or(base_size_px);
-        let size_m = if frame_size_px.x > 0.5 && frame_size_px.y > 0.5 {
-            Vec2::new(
-                base_size_m.x * frame_size_px.x / base_size_px.x * scale,
-                base_size_m.y * frame_size_px.y / base_size_px.y * scale,
-            )
+        let size_m = if match_base_size && base_size_px.x > 0.5 && base_size_px.y > 0.5 {
+            let frame_size_px = mods
+            .image_size(&handle)
+            .or_else(|| images.get(&handle).map(|i| i.size_f32()))
+            .unwrap_or(base_size_px);
+            if frame_size_px.x > 0.5 && frame_size_px.y > 0.5 {
+                Vec2::new(
+                    base_size_m.x * frame_size_px.x / base_size_px.x * scale,
+                    base_size_m.y * frame_size_px.y / base_size_px.y * scale,
+                )
+            } else {
+                base_size_m * scale
+            }
         } else {
+            // Dimensione fissa: i frame idle/walk dei flat classici sono lo
+            // stesso personaggio, la risoluzione HD non deve scalarli.
             base_size_m * scale
         };
         frames.push(materials.add(StandardMaterial {
@@ -625,6 +688,7 @@ pub fn load_custom_walk_frames(
         base_size_px,
         base_size_m,
         1.0,
+        true,
         mods,
         images,
         materials,
@@ -646,6 +710,7 @@ pub fn load_custom_idle_frames(
         base_size_px,
         base_size_m,
         1.0,
+        true,
         mods,
         images,
         materials,
@@ -717,6 +782,7 @@ fn load_flat_frames(
                                           base_size_px,
                                           base_size_m,
                                           1.0,
+                                          false,
                                           mods,
                                           images,
                                           materials,
@@ -797,19 +863,6 @@ fn debug_uv_scale(mesh: &WorldMesh, sm: &Submesh, size: (f32, f32)) {
 // =============================================================================
 
 /// Una voce da prefetchare per un NPC di un interno.
-///
-/// Contiene tutto ciò che serve a:
-/// - `QuestWorker::request_voice`: la chiave e la description di input;
-/// - `classic_npc::apply_llm_background`: l'etichetta visiva originale
-///   (`original_label`) e lo stem dello sprite (`sprite_stem`).
-///
-/// `sprite_stem` è `None` per gli NPC custom (`npc_*.txt`), che non passano
-/// da `classic_npc`.
-///
-/// `voice_key` include già `#N` (indice dell'NPC in `scene.people`) per i
-/// flat: due NPC con la stessa texture nello stesso edificio hanno voci
-/// separate. La stessa chiave è costruita da `dialog::voice_key_for` al
-/// momento del dialogo (con `Some(npc.instance)`).
 #[derive(Clone, Debug)]
 pub struct PendingVoice {
     pub voice_key: String,
@@ -826,10 +879,6 @@ pub struct InteriorEntered {
 }
 
 /// Plugin minimale: registra l'evento `InteriorEntered`.
-///
-/// I sistemi di `interior.rs` sono già aggiunti a mano in `main.rs`; questo
-/// plugin serve solo a garantire che l'evento esista. Senza, l'`EventWriter`
-/// in `interior_enter_exit` andrebbe in panic al primo `send()`.
 pub struct InteriorPlugin;
 
 impl Plugin for InteriorPlugin {
@@ -876,6 +925,21 @@ pub fn interior_enter_exit(
             });
             d_spawn < EXIT_DISTANCE || d_exit < EXIT_DISTANCE
         };
+
+        // Priorità alla porta: se il player preme E (non Backspace) e c'è
+        // una porta raggiungibile, non uscire dall'edificio. Stesso bug del
+        // palazzo reale/dungeon: E vicino all'uscita veniva interpretato
+        // come "esci" invece di "apri la porta". Se vuoi uscire, usa
+        // Backspace.
+        if act && !leave {
+            let a = state.active.as_ref().unwrap();
+            let local = tf.translation - a.origin;
+            let feet = p.feet_y - a.origin.y;
+            if a.scene.nearest_door(local.x, local.z, feet, DOOR_REACH).is_some() {
+                return; // lascia gestire a `interior_toggle_doors`
+            }
+        }
+
         if leave || near_exit {
             let a = state.active.take().unwrap();
             let (de, dn) = (origin.east - a.saved_origin.0, origin.north - a.saved_origin.1);
@@ -979,17 +1043,6 @@ pub fn interior_enter_exit(
     }
 
     // --- Prefetch voci degli NPC dell'interno ------------------------------
-    // Costruisce un `PendingVoice` per ogni NPC che spawnerà. La logica
-    // rispecchia quella di `dialog::update_dialog` ma è **read-only**: usa
-    // `resolve_existing` per i txt `classic_*.txt`.
-    //
-    // `voice_key` include `#N` per i flat (indice `i` in `scene.people`):
-    // `dialog::voice_key_for` costruisce la stessa chiave al momento del
-    // dialogo, passando `Some(npc.instance)`. Due NPC con lo stesso flat
-    // hanno istanze diverse e quindi voci separate.
-    //
-    // `sprite_stem` è `Some("181_3-0")` per i flat, `None` per i custom
-    // (che non usano `classic_npc`).
     let mut voices_to_prefetch: Vec<PendingVoice> = Vec::new();
     {
         let city = (mx, my);
@@ -998,7 +1051,6 @@ pub fn interior_enter_exit(
         let face_lookup = flats_face_map.as_ref().expect("inizializzata sopra");
         let catalog = FlatCatalog::load(&data.dir);
 
-        // Flat vanilla (scene.people).
         for (i, f) in scene.people.iter().enumerate() {
             if state.is_recruited(f.archive, f.record) {
                 continue;
@@ -1009,9 +1061,6 @@ pub fn interior_enter_exit(
                 (!c.is_empty()).then(|| c.to_string())
             });
 
-            // Con caption: key = flat:A:R, role = None.
-            // Senza caption: key = face:N (stessa formula di `update_dialog`),
-            // role = tone.role().
             let (base_key, who, role) = match caption {
                 Some(cap) => (format!("flat:{}:{}", f.archive, f.record), cap, None),
                 None => {
@@ -1026,8 +1075,6 @@ pub fn interior_enter_exit(
                     )
                 }
             };
-            // Voice key con prefisso gilda e istanza: due NPC con lo stesso
-            // flat (stessa texture) hanno `#N` diverso e quindi voci separate.
             let voice_key = format!("{}@{}#{}", base_key, current_prefix, i);
             let temperament = temperament_for(&base_key, city);
             let mut description = describe_npc_in(&who, role, place, temperament, guild);
@@ -1049,9 +1096,12 @@ pub fn interior_enter_exit(
             });
         }
 
-        // NPC custom: quelli che rispettano `position`. Il nome è univoco,
-        // quindi niente `#N` (la voice key è già distinta per NPC).
         for custom_npc in &custom_npcs.npcs {
+            if custom_npc.qbn_symbol.is_some() {
+                // Gestito da `qbn_npc.rs`: ha il pin "prima taverna di Sentinel".
+                // Il prefetch della voce parte quando `qbn_npc.rs` lo spawna.
+                continue;
+            }
             if state.is_recruited_custom(&custom_npc.name) {
                 continue;
             }
@@ -1080,8 +1130,6 @@ pub fn interior_enter_exit(
                 voice_key,
                 description,
                 original_label: who,
-                // I custom non usano `classic_npc::resolve`: nessun `.txt`
-                // condiviso da aggiornare con `apply_llm_background`.
                 sprite_stem: None,
             });
         }
@@ -1175,6 +1223,10 @@ pub fn interior_enter_exit(
             ));
         }
         for custom_npc in &custom_npcs.npcs {
+            if custom_npc.qbn_symbol.is_some() {
+                // Gestito da `qbn_npc.rs`. Spawn qui produrrebbe un doppione.
+                continue;
+            }
             if state.is_recruited_custom(&custom_npc.name) { continue; }
             let should_spawn = match &custom_npc.position {
                 NpcPosition::Any => is_home,
@@ -1216,8 +1268,6 @@ pub fn interior_enter_exit(
                               flat_archive: 0,
                               flat_record: 0,
                               size: Vec2::new(w, h),
-                          // I custom non hanno un `#N` (nome univoco);
-                          // `instance` è solo per i flat.
                           instance: 0,
                           },
                           CustomNpcName { name: custom_npc.name.clone() },
@@ -1275,8 +1325,6 @@ pub fn interior_enter_exit(
     clear.0 = Color::BLACK;
     state.active = Some(saved);
 
-    // Emette l'evento di prefetch **dopo** aver aggiornato `state` e spawnato
-    // gli NPC.
     voices_event.send(InteriorEntered {
         city: (mx, my),
                       voices: voices_to_prefetch,
@@ -1287,7 +1335,9 @@ pub fn interior_enter_exit(
         PoiKind::Guild => "gilda",
         _ => "taverna",
     };
-    let custom_count = custom_npcs.npcs.iter().filter(|n| !state.is_recruited_custom(&n.name)).count();
+    let custom_count = custom_npcs.npcs.iter().filter(|n| {
+        n.qbn_symbol.is_none() && !state.is_recruited_custom(&n.name)
+    }).count();
     if is_home {
         println!("Entrato in {name} ({what}, sub {sub}): casa NPC ({people_count} flat + {custom_count} custom).");
     } else {

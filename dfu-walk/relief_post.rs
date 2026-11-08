@@ -243,7 +243,7 @@ fn hotkeys(keys: Res<ButtonInput<KeyCode>>, mut cameras: Query<&mut FakeRelief>)
             info!("Finto rilievo: modalita' {}", if relief.mode == 1 { "bump map" } else { "classica" });
         }
         if keys.just_pressed(KeyCode::F9) {
-            relief.debug = (relief.debug + 1) % 7;
+            relief.debug = (relief.debug + 1) % 8;
             info!("Finto rilievo: vista debug {}", relief.debug);
         }
     }
@@ -254,7 +254,7 @@ fn hotkeys(keys: Res<ButtonInput<KeyCode>>, mut cameras: Query<&mut FakeRelief>)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct FakeReliefLabel;
+pub struct FakeReliefLabel;
 
 /// Texture intermedie di una vista: luminanza ridotta, temporanea del blur, media locale e mappa bump.
 #[derive(Component)]

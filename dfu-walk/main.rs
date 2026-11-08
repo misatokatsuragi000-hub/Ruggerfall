@@ -11,27 +11,40 @@
 //!   T = viaggio rapido (mappa dell'Iliac Bay)
 //!   M = mappa dell'Iliac Bay
 //!   L = mappa locale della città (taverne verdi, negozi rossi, gilde blu)
+//!   L (in dungeon) = mappa orbitante 3D del dungeon
 //!   G = attiva/disattiva l'erba
 //!   F11 = schermo intero senza bordi (on/off)
-//!   E / U = entra nel locale/dungeon / esci vicino alla porta
+//!   E = entra nel locale/dungeon, apri/chiudi porta vicina
 //!   Backspace = esci sempre da dungeon/locali
 //!   C = equipaggiamento
+//!   H = scheda del personaggio (attributi, abilità, livello)
 //!   Z = sguaina/rinfodera arma
 //!   X = intensità torcia
+//!   V = apri il bottino di un cadavere vicino
 mod torch;
 mod data;
 mod equipment;
+mod character;
 mod npc_home;
 mod calendar;
 mod grass;
 mod npc_anim;
+mod underwater_fx;
 mod fps_weapon;
 mod snow_fx;
+mod pathfind;
+mod spell_guide;
+mod underwater;
+mod magic_items;
 mod dungeon_enemies;
 mod interior;
 mod local_map;
+mod character_sheet;
+mod dungeon_map;
 mod dialog;
+mod item_templates;
 mod ship;
+mod ships;
 mod classic_npc;
 mod map;
 mod fast_travel;
@@ -52,15 +65,28 @@ mod trees;
 mod tts;
 mod wall_textures;
 mod water; // mantenuto per depth_map (usato in tiles.rs)
-mod ocean; // ← NUOVO: pipeline FFT
+mod ocean; // ← pipeline FFT
 mod world;
 mod compass;
 mod vitals;
 mod dungeon;
+// --- main quest (QBN): interprete, PNG, giornale, oggetti, pickup, notifiche ---
+mod qbn;
+mod qbn_npc;
+mod main_quest;
+mod journal;
+mod quest_items;
+mod quest_pickups;
+mod quest_save;
+mod toast;
+mod combat;
+mod damage_fx;
+mod loot;
 mod relief_post;
 mod custom_cursor;
 
 use crate::data::blocks::RmbBlock;
+
 use crate::data::bsa::{BsaArchive, BsaDirectory};
 use crate::data::maps::{DFLocation, MapsReader};
 use crate::data::Season;
@@ -481,9 +507,12 @@ fn main() {
     println!("         T = viaggio rapido (mappa dell'Iliac Bay). ");
     println!("         M = apri/chiudi mappa dell'Iliac Bay. ");
     println!("         L = mappa locale della città (taverne verdi, negozi rossi, gilde blu). ");
+    println!("         L (in dungeon) = mappa orbitante 3D del dungeon. ");
     println!("         G = attiva/disattiva l'erba. ");
-    println!("         E / U = entra nel locale o dungeon / esci vicino alla porta (Backspace = esci sempre). ");
-    println!("         C = equipaggiamento, Z = arma, X = torcia. ");
+    println!("         E = entra nel locale/dungeon, apri/chiudi porta vicina. ");
+    println!("         Backspace = esci sempre da dungeon/locali. ");
+    println!("         C = equipaggiamento, H = scheda personaggio, Z = arma, X = torcia. ");
+    println!("         V = apri il bottino di un cadavere vicino. ");
 
     let (quest_lib, quest_warnings) = dfquest::Library::load_dir(
         std::path::Path::new(dfquest::DEFAULT_QUESTS_DIR),
@@ -543,15 +572,34 @@ fn main() {
         }),
     )
     .add_plugins(dialog::DialogPlugin)
+    .add_plugins((
+        main_quest::MainQuestPlugin,
+        qbn_npc::QbnNpcPlugin,
+        journal::JournalPlugin,
+        quest_items::QuestItemsPlugin,
+        quest_pickups::QuestPickupsPlugin,
+        toast::ToastPlugin,
+    ))
     .add_plugins(quest_llm::QuestPlugin)
     .add_plugins(tts::TtsPlugin)
+
     .add_plugins(rain_fx::RainFxPlugin)
     .add_plugins(npc_home::NpcHomePlugin)
     .add_plugins(fps_weapon::FpsWeaponPlugin)
     .add_plugins(calendar::CalendarPlugin)
     .add_plugins(compass::CompassPlugin)
     .add_plugins(ship::ShipPlugin)
+    .add_plugins(combat::CombatPlugin)
+    .add_plugins(damage_fx::DamageFxPlugin)
+    .add_plugins(loot::LootPlugin)
+    .add_plugins(character::CharacterPlugin)
+    .add_plugins(character_sheet::CharacterSheetPlugin)
+    .add_plugins(spell_guide::GuideSpellPlugin)
+    .add_plugins(relief_post::FakeReliefPlugin)
+    .add_plugins(underwater_fx::UnderwaterFxPlugin)
+    .add_plugins(underwater::UnderwaterPlugin)
     .add_plugins(fast_travel::FastTravelPlugin)
+    .add_plugins(dungeon_map::DungeonMapPlugin)
     .add_plugins(tiles::FollowerMoodPlugin)
     .add_plugins(vitals::VitalsPlugin)
     .add_plugins(tuning_menu::TuningMenuPlugin)
@@ -560,7 +608,7 @@ fn main() {
     .add_plugins(torch::TorchPlugin)
     .add_plugins(savegame::SaveGamePlugin)
     .add_plugins(equipment::EquipmentPlugin)
-    .add_plugins(relief_post::FakeReliefPlugin)
+
     .add_plugins(dungeon::DungeonPlugin)
     .add_plugins(snow_fx::SnowFxPlugin)
 
@@ -605,6 +653,7 @@ fn main() {
     .add_event::<music::MusicEvent>()
     .insert_resource(music::MusicController::default())
     .init_resource::<music::MusicDucking>()
+    .init_resource::<magic_items::MagicItemsCatalog>()
     .add_systems(
         Startup,
         (
@@ -614,6 +663,7 @@ fn main() {
          local_map::setup_local_map,
          music::start_music,
          grass::setup_grass,
+
         )
         .chain(),
     )
@@ -624,6 +674,8 @@ fn main() {
          player::player_look,
          interior::interior_enter_exit,
          interior::interior_move,
+         interior::interior_toggle_doors,
+         interior::animate_doors,
          interior::face_flats,
          npc_anim::update_npcs,
          tiles::update_followers,
@@ -636,7 +688,7 @@ fn main() {
          // L'acqua non è più un figlio dei chunk: il piano segue il giocatore
          ocean::update_ocean_plane,
          sky::update_dream_texture,
-         sky::update_sky.run_if(interior::outside),
+         sky::update_sky,
         )
         .chain(),
     )
@@ -686,8 +738,8 @@ fn setup(
         Camera3d::default(),
                     Projection::Perspective(PerspectiveProjection {
                         fov: 70.0_f32.to_radians(),
-                                            near: 0.5,
-                                            far: reach * 1.3,
+                                            near: 0.1,
+                                            far: reach * 2.0,
                                             ..default()
                     }),
                     DistanceFog {

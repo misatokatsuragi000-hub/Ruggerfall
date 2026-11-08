@@ -11,30 +11,53 @@
 //! - `update_sky` che aggiorna **solo** `DirectionalLight`, `AmbientLight`,
 //!   `ClearColor` e `DistanceFog` in base a `sky_state(clock.hours)`.
 //!
-//! ## Sottomoduli esposti
+//! ## Buio del dungeon proporzionale alla stanza
 //!
-//! - `sky::dream_sky` (`DreamSkyPlugin`, `CurrentPreset`, `DreamSkyDome`,
-//!   `DreamSkySpawned`)
-//! - `sky::dream_sky_material` (`DreamSkyMaterial`, `SkyboxUniforms`)
-//! - `sky::presets` (`WeatherPreset`, `preset_for`, `SUNNY`, `CLOUDY`, ...)
+//! Se `DungeonState::is_inside()` è vero, `update_sky` calcola un **fattore**
+//! in base alla dimensione della stanza in cui si trova il player: 16 raggi
+//! orizzontali con `clearance`, accoppiati in 8 **corde** (raggio + raggio
+//! opposto, quindi la misura non dipende da dove sta il player nella stanza);
+//! la dimensione e' la **seconda corda piu' corta** (ignora un pilastro o una
+//! porta aperta che falsano una sola direzione), poi curva `smoothstep^exponent`
+//! fra `dungeon_room_dim_min` e `dungeon_room_dim_max`.
 //!
-//! **NON** usare `sky::dream_sky_plugin`: è un file vecchio/incompleto che
-//! ha `unimplemented!()` in `resolve_texture`. Non è dichiarato come modulo
-//! qui (e non lo era nemmeno prima).
+//! ## Luce "sole" nel dungeon: segue la camera
 //!
-//! ## Cosa è stato rimosso
+//! Il sole del dungeon e' una `DirectionalLight` senza ombre: illumina anche
+//! attraverso muri e soffitti, con una direzione che restava quella dell'ultimo
+//! frame all'aperto. Le facce a shading `N.L` risultavano quindi molto piu'
+//! chiare o scure a seconda di come erano orientate rispetto a una direzione
+//! arbitraria (e dell'ora del giorno all'ingresso). Con `dungeon_headlamp` la
+//! luce guarda nella direzione in cui guarda il player, inclinata verso il
+//! basso di `dungeon_headlamp_pitch` gradi: tutte le superfici che vedi ricevono
+//! una luce coerente, e il fattore stanza resta l'unico che decide la luminosita'.
+//! Il fattore moltiplica `dungeon_sun_illuminance` e
+//! `dungeon_ambient_brightness`.
 //!
-//! - **Tasto F3 in `update_sky`**: era la causa del "dopo 8s il cielo si
-//!   copre". Impostava `SkyOvercast.target = 1` e in `OVERCAST_FADE_SECS`
-//!   secondi copriva tutto con il layer DREAM. F3 ora è solo in
-//!   `dream_sky::cycle_preset_manual` (cambia il preset del cielo).
-//! - **`drive_overcast_from_weather`**: era il pilota automatico
-//!   dell'overcast DREAM. Ora è no-op.
-//! - **`update_dream_texture`**: caricava la texture `2k sky N` per il
-//!   vecchio layer. Ora è no-op (il layer è nascosto).
-//! - **Aggiornamento dei materiali della vecchia cupola / nuvole / stelle**:
-//!   non servono più (le entità sono nascoste da `hide_legacy_sky_parts` in
-//!   `dream_sky.rs`).
+//! Con i default (dim 3–20 m, factor_min 0.03, exponent 1.5):
+//! - tunnel e stanze < 6 m: fattore 0.03 → quasi buio pesto (10 ambient, 105 sole)
+//! - stanze 8–12 m: fattore 0.09–0.43 → media luce
+//! - stanze 15 m: fattore 0.76 → chiara
+//! - sala del trono 20 m+: fattore 1.0 → luce piena (350 ambient, 3500 sole)
+//!
+//! Il probe è **rumoroso** (pilastri, cornici, archi possono far "vedere" o
+//! "non vedere" un muro a seconda del pixel): per questo il fattore viene
+//! **smussato esponenzialmente** (`FACTOR_SMOOTH_TAU ≈ 0.4 s`) prima di
+//! essere applicato alla luce. Al primo frame in un nuovo dungeon il fattore
+//! smoothed parte **direttamente dal valore grezzo** (non da 0), così non
+//! c'è un fade-in indesiderato.
+//!
+//! ## Override manuali (menu F1, scheda "Luce cielo")
+//!
+//! `SkyLightTuning` può essere modificata dal menu F1 e salvata su
+//! `sky_settings.txt`. `update_sky` la legge con `Option<Res<...>>`: se la
+//! risorsa non esiste usa il comportamento astronomico normale.
+//!
+//! ## Nebbia di distanza allineata al cielo
+//!
+//! Il colore della nebbia è ottenuto mixando il colore dell'orizzonte
+//! calcolato dall'ora del giorno con il colore del fog del preset meteo
+//! corrente. Il fattore di mix è `WeatherLighting::fog_gray` del preset.
 
 use crate::calendar::GameDate;
 use crate::data::climate::Season;
@@ -49,8 +72,9 @@ use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use crate::data::sky::{
     cloud_grid, generate_cloud_texture, generate_stars, lighting, mip_chain_rgba,
-    sky_state, SkyState,
+    sky_state, SkyState, lin,
 };
+use std::path::Path;
 
 // =============================================================================
 // Sottomoduli (esposti a main.rs)
@@ -61,7 +85,7 @@ pub mod dream_sky_material;
 pub mod presets;
 
 // =============================================================================
-// Costanti (mantenute per setup_sky e per le vecchie entità nascoste)
+// Costanti
 // =============================================================================
 
 const DOME_RADIUS: f32 = 50_000.0;
@@ -76,6 +100,254 @@ const CLOUD_TILE: f32 = 6_000.0;
 const CLOUD_TEXTURE: usize = 512;
 const CLOUD_MIPS: usize = 9;
 const STARS_DEPTH_BIAS: f32 = -200_000.0;
+
+// --- Buio stanza: costanti del probe ---
+const ROOM_PROBE_MAX: f32 = 40.0;
+/// Numero di raggi (pari): `ROOM_RAYS / 2` corde.
+const ROOM_RAYS: usize = 16;
+/// Passo grossolano del raggio, poi affinato a `ROOM_PROBE_FINE` sull'ultimo tratto.
+const ROOM_PROBE_COARSE: f32 = 1.0;
+const ROOM_PROBE_FINE: f32 = 0.25;
+/// Quale corda (0 = la piu' corta) vale come dimensione della stanza.
+const ROOM_CHORD_RANK: usize = 1;
+const ROOM_PROBE_CLEARANCE_CAP: f32 = 1.0;
+const ROOM_PROBE_BLOCK_THRESHOLD: f32 = 0.6;
+const ROOM_CACHE_INTERVAL_SECS: f32 = 0.3;
+const ROOM_CACHE_MOVE_SQ: f32 = 1.0;
+
+/// Costante di tempo dello smoothing esponenziale del fattore stanza.
+/// Più alta = transizioni più lente e morbide. 0.4 s è un buon compromesso:
+/// abbastanza per assorbire il rumore del probe, abbastanza basso per
+/// accorgersi del passaggio stanza→corridoio.
+const FACTOR_SMOOTH_TAU: f32 = 0.4;
+
+// =============================================================================
+// TUNING MANUALE (menu F1)
+// =============================================================================
+
+pub const SKY_SETTINGS_FILE: &str = "sky_settings.txt";
+
+/// Override manuali di `DirectionalLight` (sole) e `AmbientLight`, più i
+/// parametri del buio del dungeon.
+#[derive(Resource, Debug, Clone)]
+pub struct SkyLightTuning {
+    pub sun_illuminance_override: Option<f32>,
+    pub sun_color_override: Option<[f32; 3]>,
+    pub ambient_brightness_override: Option<f32>,
+    pub ambient_color_override: Option<[f32; 3]>,
+
+    pub dungeon_sun_illuminance: f32,
+    pub dungeon_ambient_brightness: f32,
+    pub dungeon_ambient_color: [f32; 3],
+    pub dungeon_fog_start: f32,
+    pub dungeon_fog_end: f32,
+
+    pub dungeon_room_scale_enabled: bool,
+    pub dungeon_room_dim_min: f32,
+    pub dungeon_room_dim_max: f32,
+    pub dungeon_room_factor_min: f32,
+    /// Esponente applicato alla curva smoothstep. 1.0 = smoothstep puro,
+    /// > 1 = più selettiva (favorisce le stanze grandi, penalizza le medie),
+    /// < 1 = più permissiva.
+    pub dungeon_room_curve_exponent: f32,
+
+    /// Nel dungeon la luce "sole" segue la direzione dello sguardo (vedi doc del modulo).
+    pub dungeon_headlamp: bool,
+    /// Inclinazione verso il basso della luce (gradi): 0 = orizzontale, 90 = dall'alto.
+    pub dungeon_headlamp_pitch: f32,
+}
+
+impl Default for SkyLightTuning {
+    fn default() -> Self {
+        Self {
+            sun_illuminance_override: None,
+            sun_color_override: None,
+            ambient_brightness_override: None,
+            ambient_color_override: None,
+
+            // Valori "tetto" (fattore 1.0) alzati per la sala del trono:
+            // 350 ambient (2.3× rispetto a prima) e 3500 sole.
+            dungeon_sun_illuminance: 3500.0,
+            dungeon_ambient_brightness: 350.0,
+            dungeon_ambient_color: [0.15, 0.14, 0.20],
+            dungeon_fog_start: 30.0,
+            dungeon_fog_end: 150.0,
+
+            // Curva più selettiva: solo stanze > 12 m ricevono luce media,
+            // solo 20 m+ ricevono luce piena. Tunnel e stanze piccole: buio.
+            dungeon_room_scale_enabled: true,
+            dungeon_room_dim_min: 3.0,
+            dungeon_room_dim_max: 20.0,
+            dungeon_room_factor_min: 0.03,
+            dungeon_room_curve_exponent: 1.5,
+
+            dungeon_headlamp: true,
+            dungeon_headlamp_pitch: 35.0,
+        }
+    }
+}
+
+fn fopt(v: Option<f32>) -> String {
+    v.map_or_else(|| "none".to_string(), |x| format!("{x}"))
+}
+
+fn copt(v: Option<[f32; 3]>) -> String {
+    v.map_or_else(|| "none".to_string(), |c| format!("{},{},{}", c[0], c[1], c[2]))
+}
+
+fn parse_fopt(s: &str) -> Option<Option<f32>> {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        Some(None)
+    } else {
+        t.parse().ok().map(Some)
+    }
+}
+
+fn parse_copt(s: &str) -> Option<Option<[f32; 3]>> {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    let p: Vec<&str> = t.split(',').map(str::trim).collect();
+    if p.len() != 3 {
+        return None;
+    }
+    Some(Some([p[0].parse().ok()?, p[1].parse().ok()?, p[2].parse().ok()?]))
+}
+
+fn parse_color_or(s: &str, default: [f32; 3]) -> [f32; 3] {
+    let p: Vec<&str> = s.split(',').map(str::trim).collect();
+    if p.len() != 3 {
+        return default;
+    }
+    [
+        p[0].parse().unwrap_or(default[0]),
+        p[1].parse().unwrap_or(default[1]),
+        p[2].parse().unwrap_or(default[2]),
+    ]
+}
+
+impl SkyLightTuning {
+    pub fn load(path: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            info!(
+                "SkyLightTuning: {} non trovato, uso i valori predefiniti (F1 per regolare)",
+                  path.display()
+            );
+            return Self::default();
+        };
+        Self::parse(&text)
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut t = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let (k, v) = (k.trim(), v.trim());
+            match k {
+                "sun_illuminance_override" => {
+                    if let Some(o) = parse_fopt(v) { t.sun_illuminance_override = o; }
+                }
+                "sun_color_override" => {
+                    if let Some(o) = parse_copt(v) { t.sun_color_override = o; }
+                }
+                "ambient_brightness_override" => {
+                    if let Some(o) = parse_fopt(v) { t.ambient_brightness_override = o; }
+                }
+                "ambient_color_override" => {
+                    if let Some(o) = parse_copt(v) { t.ambient_color_override = o; }
+                }
+                "dungeon_sun_illuminance" => {
+                    if let Ok(n) = v.parse() { t.dungeon_sun_illuminance = n; }
+                }
+                "dungeon_ambient_brightness" => {
+                    if let Ok(n) = v.parse() { t.dungeon_ambient_brightness = n; }
+                }
+                "dungeon_ambient_color" => {
+                    t.dungeon_ambient_color = parse_color_or(v, t.dungeon_ambient_color);
+                }
+                "dungeon_fog_start" => {
+                    if let Ok(n) = v.parse() { t.dungeon_fog_start = n; }
+                }
+                "dungeon_fog_end" => {
+                    if let Ok(n) = v.parse() { t.dungeon_fog_end = n; }
+                }
+                "dungeon_room_scale_enabled" => {
+                    t.dungeon_room_scale_enabled =
+                    matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+                }
+                "dungeon_room_dim_min" => {
+                    if let Ok(n) = v.parse() { t.dungeon_room_dim_min = n; }
+                }
+                "dungeon_room_dim_max" => {
+                    if let Ok(n) = v.parse() { t.dungeon_room_dim_max = n; }
+                }
+                "dungeon_room_factor_min" => {
+                    if let Ok(n) = v.parse() { t.dungeon_room_factor_min = n; }
+                }
+                "dungeon_room_curve_exponent" => {
+                    if let Ok(n) = v.parse() { t.dungeon_room_curve_exponent = n; }
+                }
+                "dungeon_headlamp" => {
+                    t.dungeon_headlamp =
+                    matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+                }
+                "dungeon_headlamp_pitch" => {
+                    if let Ok(n) = v.parse() { t.dungeon_headlamp_pitch = n; }
+                }
+                _ => {}
+            }
+        }
+        t
+    }
+
+    pub fn to_text(&self) -> String {
+        let mut s = String::new();
+        s.push_str("# Override manuali del cielo (menu F1). Modifica e riavvia.\n");
+        s.push_str("# `none` = usa il valore astronomico/meteo calcolato.\n");
+        s.push_str("# I colori sono in sRGB 0..1, separati da virgola: \"r,g,b\".\n\n");
+        s.push_str(&format!("sun_illuminance_override = {}\n", fopt(self.sun_illuminance_override)));
+        s.push_str(&format!("sun_color_override = {}\n", copt(self.sun_color_override)));
+        s.push_str(&format!("ambient_brightness_override = {}\n", fopt(self.ambient_brightness_override)));
+        s.push_str(&format!("ambient_color_override = {}\n\n", copt(self.ambient_color_override)));
+        s.push_str("# Buio del dungeon (applicato quando DungeonState::is_inside())\n");
+        s.push_str("# I valori di sole/ambient sono MOLTIPLICATI per il fattore stanza.\n");
+        s.push_str(&format!("dungeon_sun_illuminance = {}\n", self.dungeon_sun_illuminance));
+        s.push_str(&format!("dungeon_ambient_brightness = {}\n", self.dungeon_ambient_brightness));
+        s.push_str(&format!(
+            "dungeon_ambient_color = {},{},{}\n",
+            self.dungeon_ambient_color[0],
+            self.dungeon_ambient_color[1],
+            self.dungeon_ambient_color[2]
+        ));
+        s.push_str(&format!("dungeon_fog_start = {}\n", self.dungeon_fog_start));
+        s.push_str(&format!("dungeon_fog_end = {}\n\n", self.dungeon_fog_end));
+        s.push_str("# Curva stanza: piu' grande la stanza, piu' luce.\n");
+        s.push_str("# `dungeon_room_dim_min` = dimensione (m) sotto cui il fattore e' minimo\n");
+        s.push_str("# `dungeon_room_dim_max` = dimensione (m) sopra cui il fattore e' 1.0\n");
+        s.push_str("# `dungeon_room_curve_exponent` = 1.0 = smoothstep puro, >1 = piu' selettiva\n");
+        s.push_str(&format!("dungeon_room_scale_enabled = {}\n", self.dungeon_room_scale_enabled as u32));
+        s.push_str(&format!("dungeon_room_dim_min = {}\n", self.dungeon_room_dim_min));
+        s.push_str(&format!("dungeon_room_dim_max = {}\n", self.dungeon_room_dim_max));
+        s.push_str(&format!("dungeon_room_factor_min = {}\n", self.dungeon_room_factor_min));
+        s.push_str(&format!("dungeon_room_curve_exponent = {}\n\n", self.dungeon_room_curve_exponent));
+        s.push_str("# Luce sole nel dungeon: 1 = segue lo sguardo del player (inclinata verso il\n");
+        s.push_str("# basso di `dungeon_headlamp_pitch` gradi), 0 = direzione fissa dell'ultimo frame\n");
+        s.push_str("# all'aperto (illuminazione dipendente dall'orientamento delle facce).\n");
+        s.push_str(&format!("dungeon_headlamp = {}\n", self.dungeon_headlamp as u32));
+        s.push_str(&format!("dungeon_headlamp_pitch = {}\n", self.dungeon_headlamp_pitch));
+        s
+    }
+
+    pub fn load_or_default(path: &Path) -> Self {
+        Self::load(path)
+    }
+}
 
 // =============================================================================
 // Componenti e risorse
@@ -138,9 +410,6 @@ impl SkyClock {
     }
 }
 
-/// Overcast del vecchio sistema DREAM: **non più usato**. La risorsa esiste
-/// ancora per retro-compatibilità con eventuali moduli esterni, ma il livello
-/// è sempre 0 e non copre più niente.
 #[derive(Resource, Default)]
 pub struct SkyOvercast {
     pub target: f32,
@@ -148,14 +417,9 @@ pub struct SkyOvercast {
     pub manual_override: Option<f32>,
 }
 
-/// Se true, il maltempo accorcia anche la portata della nebbia di distanza
-/// (funziona solo con `FogFalloff::Linear`).
 const WEATHER_FOG_RANGE: bool = true;
-/// Costante di tempo (secondi reali) con cui la luce segue il cambio di meteo.
 const WEATHER_LIGHT_TAU: f32 = 4.0;
 
-/// Stato della luce "di meteo" di `update_sky`: i moltiplicatori inseguono il
-/// valore del preset con una transizione morbida, così non scattano.
 pub struct WeatherLightState {
     sun: f32,
     ambient: f32,
@@ -163,7 +427,6 @@ pub struct WeatherLightState {
     fog_bright: f32,
     fog_gray: f32,
     fog_range: f32,
-    /// Nebbia originale (start, end) catturata la prima volta, per riportarla com'era.
     base_fog: Option<(f32, f32)>,
     fog_touched: bool,
     snapped: bool,
@@ -186,6 +449,29 @@ impl Default for WeatherLightState {
     }
 }
 
+/// Cache del fattore stanza.
+///
+/// - `raw_factor`: ultimo valore calcolato dal probe (aggiornato ogni 0.3 s
+///   o quando il player si sposta di più di 1 m). È **rumoroso**: pilastri,
+///   cornici, archi possono far "vedere" o "non vedere" un muro a seconda
+///   del pixel, quindi piccoli spostamenti producono salti.
+/// - `smoothed_factor`: valore inseguito esponenzialmente ogni frame da
+///   `update_sky` con costante di tempo `FACTOR_SMOOTH_TAU`. È **questo**
+///   che viene applicato alla luce: assorbe il rumore del probe e rende
+///   morbide le transizioni stanza→corridoio.
+///
+/// **Deve essere `pub`**: appare nella firma di `update_sky` come
+/// `Local<RoomLightCache>` e Bevy richiede che il tipo sia visibile dal
+/// codice generato. I campi possono restare privati.
+#[derive(Default)]
+pub struct RoomLightCache {
+    pos: Vec3,
+    raw_factor: f32,
+    smoothed_factor: f32,
+    timer: f32,
+    initialized: bool,
+}
+
 pub struct SkyLocal {
     pub dome_timer: f32,
     pub dream_hidden: bool,
@@ -200,9 +486,6 @@ impl Default for SkyLocal {
     }
 }
 
-/// Handle dei materiali della vecchia cupola/nuvole/DREAM. La risorsa esiste
-/// ancora perché `setup_sky` la crea e `main.rs` la passa come argomento in
-/// `setup_sky`, ma `update_sky` non la usa più.
 #[derive(Resource)]
 pub struct SkyHandles {
     pub dome: Handle<Mesh>,
@@ -213,7 +496,7 @@ pub struct SkyHandles {
 }
 
 // =============================================================================
-// Setup: crea SkyClock + DirectionalLight + le vecchie entità
+// Setup
 // =============================================================================
 
 pub fn setup_sky(
@@ -236,6 +519,8 @@ pub fn setup_sky(
         },
         paused: config.day_minutes <= 0.0,
     });
+
+    commands.init_resource::<SkyLightTuning>();
 
     // --- Vecchia cupola procedurale (nascosta) ---
     let mut dome = Sphere::new(DOME_RADIUS).mesh().uv(64, 32);
@@ -399,21 +684,129 @@ pub fn setup_sky(
 }
 
 // =============================================================================
-// Update: SOLO illuminazione e orologio
+// Calcolo del fattore stanza (dungeon)
 // =============================================================================
 
+/// Risultato del probe stanza.
+struct RoomProbe {
+    /// Dimensione della stanza (m): la corda di rango `ROOM_CHORD_RANK`.
+    size: f32,
+    /// La corda piu' corta (m), solo per il log di debug.
+    shortest: f32,
+    /// La corda piu' lunga (m), solo per il log di debug.
+    longest: f32,
+}
+
+/// Distanza libera (m) dal punto (x, z) lungo la direzione `dir`: avanza a passo
+/// grossolano finche' `clearance` dice "muro", poi affina l'ultimo tratto.
+fn ray_free_distance(
+    d: &crate::data::dungeon_builder::BuiltDungeon,
+    x: f32,
+    z: f32,
+    feet_y: f32,
+    dir: (f32, f32),
+) -> f32 {
+    let blocked = |t: f32| {
+        d.clearance(x + dir.0 * t, z + dir.1 * t, feet_y, ROOM_PROBE_CLEARANCE_CAP)
+            < ROOM_PROBE_BLOCK_THRESHOLD
+    };
+    let mut free = 0.0f32;
+    let mut t = ROOM_PROBE_COARSE;
+    while t <= ROOM_PROBE_MAX {
+        if blocked(t) {
+            let mut f = free + ROOM_PROBE_FINE;
+            while f < t {
+                if blocked(f) {
+                    break;
+                }
+                free = f;
+                f += ROOM_PROBE_FINE;
+            }
+            return free;
+        }
+        free = t;
+        t += ROOM_PROBE_COARSE;
+    }
+    free
+}
+
+/// Misura la dimensione dell'ambiente con `ROOM_RAYS` raggi orizzontali.
+///
+/// Ogni raggio viene accoppiato a quello opposto in una **corda** (somma delle due
+/// distanze libere): la corda non dipende da dove sta il player nella stanza (con il
+/// vecchio `dist+ + dist-` valeva solo sugli assi). La dimensione e' la seconda corda
+/// piu' corta: un pilastro che blocca una direzione, o una porta aperta che ne
+/// allunga un'altra, non spostano il risultato.
+fn room_probe(
+    d: &crate::data::dungeon_builder::BuiltDungeon,
+    x: f32,
+    z: f32,
+    feet_y: f32,
+) -> RoomProbe {
+    let half = ROOM_RAYS / 2;
+    let mut dist = [0.0f32; ROOM_RAYS];
+    for (i, slot) in dist.iter_mut().enumerate() {
+        let a = i as f32 / ROOM_RAYS as f32 * std::f32::consts::TAU;
+        *slot = ray_free_distance(d, x, z, feet_y, (a.cos(), a.sin()));
+    }
+    let mut chords: Vec<f32> = (0..half).map(|i| dist[i] + dist[i + half]).collect();
+    chords.sort_by(|a, b| a.total_cmp(b));
+    RoomProbe {
+        size: chords[ROOM_CHORD_RANK.min(half - 1)],
+        shortest: chords[0],
+        longest: chords[half - 1],
+    }
+}
+
+/// Curva stanza → fattore, con esponente configurabile.
+///
+/// Formula: `(smoothstep(x))^exponent`, dove `x = clamp((dim - min)/(max - min), 0, 1)`.
+/// Con `exponent = 1.0` è lo smoothstep classico; con `> 1` la curva è più
+/// ripida nella parte alta (solo stanze grandi ricevono luce piena).
+fn room_light_factor(t: &SkyLightTuning, small_dim: f32) -> f32 {
+    if !t.dungeon_room_scale_enabled {
+        return 1.0;
+    }
+    let lo = t.dungeon_room_dim_min;
+    let hi = t.dungeon_room_dim_max;
+    if hi <= lo {
+        return 1.0;
+    }
+    let x = ((small_dim - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let smooth = x * x * (3.0 - 2.0 * x);
+    let exp = t.dungeon_room_curve_exponent.max(0.1);
+    let curved = smooth.powf(exp);
+    curved.max(t.dungeon_room_factor_min).clamp(0.0, 1.0)
+}
+
+// =============================================================================
+// Update
+// =============================================================================
+
+fn srgb3(c: [f32; 3]) -> [f32; 3] {
+    [lin([c[0], 0.0, 0.0])[0], lin([c[1], 0.0, 0.0])[0], lin([c[2], 0.0, 0.0])[0]]
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn update_sky(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mut clock: ResMut<SkyClock>,
     mut ambient: ResMut<AmbientLight>,
     mut clear: ResMut<ClearColor>,
-    mut light: Query<(&mut DirectionalLight, &mut Transform), With<SunLight>>,
+    // `Without<Player>` sul `light` è necessario perché più sotto c'è
+    // `player: Query<(&Player, &Transform)>`: senza il filtro Bevy non può
+    // provare che le due query sono disgiunte su `Transform` e va in panic
+    // con `error[B0001]`.
+    mut light: Query<(&mut DirectionalLight, &mut Transform), (With<SunLight>, Without<Player>)>,
+                  player: Query<(&Player, &Transform)>,
                   mut fog: Query<&mut DistanceFog>,
-    preset: Option<Res<CurrentPreset>>,
-    interior: Option<Res<crate::interior::InteriorState>>,
-    dungeon: Option<Res<crate::dungeon::DungeonState>>,
-    mut weather_light: Local<WeatherLightState>,
+                  preset: Option<Res<CurrentPreset>>,
+                  interior: Option<Res<crate::interior::InteriorState>>,
+                  dungeon: Option<Res<crate::dungeon::DungeonState>>,
+                  tuning: Option<Res<SkyLightTuning>>,
+                  mut weather_light: Local<WeatherLightState>,
+                  mut room_cache: Local<RoomLightCache>,
 ) {
     let dt = time.delta_secs();
 
@@ -432,19 +825,106 @@ pub fn update_sky(
     }
     clock.advance_seconds(dt);
 
+    let t = tuning.as_deref().cloned().unwrap_or_default();
+
+    // --- BUIO DEL DUNGEON ---------------------------------------------------
+    let in_dungeon = dungeon.as_ref().is_some_and(|d| d.is_inside());
+    if in_dungeon {
+        // 1. Calcola (o riusa dalla cache) il fattore stanza.
+        //
+        // `room_cache` è `Local<RoomLightCache>`: DerefMut porta a
+        // `RoomLightCache`, quindi `.timer` è già `f32` (niente `*`).
+        let player_fwd = player.get_single().ok().map(|(_, tf)| tf.rotation * Vec3::NEG_Z);
+        let factor = match (dungeon.as_ref(), player.get_single()) {
+            (Some(d), Ok((p, player_tf))) => match d.active.as_ref() {
+                Some(active) => {
+                    room_cache.timer += dt;
+                    let moved_sq = player_tf.translation.distance_squared(room_cache.pos);
+                    let stale = room_cache.timer >= ROOM_CACHE_INTERVAL_SECS
+                    || moved_sq > ROOM_CACHE_MOVE_SQ
+                    || !room_cache.initialized;
+                    if stale {
+                        let local_feet = p.feet_y - active.origin.y;
+                        let local_x = player_tf.translation.x - active.origin.x;
+                        let local_z = player_tf.translation.z - active.origin.z;
+                        let probe = room_probe(&active.dungeon, local_x, local_z, local_feet);
+                        let small_dim = probe.size;
+                        let raw = room_light_factor(&t, small_dim);
+                        if !room_cache.initialized {
+                            // Primo frame in dungeon: parti direttamente dal
+                            // valore grezzo, così non c'è un fade-in.
+                            room_cache.smoothed_factor = raw;
+                        }
+                        room_cache.raw_factor = raw;
+                        room_cache.timer = 0.0;
+                        room_cache.pos = player_tf.translation;
+                        room_cache.initialized = true;
+                        if std::env::var_os("DF_DUNGEON_LIGHT_DEBUG").is_some() {
+                            info!(
+                                "Dungeon light: dim={:.1} (corda min {:.1}, max {:.1}) raw={:.3} smoothed={:.3}",
+                                small_dim, probe.shortest, probe.longest, raw, room_cache.smoothed_factor
+                            );
+                        }
+                    }
+                    // Smoothing esponenziale ogni frame: assorbe il rumore
+                    // del probe, così la luce non "vibra" quando la cache
+                    // si aggiorna e il probe misura un valore diverso.
+                    let k_smooth = 1.0 - (-dt / FACTOR_SMOOTH_TAU).exp();
+                    room_cache.smoothed_factor +=
+                    (room_cache.raw_factor - room_cache.smoothed_factor) * k_smooth;
+                    room_cache.smoothed_factor
+                }
+                None => 1.0,
+            },
+            _ => 1.0,
+        };
+
+        // 2. Applica i valori dungeon_* scalati per `factor`.
+        if let Ok((mut l, mut tf)) = light.get_single_mut() {
+            l.illuminance = t.dungeon_sun_illuminance * factor;
+            // La luce segue lo sguardo (solo l'orientamento orizzontale) con un'inclinazione
+            // fissa verso il basso: niente piu' facce chiare/scure in base a una direzione
+            // arbitraria del sole all'aperto.
+            if t.dungeon_headlamp {
+                if let Some(fwd) = player_fwd {
+                    let flat = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
+                    if flat != Vec3::ZERO {
+                        let pitch = t.dungeon_headlamp_pitch.clamp(0.0, 89.0).to_radians();
+                        let dir = flat * pitch.cos() + Vec3::NEG_Y * pitch.sin();
+                        *tf = Transform::default().looking_to(dir, Vec3::Y);
+                    }
+                }
+            }
+        }
+        ambient.brightness = t.dungeon_ambient_brightness * factor;
+        ambient.color = Color::srgb(
+            t.dungeon_ambient_color[0],
+            t.dungeon_ambient_color[1],
+            t.dungeon_ambient_color[2],
+        );
+        clear.0 = Color::BLACK;
+        for mut fog in &mut fog {
+            fog.color = Color::BLACK;
+            if let FogFalloff::Linear { start, end } = &mut fog.falloff {
+                *start = t.dungeon_fog_start;
+                *end = t.dungeon_fog_end;
+            }
+        }
+        weather_light.snapped = false;
+        return;
+    }
+
+    room_cache.initialized = false;
+
     let st = sky_state(clock.hours);
     let lit = lighting(&st);
 
-    // --- Meteo: la scena si scurisce con nuvole, pioggia, neve... ---------------
-    // All'aperto segue il preset corrente; in interni e dungeon non si applica
-    // (lì l'illuminazione è gestita dai rispettivi moduli).
-    let outside = !interior.as_ref().is_some_and(|i| i.is_inside())
-        && !dungeon.as_ref().is_some_and(|d| d.is_inside());
+    // --- Meteo --------------------------------------------------------------
+    let outside = !interior.as_ref().is_some_and(|i| i.is_inside());
     let target = match (&preset, outside) {
         (Some(p), true) => p.current.scene_lighting(),
         _ => WeatherLighting::NEUTRAL,
     };
-    // Primo frame: salta direttamente al valore; poi transizione esponenziale.
     let k = if weather_light.snapped { 1.0 - (-dt / WEATHER_LIGHT_TAU).exp() } else { 1.0 };
     weather_light.snapped = true;
     weather_light.sun += (target.sun - weather_light.sun) * k;
@@ -457,27 +937,48 @@ pub fn update_sky(
     }
     let tint = weather_light.tint;
 
+    // --- Sole ---------------------------------------------------------------
     if let Ok((mut l, mut tf)) = light.get_single_mut() {
         let c = lit.light_color;
-        l.illuminance = lit.illuminance * weather_light.sun;
-        l.color = Color::linear_rgb(c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]);
+        let computed_ill = lit.illuminance * weather_light.sun;
+        let computed_color = [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]];
+        let final_ill = t.sun_illuminance_override.unwrap_or(computed_ill);
+        let final_color = match t.sun_color_override {
+            Some(srgb) => srgb3(srgb),
+            None => computed_color,
+        };
+        l.illuminance = final_ill;
+        l.color = Color::linear_rgb(final_color[0], final_color[1], final_color[2]);
         *tf = Transform::default().looking_to(-Vec3::from(lit.light_from), Vec3::Y);
     }
 
+    // --- Ambient ------------------------------------------------------------
     let a = lit.ambient_color;
-    ambient.color = Color::linear_rgb(a[0] * tint[0], a[1] * tint[1], a[2] * tint[2]);
-    ambient.brightness = lit.ambient_brightness * weather_light.ambient;
+    let computed_amb_bright = lit.ambient_brightness * weather_light.ambient;
+    let computed_amb_color = [a[0] * tint[0], a[1] * tint[1], a[2] * tint[2]];
+    let final_amb_bright = t.ambient_brightness_override.unwrap_or(computed_amb_bright);
+    let final_amb_color = match t.ambient_color_override {
+        Some(srgb) => srgb3(srgb),
+        None => computed_amb_color,
+    };
+    ambient.brightness = final_amb_bright;
+    ambient.color = Color::linear_rgb(final_amb_color[0], final_amb_color[1], final_amb_color[2]);
 
-    // Nebbia di distanza: colore dell'ora, desaturato e scurito col maltempo.
+    // --- Nebbia -------------------------------------------------------------
     let f = lit.fog_color;
-    let gray = 0.299 * f[0] + 0.587 * f[1] + 0.114 * f[2];
-    let g = weather_light.fog_gray;
-    let b = weather_light.fog_bright;
-    let fog_rgb = [
-        (f[0] + (gray - f[0]) * g) * b,
-        (f[1] + (gray - f[1]) * g) * b,
-        (f[2] + (gray - f[2]) * g) * b,
+    let preset_horizon = match &preset {
+        Some(p) => crate::sky::presets::preset_for(p.current).fog_day,
+        None => f,
+    };
+    let mix = weather_light.fog_gray.clamp(0.0, 1.0);
+    let blended = [
+        f[0] * (1.0 - mix) + preset_horizon[0] * mix,
+        f[1] * (1.0 - mix) + preset_horizon[1] * mix,
+        f[2] * (1.0 - mix) + preset_horizon[2] * mix,
     ];
+    let b = weather_light.fog_bright;
+    let fog_rgb = [blended[0] * b, blended[1] * b, blended[2] * b];
+
     let range_changed = (weather_light.fog_range - 1.0).abs() > 0.001;
     for mut fog in &mut fog {
         fog.color = Color::linear_rgb(fog_rgb[0], fog_rgb[1], fog_rgb[2]);
@@ -490,7 +991,6 @@ pub fn update_sky(
                     *end = base.1 * weather_light.fog_range;
                     weather_light.fog_touched = true;
                 } else if weather_light.fog_touched {
-                    // Tornato sereno: ripristina la nebbia originale una volta sola.
                     if let Some(base) = weather_light.base_fog {
                         *start = base.0;
                         *end = base.1;
@@ -500,15 +1000,12 @@ pub fn update_sky(
             }
         }
     }
-    let _ = &mut clear; // ClearColor: lo copre la cupola del cielo, non serve toccarlo.
 }
 
 // =============================================================================
-// No-op (retro-compatibilità con main.rs)
+// No-op retro-compat
 // =============================================================================
 
-/// **No-op**: l'overcast DREAM è disattivato. La funzione esiste solo per
-/// non rompere `main.rs` se la chiama ancora.
 pub fn drive_overcast_from_weather(
     _data: Res<GameData>,
     mut overcast: ResMut<SkyOvercast>,
@@ -518,9 +1015,6 @@ pub fn drive_overcast_from_weather(
     overcast.manual_override = None;
 }
 
-/// **No-op**: la vecchia texture DREAM non viene più caricata (il layer è
-/// nascosto). La funzione esiste solo per non rompere `main.rs` se la chiama
-/// ancora in `.add_systems(Update, (...))`.
 pub fn update_dream_texture() {}
 
 // =============================================================================
@@ -535,10 +1029,6 @@ fn unlit(color: Color) -> StandardMaterial {
         ..default()
     }
 }
-
-// =============================================================================
-// Fix stagione (retro-compatibilità)
-// =============================================================================
 
 pub fn season_from_config(config: &SkyConfig) -> Season {
     GameDate::new(405, config.start_month, config.start_day, config.hour).season()

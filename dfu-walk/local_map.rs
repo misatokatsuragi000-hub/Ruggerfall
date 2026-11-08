@@ -118,15 +118,20 @@ pub fn toggle_local_map(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<LocalMapState>,
     mut roots: Query<&mut Visibility, With<LocalMapUi>>,
+    dungeon: Option<Res<crate::dungeon::DungeonState>>,
 ) {
+    // Dentro un dungeon, il tasto L è gestito da `dungeon_map`.
+    if dungeon.is_some_and(|d| d.is_inside()) {
+        return;
+    }
     let toggle = keyboard.just_pressed(KeyCode::KeyL)
-        || (state.is_open && keyboard.just_pressed(KeyCode::Escape));
+    || (state.is_open && keyboard.just_pressed(KeyCode::Escape));
     if !toggle {
         return;
     }
     state.is_open = !state.is_open;
     if state.is_open {
-        state.shown = None; // ridisegna alla prossima update
+        state.shown = None;
     }
     for mut vis in &mut roots {
         *vis = if state.is_open { Visibility::Visible } else { Visibility::Hidden };

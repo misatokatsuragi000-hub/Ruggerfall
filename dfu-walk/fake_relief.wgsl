@@ -368,6 +368,14 @@ fn fragment_relief(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     }
 
     let z = depth_z(uv);
+
+    // Debug 7: profondita' (m). Chiaro = vicino. Serve a controllare che anche arma e
+    // scudo (quad a ~0.9 m dalla camera) stiano nel depth buffer: se appaiono qui, lo
+    // shader li tratta come qualunque altra superficie.
+    if S.debug == 7u {
+        return out_g(vec3<f32>(sat(1.0 - z / 12.0)));
+    }
+
     if z / S.far_plane > 0.999 {
         return final_out(lin, pivot);
     }

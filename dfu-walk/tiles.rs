@@ -38,6 +38,25 @@
 //! dalla pipeline FFT in `ocean.rs`. Il campo `water_depth` di `TileResult`
 //! rimane come informazione diagnostica ma non viene più consumato in
 //! `collect_tiles`.
+//!
+//! ## Flip nord-sud (flip_ns)
+//!
+//! Il contenuto di un blocco RMB città viene specchiato (`n' = BLOCK_UNITS - n`)
+//! quando `rmb.set_flip_ns(true)` è chiamato dopo il parse. Questo allinea i
+//! flat esterni ai palazzi già specchiati da `city_buildings.rs`. Il terrain
+//! `ground_tiles` **non** è specchiato (gestione in `terrain_city.rs`).
+//!
+//! ## Probe dei muri (`Colliders::probe`)
+//!
+//! Prima di questa fix `probe` usava i `WallSegment` (lo spigolo dominante di
+//! ogni triangolo proiettato in XZ). Per una facciata rettangolare i due
+//! triangoli producevano le due diagonali, quindi un raggio orizzontale le
+//! mancava quasi sempre: era impossibile scalare qualunque muro non rettilineo
+//! (timpani, archi, facciate a più triangoli). Ora `probe` itera sui
+//! `WallTri` (triangoli interi) e ne taglia la sezione orizzontale a `eye_y`
+//! (`slice_at_y`): il raggio colpisce per tutta la larghezza del muro a
+//! qualunque altezza. `resolve` (pushout) continua a usare i `WallSegment`:
+//! la fisica del player non cambia.
 use crate::interior::InteriorState;
 use crate::mod_textures::ModTextures;
 use crate::player::Player;
@@ -56,7 +75,7 @@ use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use crate::data::blocks::RmbBlock;
 use crate::data::bsa::BsaArchive;
 use crate::data::building_gen::{MaterialKind, MeshPart, MATERIAL_COUNT, DF_UNIT, BLOCK_SIZE_M};
-use crate::data::city_buildings::build_city_buildings;
+use crate::data::city_buildings::{build_city_buildings, royal_avenue_contains};
 use crate::data::heightmap::OCEAN_ELEVATION;
 use crate::data::terrain_city::{assemble_city_tilemap, flatten_terrain_heights, CityTileRect};
 use crate::data::terrain_mesh::{build_terrain_mesh, terrain_height, TerrainMeshData, CELL_SIZE};
@@ -73,7 +92,32 @@ const MAX_PENDING: usize = 12;
 const MAX_SPAWNS_PER_FRAME: usize = 4;
 const DEFAULT_CLIMATE: i32 = 231;
 
+/// Flat RMB da disegnare come albero 3D (cross-billboard della natura).
+/// 210_28 e' una scelta artistica: nel gioco originale e' un lampione/palo
+/// (archivio 210 = luci in DFU), qui viene sostituito da un albero.
+/// Per sostituire altri flat senza ricompilare: `DF_TREE_FLATS="210_29,210_20"`.
 const FLAT_IDS_AS_TREES: &[(u16, u8)] = &[(210, 28)];
+
+fn is_tree_flat(archive: u16, record: u8) -> bool {
+    static EXTRA: std::sync::OnceLock<Vec<(u16, u8)>> = std::sync::OnceLock::new();
+    if FLAT_IDS_AS_TREES.contains(&(archive, record)) {
+        return true;
+    }
+    let extra = EXTRA.get_or_init(|| {
+        std::env::var("DF_TREE_FLATS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+            .filter_map(|t| {
+                let (a, r) = t.trim().split_once('_')?;
+                Some((a.parse().ok()?, r.parse().ok()?))
+            })
+            .collect()
+        })
+        .unwrap_or_default()
+    });
+    extra.contains(&(archive, record))
+}
 
 const PERSON_ARCHIVES: [u16; 24] = [
     381, 382, 383, 384,
@@ -131,6 +175,8 @@ const FORMATION_COLS_PER_LINE: u32 = 3;
 const MIN_FOLLOWER_DIST: f32 = 1.4;
 const FORMATION_ROT_SPEED: f32 = 1.5;
 const PLAYER_MOVING_SPEED: f32 = 0.3;
+
+const PROBE_MAX_REACH: f32 = 2.0;
 
 const IDLE_FRAME_SECONDS: f32 = 5.0;
 const IDLE_START_DELAY: f32 = 4.0;
@@ -356,9 +402,54 @@ impl SurfaceTri {
     }
 }
 
+/// Triangolo di muro (|normal.y| <= 0.35). Memorizzato intero: `probe` ne
+/// taglia la sezione orizzontale a `eye_y`, così ogni forma (rettangolo,
+/// timpano, arco, merlo…) viene colpita correttamente.
+///
+/// Il vecchio approccio memorizzava solo lo spigolo dominante del triangolo
+/// proiettato in XZ: per una facciata rettangolare i due triangoli
+/// producevano le due diagonali, e un raggio orizzontale le mancava quasi
+/// sempre. Con il triangolo intero il raggio colpisce per tutta la
+/// larghezza del muro a qualunque altezza.
+struct WallTri {
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    /// Normale unitaria del triangolo (orizzontale, `|n.y| <= 0.35`).
+    n: Vec3,
+    y_min: f32,
+    y_max: f32,
+}
+
+impl WallTri {
+    /// Intersezione del triangolo con il piano orizzontale y=const:
+    /// ritorna il segmento (in XZ) in cui il piano "taglia" il triangolo,
+    /// oppure None se il piano non lo attraversa.
+    fn slice_at_y(&self, y: f32) -> Option<(Vec2, Vec2)> {
+        let v = [self.a, self.b, self.c];
+        let mut pts = [Vec2::ZERO; 2];
+        let mut count = 0;
+        for k in 0..3 {
+            let (p, q) = (v[k], v[(k + 1) % 3]);
+            let (dp, dq) = (p.y - y, q.y - y);
+            if (dp < 0.0) != (dq < 0.0) && count < 2 {
+                let r = p + (q - p) * (dp / (dp - dq));
+                pts[count] = Vec2::new(r.x, r.z);
+                count += 1;
+            }
+        }
+        (count == 2).then(|| (pts[0], pts[1]))
+    }
+}
+
 pub struct Colliders {
+    /// Segmenti usati da `resolve` (pushout) e `hits` (test cerchio).
     segments: Vec<WallSegment>,
     grid: Vec<Vec<u32>>,
+    /// Triangoli usati da `probe` (raggi orizzontali, sezione a `eye_y`).
+    walls: Vec<WallTri>,
+    wall_grid: Vec<Vec<u32>>,
+    /// Superfici calpestabili usate da `surface_height`.
     surfaces: Vec<SurfaceTri>,
     surf_grid: Vec<Vec<u32>>,
     cell: f32,
@@ -386,6 +477,7 @@ impl Colliders {
     fn from_parts<'a>(parts: impl Iterator<Item = (&'a MeshPart, bool, u8)>) -> Self {
         let mut index: HashMap<(i32, i32, i32, i32), usize> = HashMap::new();
         let mut segments: Vec<WallSegment> = Vec::new();
+        let mut walls: Vec<WallTri> = Vec::new();
         let mut surfaces: Vec<SurfaceTri> = Vec::new();
         let q = |v: f32| (v * 20.0).round() as i32;
         for (part, as_walls, surface_mode) in parts {
@@ -410,6 +502,20 @@ impl Colliders {
                 if !as_walls || ny.abs() > 0.35 {
                     continue;
                 }
+
+                // NUOVO: memorizza il triangolo intero per `probe`.
+                // Il vecchio approccio calcolava lo spigolo dominante
+                // (`WallSegment`) e lo usava per il ray test: su facciate
+                // non rettilinee il raggio mancava quasi sempre. Con il
+                // triangolo intero `probe` ne taglia la sezione a eye_y e
+                // colpisce correttamente per tutta la larghezza del muro.
+                walls.push(WallTri {
+                    a: p0, b: p1, c: p2,
+                    n: n / len,
+                    y_min: p0.y.min(p1.y).min(p2.y),
+                           y_max: p0.y.max(p1.y).max(p2.y),
+                });
+
                 let pts = [
                     Vec2::new(p0.x, p0.z),
                     Vec2::new(p1.x, p1.z),
@@ -463,6 +569,23 @@ impl Colliders {
                 }
             }
         }
+        // NUOVO: griglia per i triangoli di muro (usata da `probe`).
+        let mut wall_grid: Vec<Vec<u32>> = vec![Vec::new(); COLLISION_GRID * COLLISION_GRID];
+        for (i, w) in walls.iter().enumerate() {
+            let (min_x, max_x) = (
+                w.a.x.min(w.b.x).min(w.c.x) - COLLIDER_MARGIN,
+                                  w.a.x.max(w.b.x).max(w.c.x) + COLLIDER_MARGIN,
+            );
+            let (min_z, max_z) = (
+                -(w.a.z.max(w.b.z).max(w.c.z) + COLLIDER_MARGIN),
+                                  -(w.a.z.min(w.b.z).min(w.c.z) - COLLIDER_MARGIN),
+            );
+            for iz in to_cell(min_z)..=to_cell(max_z) {
+                for ix in to_cell(min_x)..=to_cell(max_x) {
+                    wall_grid[iz * COLLISION_GRID + ix].push(i as u32);
+                }
+            }
+        }
         let mut surf_grid: Vec<Vec<u32>> = vec![Vec::new(); COLLISION_GRID * COLLISION_GRID];
         for (i, t) in surfaces.iter().enumerate() {
             let xs = t.v.map(|v| v.x);
@@ -475,7 +598,7 @@ impl Colliders {
                 }
             }
         }
-        Colliders { segments, grid, surfaces, surf_grid, cell }
+        Colliders { segments, grid, walls, wall_grid, surfaces, surf_grid, cell }
     }
 
     fn cell_index(&self, p: Vec2) -> Option<usize> {
@@ -536,41 +659,76 @@ impl Colliders {
         p
     }
 
+    /// Raggio orizzontale contro i muri della città.
+    ///
+    /// **Fix "più permissivo"**: prima testava un solo raggio all'altezza
+    /// dell'occhio (`feet_y + 0.9`). Qualunque sporgenza che esiste solo in
+    /// basso (cornicione, davanzale) o in alto (balcone, trave) non veniva
+    /// vista. Ora testa tre altezze (0.3, 0.9, 1.6 m sopra i piedi) e sceglie
+    /// l'hit con `y_max` più alto, così il player si aggrappa al punto più
+    /// rialzato (quello più scalabile) fra quelli davanti a lui.
+    ///
+    /// Il `reach.min(PROBE_MAX_REACH)` sostituisce il vecchio
+    /// `reach.min(COLLIDER_MARGIN)`: `COLLIDER_MARGIN` resta usato per
+    /// costruire `wall_grid`, ma non deve più limitare il probe (altrimenti
+    /// `player::CLIMB_REACH` verrebbe troncato a 1.0 m).
     pub fn probe(&self, p: Vec2, dir: Vec2, reach: f32, feet_y: f32) -> Option<WallHit> {
-        let ci = self.cell_index(p)?;
-        let reach = reach.min(COLLIDER_MARGIN);
-        let cross = |a: Vec2, b: Vec2| a.x * b.y - a.y * b.x;
-        let mut best: Option<WallHit> = None;
-        for &i in &self.grid[ci] {
-            let s = &self.segments[i as usize];
-            if s.y_max <= feet_y || s.y_min >= feet_y + BODY_HEIGHT {
-                continue;
-            }
-            let ab = s.b - s.a;
-            let denom = cross(dir, ab);
-            if denom.abs() < 1e-6 {
-                continue;
-            }
-            let t = cross(s.a - p, ab) / denom;
-            let u = cross(s.a - p, dir) / denom;
-            if !(0.0..=reach).contains(&t) || !(0.0..=1.0).contains(&u) {
-                continue;
-            }
-            if best.map_or(true, |b| t < b.distance) {
-                let mut normal = Vec2::new(-ab.y, ab.x).normalize_or_zero();
-                if normal.dot(dir) > 0.0 {
-                    normal = -normal;
+        let reach = reach.min(PROBE_MAX_REACH);
+
+        let end = p + dir * reach;
+        let n = COLLISION_GRID as i32;
+        let ix_lo = ((p.x.min(end.x) / self.cell).floor() as i32).max(0);
+        let ix_hi = ((p.x.max(end.x) / self.cell).ceil() as i32).min(n - 1);
+        let iz_lo = ((-p.y.max(end.y) / self.cell).floor() as i32).max(0);
+        let iz_hi = ((-p.y.min(end.y) / self.cell).ceil() as i32).min(n - 1);
+
+        const PROBE_HEIGHTS: [f32; 3] = [0.3, 0.9, 1.6];
+
+        let mut best: Option<(f32, WallHit)> = None;
+
+        for iz in iz_lo..=iz_hi {
+            for ix in ix_lo..=ix_hi {
+                let ci = (iz * n + ix) as usize;
+                for &i in &self.wall_grid[ci] {
+                    let w = &self.walls[i as usize];
+                    if w.y_max <= feet_y + 0.05 || w.y_min >= feet_y + BODY_HEIGHT {
+                        continue;
+                    }
+                    for probe_h in PROBE_HEIGHTS {
+                        let probe_y = feet_y + probe_h;
+                        if probe_y < w.y_min || probe_y > w.y_max {
+                            continue;
+                        }
+                        let Some((s0, s1)) = w.slice_at_y(probe_y) else {
+                            continue;
+                        };
+                        let e = s1 - s0;
+                        let qv = s0 - p;
+                        let det = e.x * dir.y - e.y * dir.x;
+                        if det.abs() < 1e-8 {
+                            continue;
+                        }
+                        let t = (e.x * qv.y - e.y * qv.x) / det;
+                        let u = (dir.x * qv.y - dir.y * qv.x) / det;
+                        if t < 0.0 || t > reach || !(0.0..=1.0).contains(&u) {
+                            continue;
+                        }
+                        // Preferisci l'hit con y_max più alto (muro più scalabile).
+                        if best.as_ref().map_or(true, |(_, h)| w.y_max > h.y_max) {
+                            best = Some((t, WallHit {
+                                point: p + dir * t,
+                                normal: Vec2::new(w.n.x, w.n.z).normalize_or_zero(),
+                                         distance: t,
+                                         y_min: w.y_min,
+                                         y_max: w.y_max,
+                            }));
+                        }
+                        break; // trovato un hit per questo triangolo, non testare altre altezze
+                    }
                 }
-                best = Some(WallHit {
-                    point: p + dir * t,
-                    normal,
-                    distance: t,
-                    y_min: s.y_min,
-                    y_max: s.y_max,
-                });
             }
         }
-        best
+        best.map(|(_, h)| h)
     }
 
     pub fn surface_height(&self, p: Vec2, max_y: f32) -> Option<f32> {
@@ -582,6 +740,24 @@ impl Colliders {
         .fold(None, |best: Option<f32>, h| {
             Some(best.map_or(h, |b| b.max(h)))
         })
+    }
+
+    /// `true` se un albero di raggio `r` in `p` finirebbe dentro o contro un
+    /// edificio (palazzo, gilde e templi procedurali compresi: stanno nello
+    /// stesso `CityBuilder`, quindi in questi collider).
+    ///
+    /// NON usa `inside_building` (parita' dei muri): le siepi del cimitero sono
+    /// modelli `edificio: true` e formano recinti chiusi, quindi tutti gli
+    /// alberi del cimitero risulterebbero "dentro un edificio". Usa invece:
+    /// - la distanza dai muri (`hits`, raggio `r`);
+    /// - un tetto/superficie sopra la testa (un albero dentro una casa ha
+    ///   sempre il tetto sopra; dentro un recinto di siepi no).
+    pub fn blocks_tree(&self, p: Vec2, ground_y: f32, r: f32) -> bool {
+        if self.hits(p, ground_y, r) {
+            return true;
+        }
+        self.surface_height(p, ground_y + 60.0)
+        .is_some_and(|h| h > ground_y + 2.5)
     }
 
     pub fn inside_building(&self, p: Vec2, ground_y: f32) -> bool {
@@ -1082,6 +1258,8 @@ pub struct TileResult {
     city_textured: Vec<((u16, u8), MeshPart)>,
     city_rect: Option<CityTileRect>,
     exterior_flats: Vec<(f32, f32, u16, u8)>,
+    /// Alberi/vegetazione del livello "ground scenery" dei blocchi RMB: (x, z, record nell'archivio di natura).
+    exterior_scenery: Vec<(f32, f32, u8)>,
     exterior_npcs: Vec<(f32, f32, u16, (Vec2, Vec2))>,
     exterior_enemies: Vec<(f32, f32, usize)>,
     colliders: Option<Arc<Colliders>>,
@@ -1193,6 +1371,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
     let mut city_colliders: Option<Arc<Colliders>> = None;
     let mut tile_preset = None;
     let mut exterior_flats: Vec<(f32, f32, u16, u8)> = Vec::new();
+    let mut exterior_scenery: Vec<(f32, f32, u8)> = Vec::new();
     let mut exterior_npcs: Vec<(f32, f32, u16, (Vec2, Vec2))> = Vec::new();
     if let Some(loc) = data.locations.get(&(mx, my)) {
         let blocks_bsa = BsaArchive::parse(&data.blocks_buf).ok()?;
@@ -1219,7 +1398,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                     if i == wall_i {
                         Some((p, true, 1u8))
                     } else if i == roof_i || i == trim_i {
-                        Some((p, false, 2u8))
+                        Some((p, true, 2u8))
                     } else {
                         None
                     }
@@ -1234,11 +1413,23 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
         let start_bx = (8 - bw) / 2;
         let start_by = (8 - bh) / 2;
         let block_debug = std::env::var("DF_MODEL_DEBUG_BLOCK").ok().map(|v| v.to_ascii_uppercase());
+        // Margine extra (m) attorno alla via reale dove non spawnano alberi.
+        let avenue_tree_margin: f32 = std::env::var("DF_AVENUE_TREE_MARGIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-9.0);
+        // Statistiche sui flat esterni (attive con DF_FLAT_STATS=1).
+        let stats_on = std::env::var_os("DF_FLAT_STATS").is_some();
+        let mut flat_stats: std::collections::BTreeMap<(u16, u8, &'static str), u32> =
+        std::collections::BTreeMap::new();
         for by in 0..bh {
             for bx in 0..bw {
                 let Some(name) = loc.block_names.get(by * loc.width + bx) else { continue };
                 let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
-                let Ok(rmb) = RmbBlock::parse(raw) else { continue };
+                let Ok(mut rmb) = RmbBlock::parse(raw) else { continue };
+                // Flip nord-sud: i flat esterni (alberi, statue, siepi sciolte)
+                // devono seguire lo stesso flip degli edifici.
+                rmb.set_flip_ns(true);
                 let bx0 = (start_bx + bx) as f32 * BLOCK_SIZE_M;
                 let bz0 = (start_by + by) as f32 * BLOCK_SIZE_M;
                 let flat_dbg = block_debug.as_deref().map_or(false, |f| name.to_ascii_uppercase().contains(f));
@@ -1260,15 +1451,88 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
                         );
                     }
                     if flat.block.is_some() {
+                        if stats_on {
+                            *flat_stats.entry((flat.texture_archive, flat.texture_record, "scartato_block")).or_default() += 1;
+                        }
                         continue;
                     }
                     if flat.texture_archive == 199 {
+                        if stats_on {
+                            *flat_stats.entry((flat.texture_archive, flat.texture_record, "scartato_199")).or_default() += 1;
+                        }
                         continue;
                     }
+                    if stats_on {
+                        *flat_stats.entry((flat.texture_archive, flat.texture_record, "ok")).or_default() += 1;
+                    }
+                    // `n` originale del flat, poi flip se attivo.
+                    let n_flat = flat.z as f32 + 4096.0;
+                    let n_flat = if rmb.flip_ns { 4096.0 - n_flat } else { n_flat };
                     let fx = bx0 + flat.x as f32 * DF_UNIT;
-                    let fz = -(bz0 + (flat.z as f32 + 4096.0) * DF_UNIT);
-                    exterior_flats.push((fx, fz, flat.texture_archive, flat.texture_record));
+                    let fz = -(bz0 + n_flat * DF_UNIT);
+                    // Via reale di Daggerfall: niente alberi (ne' flat sostituiti da alberi).
+                    if is_tree_flat(flat.texture_archive, flat.texture_record)
+                        && royal_avenue_contains(loc, fx, fz, avenue_tree_margin)
+                        {
+                            if stats_on {
+                                eprintln!("FLAT {name}: {}_{} scartato: sulla via reale", flat.texture_archive, flat.texture_record);
+                            }
+                            continue;
+                        }
+                        exterior_flats.push((fx, fz, flat.texture_archive, flat.texture_record));
                 }
+                // Ground scenery (come `RMBLayout.AddNatureFlats` di DFU): griglia
+                // 16x16 di byte letta da `ground_decor`. 255 = vuoto; altrimenti
+                // record = byte/4 - 1, e record < 1 e' un marker da ignorare.
+                // L'archivio (5xx) lo sceglie collect_tiles da clima e stagione.
+                // DFU mette l'albero in (x*256, (16-riga)*256) unita' DF.
+                let scenery_clearance: f32 = std::env::var("DF_SCENERY_CLEARANCE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0);
+                let scenery_flip = std::env::var("DF_SCENERY_FLIP").map(|v| v != "0").unwrap_or(rmb.flip_ns);
+                for row in 0..16usize {
+                    for col in 0..16usize {
+                        let b = rmb.ground_decor[row * 16 + col];
+                        if b == 255 {
+                            continue;
+                        }
+                        let record = (b as i32) / 4 - 1;
+                        if record < 1 {
+                            continue;
+                        }
+                        let n_south = (16 - row) as f32 * 256.0;
+                        let n = if scenery_flip { 4096.0 - n_south } else { n_south };
+                        let fx = bx0 + col as f32 * 256.0 * DF_UNIT;
+                        let fz = -(bz0 + n * DF_UNIT);
+                        // Via reale di Daggerfall: niente alberi.
+                        if royal_avenue_contains(loc, fx, fz, avenue_tree_margin) {
+                            if stats_on {
+                                eprintln!("SCENERY {name}: record {record} cella ({col},{row}) scartato: sulla via reale");
+                            }
+                            continue;
+                        }
+                        // Niente alberi dentro o contro gli edifici (anche custom).
+                        if let Some(c) = city_colliders.as_deref() {
+                            let g = terrain_height(&samples, fx / CELL_SIZE, -fz / CELL_SIZE);
+                            if c.blocks_tree(Vec2::new(fx, fz), g, scenery_clearance) {
+                                if stats_on {
+                                    eprintln!("SCENERY {name}: record {record} cella ({col},{row}) scartato: dentro/contro un edificio");
+                                }
+                                continue;
+                            }
+                        }
+                        if stats_on {
+                            eprintln!("SCENERY {name}: record {record} cella ({col},{row})");
+                        }
+                        exterior_scenery.push((fx, fz, record as u8));
+                    }
+                }
+            }
+        }
+        if stats_on {
+            for ((a, r, why), n) in &flat_stats {
+                eprintln!("FLATSTAT ({mx},{my}) {a}_{r} {why}: {n}");
             }
         }
         if let Some(rect) = city_rect_opt.as_ref() {
@@ -1321,9 +1585,6 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
     let mesh = build_terrain_mesh(&samples, &encoded, tile_px);
 
     // --- CALCOLO ACQUA PER I NEMICI ---
-    // Il vettore water per i nemici non si può più ricavare dalla tilemap,
-    // perché ora non contiene più la tile 0. Lo ricalcoliamo dalle altezze,
-    // con la media dei quattro angoli sotto il livello del mare.
     let mut water: Vec<bool> = Vec::with_capacity(128 * 128);
     for cy in 0..128 {
         for cx in 0..128 {
@@ -1379,6 +1640,7 @@ fn build_tile(data: &GameData, tile_px: (usize, usize), mx: i32, my: i32) -> Opt
          city_textured,
          city_rect: city_rect_opt,
          exterior_flats,
+         exterior_scenery,
          exterior_npcs,
          exterior_enemies,
          water,
@@ -1651,8 +1913,37 @@ pub fn collect_tiles(
             &mut meshes,
             &mut standard_materials,
         );
-        let tree_template: Option<crate::trees::TreeType> =
-        (0..64u32).find_map(|r| nature_pool.tree_for_flat(tree_archive, r));
+        // Albero che sostituisce i flat di FLAT_IDS_AS_TREES (es. i lampioni 210_28):
+        // texture 506_16 (archivio, record), cambiabile con `DF_FLAT_TREE="506_16"`.
+        let (flat_tree_archive, flat_tree_record): (u32, u32) = std::env::var("DF_FLAT_TREE")
+        .ok()
+        .and_then(|v| {
+            let v = v.split('-').next()?.to_string();
+            let (a, r) = v.split_once('_')?;
+            Some((a.trim().parse().ok()?, r.trim().parse().ok()?))
+        })
+        .unwrap_or((506, 16));
+        // Variante invernale come in DFU: 504->505, 506->507, 508->509, 510->511
+        // (solo archivi pari >= 504). Se manca, `get_or_load` ricade sull'estivo.
+        let flat_tree_archive = if matches!(data.season, crate::data::climate::Season::Winter)
+        && flat_tree_archive >= 504
+        && flat_tree_archive % 2 == 0
+        {
+            flat_tree_archive + 1
+        } else {
+            flat_tree_archive
+        };
+        nature_pool.get_or_load(
+            flat_tree_archive,
+            &data,
+            &mut mods,
+            &mut images,
+            &mut meshes,
+            &mut standard_materials,
+        );
+        let tree_template: Option<crate::trees::TreeType> = nature_pool
+        .tree_for_flat(flat_tree_archive, flat_tree_record)
+        .or_else(|| (0..64u32).find_map(|r| nature_pool.tree_for_flat(tree_archive, r)));
         let mut trees_to_spawn: Vec<(Handle<Mesh>, Handle<StandardMaterial>, Vec3, Vec3)> = Vec::new();
         let mut rects_to_spawn: Vec<(Handle<Mesh>, Handle<StandardMaterial>, Vec3)> = Vec::new();
         let mut total_nature = 0usize;
@@ -1662,20 +1953,29 @@ pub fn collect_tiles(
             let gx = (fx / CELL_SIZE).clamp(0.0, 128.0);
             let gy = (-fz / CELL_SIZE).clamp(0.0, 128.0);
             let y = terrain_height(&tile.samples, gx, gy);
-            let Some((mat_orig, w_px, h_px)) = wall_textures.flat_material(
+            let is_tree = is_tree_flat(*archive, *record);
+            let mat_info = wall_textures.flat_material(
                 *archive,
                 *record,
                 &data,
                 &mut mods,
                 &mut images,
                 &mut standard_materials,
-            ) else {
-                if flat_debug {
-                    eprintln!("FLAT {archive}_{record} a ({fx:.0}, {fz:.0}): nessuna texture/materiale, non viene mostrato");
+            );
+            if std::env::var_os("DF_FLAT_STATS").is_some() {
+                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u16, u8)>>> =
+                std::sync::OnceLock::new();
+                let seen = SEEN.get_or_init(Default::default);
+                if let Ok(mut set) = seen.lock() {
+                    if set.insert((*archive, *record)) {
+                        match &mat_info {
+                            Some((_, w, h)) => eprintln!("FLATSIZE {archive}_{record}: {w} x {h} px{}", if is_tree { "  [albero]" } else { "" }),
+                            None => eprintln!("FLATSIZE {archive}_{record}: NESSUN MATERIALE{}", if is_tree { "  [albero]" } else { "" }),
+                        }
+                    }
                 }
-                continue;
-            };
-            if FLAT_IDS_AS_TREES.contains(&(*archive, *record)) {
+            }
+            if is_tree {
                 let Some(tree) = tree_template.as_ref() else {
                     if flat_debug {
                         eprintln!("FLAT {archive}_{record} a ({fx:.0}, {fz:.0}): albero senza modello, non viene mostrato");
@@ -1693,11 +1993,43 @@ pub fn collect_tiles(
                                      Vec3::new(scale_xz, scale_y, scale_xz),
                 ));
             } else {
+                let Some((mat_orig, w_px, h_px)) = mat_info else {
+                    if flat_debug {
+                        eprintln!("FLAT {archive}_{record} a ({fx:.0}, {fz:.0}): nessuna texture/materiale, non viene mostrato");
+                    }
+                    continue;
+                };
                 let (w, h) = (w_px * DF_UNIT, h_px * DF_UNIT);
 
                 let mesh = meshes.add(Rectangle::new(w, h));
                 rects_to_spawn.push((mesh, mat_orig, Vec3::new(*fx, y + h * 0.5, *fz)));
                 total_decor += 1;
+            }
+        }
+        // Alberi del livello scenery (cimiteri, giardini, piazze): uno per cella,
+        // con il record vero dell'archivio di natura del clima/stagione.
+        {
+            let scenery_scale: f32 = std::env::var("DF_SCENERY_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.7);
+            for (fx, fz, record) in &tile.exterior_scenery {
+                let Some(tree) = nature_pool.tree_for_flat(tree_archive, *record as u32) else {
+                    if flat_debug {
+                        eprintln!("SCENERY record {record} (archivio {tree_archive}): nessun modello, non viene mostrato");
+                    }
+                    continue;
+                };
+                let gx = (fx / CELL_SIZE).clamp(0.0, 128.0);
+                let gy = (-fz / CELL_SIZE).clamp(0.0, 128.0);
+                let y = terrain_height(&tile.samples, gx, gy);
+                total_nature += 1;
+                trees_to_spawn.push((
+                    tree.mesh.clone(),
+                                     tree.material.clone(),
+                                     Vec3::new(*fx, y, *fz),
+                                     Vec3::splat(scenery_scale),
+                ));
             }
         }
         if total_nature + total_decor > 0 {
@@ -1864,10 +2196,6 @@ pub fn collect_tiles(
                               &mut standard_materials,
                               tile.city_rect,
         );
-
-        // NB: l'acqua non viene più spawnata come figlio del chunk.
-        // È gestita globalmente da `ocean::OceanPlugin` come piano FFT
-        // che segue il giocatore.
 
         streaming.loaded.insert(key, chunk_entity);
         field.tiles.insert(key, tile.samples);

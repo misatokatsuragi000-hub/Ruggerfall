@@ -883,7 +883,10 @@ fn write_savegame_to(sg: &SaveGame, path: &Path) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(path, sg.to_text())
+    std::fs::write(path, sg.to_text())?;
+    // Stato della main quest accanto al salvataggio (`<save>.quest`).
+    crate::quest_save::write_sidecar(path);
+    Ok(())
 }
 
 pub fn save_after_recruit(
@@ -1033,6 +1036,14 @@ fn load_savegame_now(
         return Err(format!("{} non trovato", path.display()));
     }
     let sg = SaveGame::load(path);
+
+    // Stato della main quest: lo applica `quest_save::apply_pending_restore` al frame dopo.
+    if !crate::quest_save::queue_restore(path) {
+        info!(
+            "savegame: {} non ha lo stato della quest (salvataggio vecchio): resta quello attuale",
+            path.display()
+        );
+    }
 
     for e in followers_to_despawn {
         commands.entity(*e).despawn_recursive();
@@ -1790,6 +1801,7 @@ fn apply_delete_request(mut request: ResMut<SaveLoadRequest>, mut menu: ResMut<S
     let Some(path) = request.delete_path.take() else { return };
     match std::fs::remove_file(&path) {
         Ok(()) => {
+            crate::quest_save::remove_sidecar(&path);
             let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
             menu.set_ok(format!("Eliminato '{}'", name));
             info!("savegame: deleted '{}'", path.display());
@@ -1809,7 +1821,8 @@ pub struct SaveGamePlugin;
 
 impl Plugin for SaveGamePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<SaveDelayed>()
+        app.add_plugins(crate::quest_save::QuestSavePlugin)
+        .init_resource::<SaveDelayed>()
         .init_resource::<SaveMenuState>()
         .init_resource::<SaveLoadRequest>()
         .init_resource::<AutosaveTimer>()

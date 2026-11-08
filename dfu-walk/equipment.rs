@@ -5,24 +5,59 @@
 //!   [Click / 1..9] Equip or unequip item
 //!   [Hover mouse] Show item details popup
 //!   [R] Change race  ·  [Tab] Change gender  ·  [V] Change face  ·  [C / Esc] Close
+//!
+//! ## Icone dell'inventario
+//!
+//! Catena in `icon_location_full`:
+//!   1. `icon_source` esplicito (vince sempre);
+//!   2. `template_id` → `ItemTemplates::icon(id)` (dump JSON di DFU o FALL.EXE);
+//!   3. `magic_item_param` → `MagicItemsCatalog::get(param)` → TEXTURE.432/433
+//!      (artefatti di DFU: hanno una texture dedicata, NON il template base);
+//!   4. `default_icon_for_slot` (attualmente `None`);
+//!   5. slot paperdoll con `paperdoll_record` (e `paperdoll_archive_override`
+//!      se presente, per gli artefatti);
+//!   6. `None` → fallback procedurale.
+//!
+//! Il fallback procedurale è **consapevole del nome** (`generate_fallback_icon_for`):
+//! "Potion/Flask/Bottle" → fiala rossa; "Letter/Document/Certificate/Scroll/
+//! Parchment" → pergamena con sigillo; tutto il resto → icona per slot.
+//!
+//! `loot.rs` usa `icon_location` (wrapper retrocompatibile con
+//! `ItemTemplates::default()` e `MagicItemsCatalog::default()`), che è
+//! equivalente alla vecchia funzione: catalogo vuoto = nessun artefatto.
+//!
+//! ## Template dei DFU
+//!
+//! `load_item_templates` (Startup) prova:
+//!   1. `assets/ItemTemplates.json` (dump di Daggerfall Unity, consigliato);
+//!   2. `<ARENA2>/FALL.EXE` (parser euristico, opzionale).
+//!
+//! `load_magic_items` (Startup) prova:
+//!   1. `assets/MagicItems.json` (dump di Daggerfall Unity, consigliato);
+//!   2. `assets/Artifacts.json` (fallback, stessa forma).
+//!
+//! Senza né JSON né exe, `ItemTemplates` resta vuoto e la catena ricade su
+//! paperdoll/procedurale: nessuna regressione.
 
 use crate::data::{archive_file_name, find_file_ci, Palette, TextureFile};
 use crate::dialog::DialogState;
+use crate::item_templates::ItemTemplates;
+use crate::magic_items::MagicItemsCatalog;
 use crate::mod_textures::ModTextures;
+use crate::quest_items::{is_quest_document, QuestItemUse};
 use crate::world::GameData;
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::{CursorGrabMode, PrimaryWindow};
 use std::collections::HashMap;
+use std::path::Path;
 
 const DOLL_PALETTE: &str = "PAL.PAL";
 
-// Native Daggerfall / DFU Paperdoll dimensions
 pub const DOLL_WIDTH: usize = 110;
 pub const DOLL_HEIGHT: usize = 184;
 
-// --- UI Styling & Colors: Dark Fantasy Semitrasparente ---
 const OVERLAY: Color = Color::srgba(0.02, 0.015, 0.01, 0.45);
 const PANEL: Color = Color::srgba(0.10, 0.075, 0.055, 0.88);
 const PANEL_BORDER: Color = Color::srgba(0.75, 0.58, 0.28, 0.50);
@@ -85,6 +120,18 @@ pub struct InventoryItem {
     pub armor_rating: i32,
     pub paperdoll_record: Option<usize>,
     pub icon_source: Option<(u32, usize)>,
+    /// ID del template di DFU (`ItemTemplates::icon(id)`), se noto.
+    /// Usato in `icon_location_full` **dopo** `icon_source` e **prima**
+    /// del paperdoll.
+    pub template_id: Option<u32>,
+    /// Se `Some`, questo item è un artefatto di DFU: la texture dell'icona
+    /// viene da `TEXTURE.432`/`TEXTURE.433` (indice in `ARTIFACT_TEXTURE_MAPPINGS`)
+    /// e **non** dal template base. Il `param` è quello del primo enchantment
+    /// `SpecialArtifactEffect` in `MagicItems.json`.
+    pub magic_item_param: Option<u8>,
+    /// Archivio paperdoll alternativo (per gli artefatti: 432 maschile, 433
+    /// femminile). Se `None`, si usa `armor_archive(look)` o `WEAPON_ARCHIVE`.
+    pub paperdoll_archive_override: Option<u32>,
     pub description: String,
 }
 
@@ -110,6 +157,9 @@ impl Default for PlayerInventory {
                     armor_rating: 18,
                     paperdoll_record: Some(3),
                     icon_source: Some((247, 3)),
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Chest plate forged from lightweight, durable elven alloys.".into(),
                 },
                 InventoryItem {
@@ -121,6 +171,9 @@ impl Default for PlayerInventory {
                     armor_rating: 12,
                     paperdoll_record: Some(4),
                     icon_source: Some((247, 4)),
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Articulated plate armor tailored to protect the lower legs.".into(),
                 },
                 InventoryItem {
@@ -132,6 +185,9 @@ impl Default for PlayerInventory {
                     armor_rating: 6,
                     paperdoll_record: Some(2),
                     icon_source: Some((247, 2)),
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Heavy reinforced footwear with solid metal soles and caps.".into(),
                 },
                 InventoryItem {
@@ -143,6 +199,9 @@ impl Default for PlayerInventory {
                     armor_rating: 5,
                     paperdoll_record: Some(6),
                     icon_source: Some((247, 6)),
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Combat gauntlets with layered, flexible finger plates.".into(),
                 },
                 InventoryItem {
@@ -154,6 +213,9 @@ impl Default for PlayerInventory {
                     armor_rating: 6,
                     paperdoll_record: Some(7),
                     icon_source: Some((247, 7)),
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Curved shoulder guards crafted to deflect downward strikes.".into(),
                 },
                 InventoryItem {
@@ -165,8 +227,16 @@ impl Default for PlayerInventory {
                     armor_rating: 8,
                     paperdoll_record: Some(5),
                     icon_source: Some((247, 5)),
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Knightly visor helmet providing solid cranial and throat protection.".into(),
                 },
+                // Esempio: `template_id: Some(120)` = "Longsword" in DFU
+                // (dump JSON → player (234, 12)). `icon_source` vince,
+                // quindi il comportamento è identico al precedente; il
+                // template_id è pronto se un giorno vuoi generare l'item
+                // senza `icon_source`.
                 InventoryItem {
                     id: 7,
                     name: "Elven Longsword".into(),
@@ -176,6 +246,9 @@ impl Default for PlayerInventory {
                     armor_rating: 0,
                     paperdoll_record: Some(13),
                     icon_source: Some((234, 12)),
+                    template_id: Some(120),
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Finely balanced single-edged blade etched with ancient elven runes.".into(),
                 },
                 InventoryItem {
@@ -187,6 +260,9 @@ impl Default for PlayerInventory {
                     armor_rating: 8,
                     paperdoll_record: Some(34),
                     icon_source: None,
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Sturdy infantry shield with central metal boss and reinforced rim.".into(),
                 },
                 InventoryItem {
@@ -198,8 +274,18 @@ impl Default for PlayerInventory {
                     armor_rating: 10,
                     paperdoll_record: Some(5),
                     icon_source: Some((247, 5)),
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Flexible mail shirt made of interlocking riveted iron rings.".into(),
                 },
+                // FIX: la pozione non ha un template DFU dedicato (in
+                // Daggerfall le pozioni sono generate proceduralmente con
+                // tint diverso sullo stesso template "Pure Water"). Il
+                // vecchio `icon_source: Some((205, 0))` caricava la
+                // bottiglia vuota di DREAM, non una pozione. Il fallback
+                // procedurale (`generate_potion_icon`) disegna una fiala
+                // rossa riconoscibile.
                 InventoryItem {
                     id: 10,
                     name: "Greater Healing Potion".into(),
@@ -208,7 +294,10 @@ impl Default for PlayerInventory {
                     weight_kg: 0.5,
                     armor_rating: 0,
                     paperdoll_record: None,
-                    icon_source: Some((205, 0)),
+                    icon_source: None,
+                    template_id: None,
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Wax-sealed glass flask containing an invigorating crimson brew.".into(),
                 },
                 InventoryItem {
@@ -220,6 +309,9 @@ impl Default for PlayerInventory {
                     armor_rating: 0,
                     paperdoll_record: Some(0),
                     icon_source: Some((234, 0)),
+                    template_id: Some(127), // "Battle Axe" in DFU
+                    magic_item_param: None,
+                    paperdoll_archive_override: None,
                     description: "Heavy double-headed axe. Slow to swing, but it bites deep.".into(),
                 },
             ],
@@ -311,9 +403,9 @@ pub fn appearance_label(look: PlayerAppearance) -> String {
     format!("{} — Face {}", race_name, look.face + 1)
 }
 
-struct BuiltDoll {
-    handle: Handle<Image>,
-    size: Vec2,
+pub struct BuiltDoll {
+    pub handle: Handle<Image>,
+    pub size: Vec2,
 }
 
 #[derive(Resource, Default)]
@@ -324,13 +416,13 @@ struct DollCache {
     layers_dirty: bool,
 }
 
-struct HdLayer {
-    image: Handle<Image>,
-    flip_y: bool,
-    x: i32,
-    y: i32,
-    w: usize,
-    h: usize,
+pub struct HdLayer {
+    pub image: Handle<Image>,
+    pub flip_y: bool,
+    pub x: i32,
+    pub y: i32,
+    pub w: usize,
+    pub h: usize,
 }
 
 #[derive(Resource, Default)]
@@ -343,61 +435,64 @@ struct ItemIconCache {
 // ---------------------------------------------------------------------------
 
 #[derive(Component)]
-struct EquipmentRoot;
+pub struct EquipmentRoot;
 
 #[derive(Component)]
-struct DollImage;
+pub struct DollImage;
 
 #[derive(Component)]
-struct DollMissing;
+pub struct DollMissing;
 
 #[derive(Component)]
-struct DollLayerNode;
+pub struct DollLayerNode;
 
 #[derive(Component)]
-struct DollDescText;
+pub struct DollDescText;
 
 #[derive(Component)]
-struct BackpackSummaryText;
+pub struct BackpackSummaryText;
 
 #[derive(Component)]
-struct BackpackSlotButton(usize);
+pub struct BackpackSlotButton(usize);
 
 #[derive(Component)]
-struct BackpackSlotIcon(usize);
+pub struct BackpackSlotIcon(usize);
 
 #[derive(Component)]
-struct BackpackSlotBadge(usize);
+pub struct BackpackSlotBadge(usize);
 
 #[derive(Component)]
-struct EquipSlotButton(EquipSlot);
+pub struct BackpackGrid;
 
 #[derive(Component)]
-struct EquipSlotIcon(EquipSlot);
+pub struct EquipSlotButton(EquipSlot);
 
 #[derive(Component)]
-struct EquipSlotLabel(EquipSlot);
+pub struct EquipSlotIcon(EquipSlot);
 
 #[derive(Component)]
-struct TooltipNode;
+pub struct EquipSlotLabel(EquipSlot);
 
 #[derive(Component)]
-struct TooltipTitle;
+pub struct TooltipNode;
 
 #[derive(Component)]
-struct TooltipSlot;
+pub struct TooltipTitle;
 
 #[derive(Component)]
-struct TooltipStats;
+pub struct TooltipSlot;
 
 #[derive(Component)]
-struct TooltipDesc;
+pub struct TooltipStats;
 
 #[derive(Component)]
-struct TooltipStatus;
+pub struct TooltipDesc;
+
+#[derive(Component)]
+pub struct TooltipStatus;
 
 // ---------------------------------------------------------------------------
-// Image File Reading (IMG / CIF / TEXTURE)
+// Image File Reading
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -473,7 +568,7 @@ fn doll_file_names(look: PlayerAppearance) -> (String, String) {
     (format!("BODY{g}{r}I0.IMG"), format!("FACE{g}{r}I0.CIF"))
 }
 
-fn armor_archive(look: PlayerAppearance) -> u32 {
+pub(crate) fn armor_archive(look: PlayerAppearance) -> u32 {
     let elf = matches!(look.race % 8, 3 | 4 | 5);
     match (look.female, elf) {
         (true, true) => 246,
@@ -483,25 +578,99 @@ fn armor_archive(look: PlayerAppearance) -> u32 {
     }
 }
 
-const WEAPON_ARCHIVE: u32 = 234;
-const WEAPON_ARCHIVE_FALLBACK: u32 = 233;
+pub(crate) const WEAPON_ARCHIVE: u32 = 234;
+pub(crate) const WEAPON_ARCHIVE_FALLBACK: u32 = 233;
 
-fn paperdoll_archive(look: PlayerAppearance, slot: EquipSlot) -> u32 {
+/// Archivio paperdoll per uno slot. `override_archive` (se `Some`) vince:
+/// serve agli artefatti (TEXTURE.432 maschile, TEXTURE.433 femminile) che
+/// hanno una texture dedicata e non usano l'archivio normale di armatura/arma.
+pub(crate) fn paperdoll_archive(
+    look: PlayerAppearance,
+    slot: EquipSlot,
+    override_archive: Option<u32>,
+) -> u32 {
+    if let Some(a) = override_archive {
+        return a;
+    }
     match slot {
         EquipSlot::RightHand => WEAPON_ARCHIVE,
         _ => armor_archive(look),
     }
 }
 
-fn icon_location(look: PlayerAppearance, item: &InventoryItem) -> Option<(u32, usize)> {
+pub(crate) fn is_paperdoll_slot(slot: EquipSlot) -> bool {
+    matches!(
+        slot,
+        EquipSlot::Head
+        | EquipSlot::Shoulders
+        | EquipSlot::Chest
+        | EquipSlot::Hands
+        | EquipSlot::Legs
+        | EquipSlot::Feet
+        | EquipSlot::RightHand
+        | EquipSlot::LeftHand
+    )
+}
+
+/// Fallback "canonico" per slot senza paperdoll (anelli, amuleti, mantelli).
+/// Attualmente `None`: senza template DFU non esiste un (archivio, record)
+/// sicuro per questi slot. Chi vuole un'icona specifica deve impostare
+/// `icon_source` o `template_id` sull'item.
+pub(crate) fn default_icon_for_slot(_slot: EquipSlot) -> Option<(u32, usize)> {
+    None
+}
+
+/// Catena completa con `ItemTemplates` e `MagicItemsCatalog`.
+///
+/// 1. `icon_source` esplicito;
+/// 2. `template_id` → `ItemTemplates::icon(id)` (JSON di DFU o FALL.EXE);
+/// 3. `magic_item_param` → `MagicItemsCatalog` (artefatti: TEXTURE.432/433);
+/// 4. `default_icon_for_slot` (attualmente `None`);
+/// 5. slot paperdoll con `paperdoll_record` (e `paperdoll_archive_override`
+///    se presente);
+/// 6. `None` → fallback procedurale in `load_item_icon`.
+pub(crate) fn icon_location_full(
+    look: PlayerAppearance,
+    item: &InventoryItem,
+    templates: &ItemTemplates,
+    magic_catalog: &MagicItemsCatalog,
+) -> Option<(u32, usize)> {
     if let Some(source) = item.icon_source {
         return Some(source);
+    }
+    if let Some(id) = item.template_id {
+        if let Some(t) = templates.icon(id) {
+            if let Some(icon) = t.icon() {
+                return Some(icon);
+            }
+        }
+    }
+    if let Some(param) = item.magic_item_param {
+        if let Some(def) = magic_catalog.get(param) {
+            let (archive, record) = def.texture_for(look.female);
+            return Some((archive, record as usize));
+        }
+    }
+    if let Some((a, r)) = default_icon_for_slot(item.slot) {
+        return Some((a, r));
+    }
+    if !is_paperdoll_slot(item.slot) {
+        return None;
     }
     let record = item.paperdoll_record?;
     Some(match item.slot {
         EquipSlot::RightHand => (WEAPON_ARCHIVE, record.saturating_sub(1)),
-         slot => (paperdoll_archive(look, slot), record),
+         slot => (
+             paperdoll_archive(look, slot, item.paperdoll_archive_override),
+                  record,
+         ),
     })
+}
+
+/// Variante retrocompatibile senza template né catalogo artefatti. `loot.rs`
+/// usa questa: catalogo vuoto = nessun artefatto, come prima.
+pub(crate) fn icon_location(look: PlayerAppearance, item: &InventoryItem) -> Option<(u32, usize)> {
+    icon_location_full(look, item, &ItemTemplates::default(), &MagicItemsCatalog::default())
 }
 
 fn load_paperdoll_item_sprite(
@@ -510,7 +679,7 @@ fn load_paperdoll_item_sprite(
     item: &InventoryItem,
     record_idx: usize,
 ) -> Option<DfImage> {
-    let archive_id = paperdoll_archive(look, item.slot);
+    let archive_id = paperdoll_archive(look, item.slot, item.paperdoll_archive_override);
 
     let path = find_file_ci(&data.dir, &archive_file_name(archive_id))
     .or_else(|| {
@@ -571,7 +740,6 @@ fn generate_fallback_icon(slot: EquipSlot) -> Image {
     let dark_metal = [120, 125, 135, 255];
     let gold = [230, 180, 50, 255];
     let wood = [140, 85, 40, 255];
-    let red_pot = [220, 45, 45, 240];
 
     match slot {
         EquipSlot::Chest => {
@@ -602,10 +770,12 @@ fn generate_fallback_icon(slot: EquipSlot) -> Image {
         EquipSlot::Head => {
             for y in 6..24 {
                 for x in 8..24 {
-                    if (y < 9 && (x < 11 || x > 20)) || (y > 14 && y < 17 && x > 11 && x < 21) {
-                        continue;
-                    }
-                    set(x, y, metal);
+                    if (y < 9 && (x < 11 || x > 20))
+                        || (y > 14 && y < 17 && x > 11 && x < 21)
+                        {
+                            continue;
+                        }
+                        set(x, y, metal);
                 }
             }
         }
@@ -636,15 +806,79 @@ fn generate_fallback_icon(slot: EquipSlot) -> Image {
                 }
             }
         }
-        _ => {
-            for y in 12..25 {
-                for x in 10..22 {
-                    let d = ((x as f32 - 16.0).powi(2) + (y as f32 - 18.0).powi(2)).sqrt();
-                    if d < 6.0 { set(x, y, red_pot); }
+        EquipSlot::Ring => {
+            let gold_light = [255, 220, 90, 255];
+            let gold_dark = [180, 140, 30, 255];
+            let gem = [190, 30, 70, 255];
+            let gem_light = [255, 100, 140, 255];
+            let (cx, cy, r_out, r_in) = (16.0f32, 19.0f32, 9.0f32, 5.5f32);
+            for y in 0..32 {
+                for x in 0..32 {
+                    let dx = x as f32 + 0.5 - cx;
+                    let dy = y as f32 + 0.5 - cy;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d >= r_in && d < r_out {
+                        set(x, y, if dy < 0.0 { gold_light } else { gold_dark });
+                    }
                 }
             }
-            for y in 8..13 { for x in 14..18 { set(x, y, [240, 240, 250, 200]); } }
-            for x in 13..19 { set(x, 7, wood); }
+            for y in 3..12 {
+                for x in 11..21 {
+                    let dx = x as f32 + 0.5 - 16.0;
+                    let dy = y as f32 + 0.5 - 7.0;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < 3.2 { set(x, y, gem); }
+                    else if d < 4.0 { set(x, y, gem_light); }
+                }
+            }
+        }
+        EquipSlot::Amulet => {
+            let gem = [50, 130, 220, 255];
+            let gem_light = [120, 190, 255, 255];
+            let (cx, cy, r) = (16.0f32, 10.0f32, 10.0f32);
+            for y in 0..32 {
+                for x in 0..32 {
+                    let dx = x as f32 + 0.5 - cx;
+                    let dy = y as f32 + 0.5 - cy;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if (d - r).abs() < 0.9 && dy >= 0.0 {
+                        set(x, y, gold);
+                    }
+                }
+            }
+            for y in 14..28 {
+                for x in 8..24 {
+                    let dx = (x as f32 + 0.5 - 16.0).abs();
+                    let dy = (y as f32 + 0.5 - 21.0).abs();
+                    if dx + dy < 5.5 {
+                        set(x, y, if dy < 2.0 { gem_light } else { gem });
+                    }
+                }
+            }
+        }
+        EquipSlot::Cloak => {
+            let cloth = [90, 45, 110, 255];
+            let cloth_dark = [55, 25, 70, 255];
+            let cloth_light = [130, 75, 150, 255];
+            for y in 3..12 {
+                for x in 10..22 {
+                    let dx = x as f32 + 0.5 - 16.0;
+                    let dy = y as f32 + 0.5 - 8.0;
+                    if (dx * dx + dy * dy).sqrt() < 5.0 { set(x, y, cloth_dark); }
+                }
+            }
+            for y in 10..30 {
+                for x in 0..32 {
+                    let flare = ((y as f32 - 10.0) / 20.0) * 6.0;
+                    let half = 6.0 + flare;
+                    let dx = (x as f32 + 0.5 - 16.0).abs();
+                    if dx < half {
+                        set(x, y, if dx < half * 0.4 { cloth }
+                        else if dx < half * 0.75 { cloth_dark }
+                        else { cloth_light });
+                    }
+                }
+            }
         }
     }
 
@@ -659,9 +893,150 @@ fn generate_fallback_icon(slot: EquipSlot) -> Image {
     img
 }
 
+/// Fiala (bottiglia con tappo e liquido rosso). Usata per gli item il cui
+/// nome contiene "potion"/"pozione"/"flask"/"bottle".
+fn generate_potion_icon() -> Image {
+    const W: usize = 32;
+    const H: usize = 32;
+    let mut rgba = vec![0u8; W * H * 4];
+    let mut set = |x: usize, y: usize, c: [u8; 4]| {
+        if x < W && y < H {
+            let o = (y * W + x) * 4;
+            rgba[o..o + 4].copy_from_slice(&c);
+        }
+    };
+
+    let glass_light = [220, 235, 245, 200];
+    let glass_dark = [140, 165, 190, 220];
+    let cork = [140, 90, 50, 255];
+    let liquid_lit = [255, 90, 110, 240];
+    let liquid_dark = [180, 20, 50, 240];
+    let liquid_hl = [255, 180, 190, 200];
+
+    for y in 6..12 {
+        for x in 12..20 {
+            let (dx, dy) = (x as f32 - 16.0, y as f32 - 9.0);
+            if dx.abs() < 4.0 && dy.abs() < 3.5 {
+                set(x, y, if x < 16 { glass_light } else { glass_dark });
+            }
+        }
+    }
+    for y in 3..8 {
+        for x in 13..19 {
+            set(x, y, cork);
+        }
+    }
+    for x in 13..19 { set(x, 3, [90, 55, 25, 255]); }
+
+    for y in 10..28 {
+        for x in 6..26 {
+            let (dx, dy) = (x as f32 - 16.0, y as f32 - 19.0);
+            let inside = (dx * dx) / 100.0 + (dy * dy) / 81.0 <= 1.0;
+            if !inside { continue; }
+            if dy > -2.0 {
+                let col = if dx < -3.0 && dy < 3.0 {
+                    liquid_hl
+                } else if dx > 3.0 {
+                    liquid_dark
+                } else {
+                    liquid_lit
+                };
+                set(x, y, col);
+            } else {
+                set(x, y, if dx < 0.0 { glass_light } else { glass_dark });
+            }
+        }
+    }
+
+    let mut img = Image::new(
+        Extent3d { width: W as u32, height: H as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    img.sampler = bevy::image::ImageSampler::nearest();
+    img
+}
+
+/// Pergamena con righe di testo e sigillo rosso. Usata per gli item il cui
+/// nome contiene "letter"/"document"/"certificate"/"scroll"/"parchment".
+fn generate_document_icon() -> Image {
+    const W: usize = 32;
+    const H: usize = 32;
+    let mut rgba = vec![0u8; W * H * 4];
+    let mut set = |x: usize, y: usize, c: [u8; 4]| {
+        if x < W && y < H {
+            let o = (y * W + x) * 4;
+            rgba[o..o + 4].copy_from_slice(&c);
+        }
+    };
+    let parchment = [235, 218, 175, 255];
+    let parchment_edge = [190, 165, 120, 255];
+    let ink = [55, 30, 15, 255];
+    let seal_red = [180, 30, 40, 255];
+
+    for y in 6..28 {
+        for x in 8..24 {
+            set(x, y, parchment);
+        }
+    }
+    for x in 8..24 {
+        set(x, 6, parchment_edge);
+        set(x, 27, parchment_edge);
+    }
+    for y in 6..28 {
+        set(8, y, parchment_edge);
+        set(23, y, parchment_edge);
+    }
+
+    for (y, len) in [(10, 12), (13, 10), (16, 13), (19, 8), (22, 11)] {
+        for x in 10..10 + len {
+            set(x, y, ink);
+        }
+    }
+
+    for y in 22..27 {
+        for x in 18..23 {
+            let (dx, dy) = (x as f32 - 20.0, y as f32 - 24.0);
+            if (dx * dx + dy * dy).sqrt() < 2.5 {
+                set(x, y, seal_red);
+            }
+        }
+    }
+
+    let mut img = Image::new(
+        Extent3d { width: W as u32, height: H as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    img.sampler = bevy::image::ImageSampler::nearest();
+    img
+}
+
+/// Sceglie il fallback procedurale in base al nome dell'item.
+fn generate_fallback_icon_for(item: &InventoryItem) -> Image {
+    let n = item.name.to_lowercase();
+    if n.contains("potion") || n.contains("pozione") || n.contains("flask") || n.contains("bottle") {
+        return generate_potion_icon();
+    }
+    if n.contains("letter")
+        || n.contains("document")
+        || n.contains("certificate")
+        || n.contains("scroll")
+        || n.contains("parchment")
+        {
+            return generate_document_icon();
+        }
+        generate_fallback_icon(item.slot)
+}
+
 fn material_from_name(name: &str) -> Option<String> {
     const MATERIALS: [&str; 10] = [
-        "iron", "steel", "silver", "elven", "dwarven", "mithril", "adamantium", "ebony", "orcish", "daedric",
+        "iron", "steel", "silver", "elven", "dwarven", "mithril",
+        "adamantium", "ebony", "orcish", "daedric",
     ];
     let first = name.split_whitespace().next()?.to_ascii_lowercase();
     MATERIALS.contains(&first.as_str()).then_some(first)
@@ -674,19 +1049,20 @@ fn load_item_icon(
     images: &mut Assets<Image>,
     mods: &mut ModTextures,
     cache: &mut ItemIconCache,
+    templates: &ItemTemplates,
+    magic_catalog: &MagicItemsCatalog,
 ) -> (Handle<Image>, bool) {
     if let Some(entry) = cache.icons.get(&item.id) {
         return entry.clone();
     }
 
     let entry = (|| {
-        let (archive, record) = icon_location(look, item)?;
+        let (archive, record) = icon_location_full(look, item, templates, magic_catalog)?;
         let mut archives = vec![archive];
         if archive == WEAPON_ARCHIVE {
             archives.push(WEAPON_ARCHIVE_FALLBACK);
         }
 
-        // 1. Versione HD nelle mod.
         let material = material_from_name(&item.name);
         for &a in &archives {
             if let Some(handle) = mods.item_image(a, record as u32, 0, material.as_deref(), images) {
@@ -696,7 +1072,6 @@ fn load_item_icon(
             }
         }
 
-        // 2. Originale di Daggerfall.
         let tex = archives.iter().find_map(|&a| {
             find_file_ci(&data.dir, &archive_file_name(a)).and_then(|p| TextureFile::open(p).ok())
         })?;
@@ -704,7 +1079,7 @@ fn load_item_icon(
         if img.width == 0 || img.height == 0 {
             return None;
         }
-        info!("icona di '{}': TEXTURE.{} record {}", item.name, archive, record);
+        info!("icona di '{}': TEXTURE.{} record {} (vanilla)", item.name, archive, record);
 
         let rgba = img.to_rgba(&data.palette, Some(0));
         let mut image = Image::new(
@@ -719,7 +1094,7 @@ fn load_item_icon(
     })()
     .unwrap_or_else(|| {
         warn!("icona di '{}' non trovata: uso quella generata", item.name);
-        (images.add(generate_fallback_icon(item.slot)), false)
+        (images.add(generate_fallback_icon_for(item)), false)
     });
 
     cache.icons.insert(item.id, entry.clone());
@@ -730,10 +1105,10 @@ fn load_item_icon(
 // Layered Paperdoll Composition
 // ---------------------------------------------------------------------------
 
-struct Doll {
-    width: usize,
-    height: usize,
-    rgba: Vec<u8>,
+pub struct Doll {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
 }
 
 fn compose_doll(
@@ -780,7 +1155,7 @@ fn compose_doll(
     Doll { width: w, height: h, rgba }
 }
 
-fn build_doll(data: &GameData, look: PlayerAppearance, inventory: &PlayerInventory) -> Option<Doll> {
+pub fn build_doll(data: &GameData, look: PlayerAppearance, inventory: &PlayerInventory) -> Option<Doll> {
     let (body_name, head_name) = doll_file_names(look);
     let read = |name: &str| -> Option<Vec<u8>> {
         let path = find_file_ci(&data.dir, name);
@@ -833,7 +1208,9 @@ impl Plugin for EquipmentPlugin {
         .init_resource::<PlayerInventory>()
         .init_resource::<DollCache>()
         .init_resource::<ItemIconCache>()
-        .add_systems(Startup, setup_equipment_ui)
+        .init_resource::<ItemTemplates>()
+        .init_resource::<MagicItemsCatalog>()
+        .add_systems(Startup, (load_item_templates, load_magic_items, setup_equipment_ui))
         .add_systems(
             Update,
             (
@@ -842,12 +1219,48 @@ impl Plugin for EquipmentPlugin {
              handle_equip_slot_clicks,
              update_tooltip,
              refresh_doll,
+             grow_backpack_grid,
              update_inventory_ui,
             )
             .chain()
             .before(crate::dialog::update_dialog)
             .before(crate::player::grab_cursor),
         );
+    }
+}
+
+/// Carica `assets/ItemTemplates.json` (dump di DFU) oppure, se manca, il
+/// parser euristico di `FALL.EXE`. Se nessuno dei due è disponibile,
+/// `ItemTemplates` resta vuoto: la catena delle icone ricade su
+/// paperdoll/procedurale.
+fn load_item_templates(
+    data: Res<GameData>,
+    mut templates: ResMut<ItemTemplates>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    *done = true;
+    let json_path = Path::new("assets/ItemTemplates.json");
+    if let Some(t) = ItemTemplates::load_auto(&data.dir, json_path) {
+        *templates = t;
+    }
+}
+
+/// Carica `assets/MagicItems.json` (o `Artifacts.json` come fallback): serve
+/// a risolvere l'icona degli artefatti (TEXTURE.432/433).
+fn load_magic_items(
+    mut catalog: ResMut<MagicItemsCatalog>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    *done = true;
+    let dir = Path::new("assets");
+    if let Some(c) = MagicItemsCatalog::load_auto(dir) {
+        *catalog = c;
     }
 }
 
@@ -906,6 +1319,80 @@ fn slot_column(parent: &mut ChildBuilder, slots: &[EquipSlot]) {
             });
         }
     });
+}
+
+fn spawn_backpack_slot(grid: &mut ChildBuilder, idx: usize) {
+    grid.spawn((
+        Button,
+        BackpackSlotButton(idx),
+                Node {
+                    width: Val::Px(72.0),
+                height: Val::Px(72.0),
+                border: UiRect::all(Val::Px(1.5)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                position_type: PositionType::Relative,
+                ..default()
+                },
+                BackgroundColor(SLOT_BG),
+                BorderColor(SLOT_BORDER),
+                BorderRadius::all(Val::Px(8.0)),
+    ))
+    .with_children(|slot_node| {
+        slot_node.spawn((
+            ImageNode::default(),
+                         Node {
+                             max_width: Val::Px(52.0),
+                         max_height: Val::Px(52.0),
+                         ..default()
+                         },
+                         BackpackSlotIcon(idx),
+        ));
+        slot_node.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(2.0),
+                         left: Val::Px(4.0),
+                         ..default()
+            },
+            Text::new(if idx < 9 { format!("{}", idx + 1) } else { "".into() }),
+                         TextFont { font_size: 10.0, ..default() },
+                         TextColor(MUTED),
+        ));
+        slot_node.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(2.0),
+                         right: Val::Px(4.0),
+                         ..default()
+            },
+            Text::new("E"),
+                         TextFont { font_size: 11.0, ..default() },
+                         TextColor(EQUIPPED_GREEN),
+                         Visibility::Hidden,
+                         BackpackSlotBadge(idx),
+        ));
+    });
+}
+
+fn grow_backpack_grid(
+    mut commands: Commands,
+    mut inventory: ResMut<PlayerInventory>,
+    grid: Query<Entity, With<BackpackGrid>>,
+    slots: Query<&BackpackSlotButton>,
+) {
+    let have = slots.iter().count();
+    let want = inventory.items.len();
+    if have >= want {
+        return;
+    }
+    let Ok(grid) = grid.get_single() else { return };
+    commands.entity(grid).with_children(|g| {
+        for idx in have..want {
+            spawn_backpack_slot(g, idx);
+        }
+    });
+    inventory.dirty = true;
 }
 
 fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
@@ -1076,59 +1563,10 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
                                           justify_content: JustifyContent::FlexStart,
                                           ..default()
                         },
+                        BackpackGrid,
                     )).with_children(|grid| {
                         for idx in 0..inventory.items.len() {
-                            grid.spawn((
-                                Button,
-                                BackpackSlotButton(idx),
-                                        Node {
-                                            width: Val::Px(72.0),
-                                        height: Val::Px(72.0),
-                                        border: UiRect::all(Val::Px(1.5)),
-                                        justify_content: JustifyContent::Center,
-                                        align_items: AlignItems::Center,
-                                        position_type: PositionType::Relative,
-                                        ..default()
-                                        },
-                                        BackgroundColor(SLOT_BG),
-                                        BorderColor(SLOT_BORDER),
-                                        BorderRadius::all(Val::Px(8.0)),
-                            ))
-                            .with_children(|slot_node| {
-                                slot_node.spawn((
-                                    ImageNode::default(),
-                                                 Node {
-                                                     max_width: Val::Px(52.0),
-                                                 max_height: Val::Px(52.0),
-                                                 ..default()
-                                                 },
-                                                 BackpackSlotIcon(idx),
-                                ));
-                                slot_node.spawn((
-                                    Node {
-                                        position_type: PositionType::Absolute,
-                                        top: Val::Px(2.0),
-                                                 left: Val::Px(4.0),
-                                                 ..default()
-                                    },
-                                    Text::new(if idx < 9 { format!("{}", idx + 1) } else { "".into() }),
-                                                 TextFont { font_size: 10.0, ..default() },
-                                                 TextColor(MUTED),
-                                ));
-                                slot_node.spawn((
-                                    Node {
-                                        position_type: PositionType::Absolute,
-                                        top: Val::Px(2.0),
-                                                 right: Val::Px(4.0),
-                                                 ..default()
-                                    },
-                                    Text::new("E"),
-                                                 TextFont { font_size: 11.0, ..default() },
-                                                 TextColor(EQUIPPED_GREEN),
-                                                 Visibility::Hidden,
-                                                 BackpackSlotBadge(idx),
-                                ));
-                            });
+                            spawn_backpack_slot(grid, idx);
                         }
                     });
 
@@ -1205,20 +1643,24 @@ fn setup_equipment_ui(mut commands: Commands, inventory: Res<PlayerInventory>) {
 // Logic & Systems
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn toggle_equipment(
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut state: ResMut<EquipmentState>,
     mut look: ResMut<PlayerAppearance>,
     mut inventory: ResMut<PlayerInventory>,
     dialog: Res<DialogState>,
+    sheet: Option<Res<crate::character_sheet::CharacterSheetState>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut root: Query<&mut Visibility, With<EquipmentRoot>>,
     mut desc: Query<&mut Text, (With<DollDescText>, Without<BackpackSummaryText>, Without<TooltipTitle>, Without<TooltipSlot>, Without<TooltipStats>, Without<TooltipDesc>, Without<TooltipStatus>, Without<EquipSlotLabel>)>,
 ) {
+    let sheet_open = sheet.as_ref().is_some_and(|s| s.open);
+
     let toggle = if state.open {
         keys.just_pressed(KeyCode::KeyC) || keys.just_pressed(KeyCode::Escape)
     } else {
-        keys.just_pressed(KeyCode::KeyC) && !dialog.open
+        keys.just_pressed(KeyCode::KeyC) && !dialog.open && !sheet_open
     };
 
     if toggle {
@@ -1283,11 +1725,17 @@ fn handle_backpack_clicks(
                           (Changed<Interaction>, With<Button>),
                           >,
                           mut inventory: ResMut<PlayerInventory>,
+                          mut uses: EventWriter<QuestItemUse>,
 ) {
     for (interaction, slot, mut bg) in &mut interaction_query {
         match *interaction {
             Interaction::Pressed => {
-                inventory.toggle_equip(slot.0);
+                let id = inventory.items.get(slot.0).map(|i| i.id);
+                if id.map_or(false, is_quest_document) {
+                    uses.send(QuestItemUse(id.unwrap_or_default()));
+                } else {
+                    inventory.toggle_equip(slot.0);
+                }
                 *bg = BackgroundColor(Color::srgb(0.25, 0.45, 0.25));
             }
             Interaction::Hovered => {
@@ -1325,6 +1773,7 @@ fn handle_equip_slot_clicks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_tooltip(
     state: Res<EquipmentState>,
     inventory: Res<PlayerInventory>,
@@ -1413,11 +1862,14 @@ fn update_tooltip(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_inventory_ui(
     mut inventory: ResMut<PlayerInventory>,
     state: Res<EquipmentState>,
     look: Res<PlayerAppearance>,
     data: Res<GameData>,
+    templates: Res<ItemTemplates>,
+    magic_catalog: Res<MagicItemsCatalog>,
     mut icon_cache: ResMut<ItemIconCache>,
     mut images: ResMut<Assets<Image>>,
     mut mods: ResMut<ModTextures>,
@@ -1482,7 +1934,9 @@ fn update_inventory_ui(
 
     for (icon_comp, mut img_node) in &mut bp_icons {
         if let Some(item) = inventory.items.get(icon_comp.0) {
-            let (handle, flip) = load_item_icon(&data, *look, item, &mut images, &mut mods, &mut icon_cache);
+            let (handle, flip) = load_item_icon(
+                &data, *look, item, &mut images, &mut mods, &mut icon_cache, &templates, &magic_catalog,
+            );
             img_node.image = handle;
             img_node.flip_y = flip;
         }
@@ -1496,7 +1950,9 @@ fn update_inventory_ui(
 
     for (slot_comp, mut img_node, mut vis) in &mut eq_icons {
         if let Some(item) = inventory.equipped_in(slot_comp.0) {
-            let (handle, flip) = load_item_icon(&data, *look, item, &mut images, &mut mods, &mut icon_cache);
+            let (handle, flip) = load_item_icon(
+                &data, *look, item, &mut images, &mut mods, &mut icon_cache, &templates, &magic_catalog,
+            );
             img_node.image = handle;
             img_node.flip_y = flip;
             *vis = Visibility::Inherited;
@@ -1535,15 +1991,7 @@ fn layer_image(img: &DfImage, palette: &Palette) -> Image {
     image
 }
 
-/// Costruisce i layer HD del paperdoll.
-///
-/// Non richiede più la presenza dei file nativi `BODYxxI0.IMG`/`FACEyyI0.CIF`: se ci sono, li
-/// usa solo come riferimento di posizione e dimensione del layer; se mancano, prende posizione
-/// e dimensione dalla texture HD stessa (dfmod o PNG sciolto).
-///
-/// Restituisce `Some((size, layers))` se **almeno una** texture HD è stata trovata, `None`
-/// altrimenti (il chiamante userà il fallback vanilla).
-fn build_hd_layers(
+pub fn build_hd_layers(
     data: &GameData,
     look: PlayerAppearance,
     inventory: &PlayerInventory,
@@ -1555,7 +2003,6 @@ fn build_hd_layers(
         std::fs::read(find_file_ci(&data.dir, name)?).ok()
     };
 
-    // I nativi possono mancare (o essere in BSA): non sono obbligatori.
     let body_native = read(&body_name).and_then(|b| read_img(&b));
     let head_native = read(&head_name).and_then(|h| read_cif(&h, look.face));
 
@@ -1565,7 +2012,6 @@ fn build_hd_layers(
 
     let (g, r) = (look.female as u8, look.race % 8);
 
-    // Varianti di prefisso per body e head.
     let body_prefixes = vec![
         format!("body{g}{r}i0"),
             format!("body{g}_{r}_i0"),
@@ -1599,7 +2045,7 @@ fn build_hd_layers(
         let Some(item) = inventory.equipped_in(slot) else { continue };
         let Some(record) = item.paperdoll_record else { continue };
         let native = load_paperdoll_item_sprite(data, look, item, record);
-        let mut archives = vec![paperdoll_archive(look, slot)];
+        let mut archives = vec![paperdoll_archive(look, slot, item.paperdoll_archive_override)];
         if slot == EquipSlot::RightHand {
             archives.push(WEAPON_ARCHIVE_FALLBACK);
         }
@@ -1621,7 +2067,6 @@ fn build_hd_layers(
     let mut used_body_size: Option<Vec2> = None;
 
     for (native_opt, prefixes, prefer, label) in sources {
-        // 1. Cerca una texture HD: prima nei .dfmod, poi nei file sciolti (via find_by_prefix).
         let mut hd_choice: Option<(String, Handle<Image>, bool)> = None;
         for p in &prefixes {
             if let Some(name) = mods.find_by_prefix(p, &prefer) {
@@ -1689,9 +2134,7 @@ fn build_hd_layers(
                 }
             }
             (None, None) => {
-                warn!(
-                    "paperdoll `{label}`: nessuna texture (né HD né nativa); salto il layer"
-                );
+                warn!("paperdoll `{label}`: nessuna texture (né HD né nativa); salto il layer");
                 continue;
             }
         };
@@ -1715,7 +2158,7 @@ appearance_label(look), look.race, look.female, look.face
     Some((Vec2::new(w, h), layers))
 }
 
-fn layer_rect_percent(layer: &HdLayer, doll: Vec2) -> (f32, f32, f32, f32) {
+pub fn layer_rect_percent(layer: &HdLayer, doll: Vec2) -> (f32, f32, f32, f32) {
     (
         layer.x as f32 / doll.x * 100.0,
      layer.y as f32 / doll.y * 100.0,
@@ -1724,6 +2167,7 @@ fn layer_rect_percent(layer: &HdLayer, doll: Vec2) -> (f32, f32, f32, f32) {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_doll(
     mut commands: Commands,
     state: Res<EquipmentState>,
@@ -1851,12 +2295,14 @@ mod tests {
         let female_redguard = PlayerAppearance { race: 1, female: true, face: 0 };
         let male_elf = PlayerAppearance { race: 4, female: false, face: 0 };
 
+        // `icon_location` (senza template) restituisce gli stessi valori di prima:
+        // i default hanno `icon_source`/`paperdoll_record` e non dipendono dai template.
         assert_eq!(icon_location(female_redguard, sword), Some((234, 12)));
         assert_eq!(sword.paperdoll_record, Some(13));
         assert_eq!(icon_location(female_redguard, shield), Some((247, 34)));
         assert_eq!(icon_location(male_elf, shield), Some((250, 34)));
-        assert_eq!(paperdoll_archive(male_elf, EquipSlot::RightHand), 234);
-        assert_eq!(paperdoll_archive(male_elf, EquipSlot::LeftHand), 250);
+        assert_eq!(paperdoll_archive(male_elf, EquipSlot::RightHand, None), 234);
+        assert_eq!(paperdoll_archive(male_elf, EquipSlot::LeftHand, None), 250);
 
         let axe = inv.items.iter().find(|i| i.name.contains("Axe")).unwrap();
         assert_eq!(axe.slot, EquipSlot::RightHand);
@@ -1867,6 +2313,70 @@ mod tests {
         let mut custom = sword.clone();
         custom.icon_source = None;
         assert_eq!(icon_location(female_redguard, &custom), Some((234, 12)));
+    }
+
+    #[test]
+    fn ring_amulet_cloak_without_icon_source_go_to_procedural_fallback() {
+        let look = PlayerAppearance { race: 1, female: true, face: 0 };
+        let mk = |slot, record| InventoryItem {
+            id: 999, name: "x".into(), slot, equipped: false,
+            weight_kg: 0.1, armor_rating: 0,
+            paperdoll_record: record,
+            icon_source: None,
+            template_id: None,
+            magic_item_param: None,
+            paperdoll_archive_override: None,
+            description: String::new(),
+        };
+
+        // Nessun (archivio, record) "canonico" per ring/amulet/cloak: senza
+        // `icon_source`/`template_id` si va al fallback procedurale.
+        assert_eq!(icon_location(look, &mk(EquipSlot::Ring, None)), None);
+        assert_eq!(icon_location(look, &mk(EquipSlot::Amulet, None)), None);
+        assert_eq!(icon_location(look, &mk(EquipSlot::Cloak, None)), None);
+        assert_eq!(icon_location(look, &mk(EquipSlot::Ring, Some(5))), None);
+        assert_eq!(icon_location(look, &mk(EquipSlot::Amulet, Some(5))), None);
+        assert_eq!(icon_location(look, &mk(EquipSlot::Cloak, Some(5))), None);
+    }
+
+    #[test]
+    fn explicit_icon_source_still_wins_for_any_slot() {
+        let look = PlayerAppearance::default();
+        let ring = InventoryItem {
+            id: 1, name: "Ring".into(), slot: EquipSlot::Ring, equipped: false,
+            weight_kg: 0.1, armor_rating: 0,
+            paperdoll_record: None,
+            icon_source: Some((216, 4)), // record specifico (non 0 = monete)
+            template_id: None,
+            magic_item_param: None,
+            paperdoll_archive_override: None,
+            description: String::new(),
+        };
+        // Con `icon_source` esplicito (es. template DFU o mod HD), l'override vince.
+        assert_eq!(icon_location(look, &ring), Some((216, 4)));
+    }
+
+    #[test]
+    fn template_id_wins_over_paperdoll_when_templates_loaded() {
+        // `icon_location_full` con `ItemTemplates` vuoto e catalogo artefatti
+        // vuoto equivale a `icon_location`: regression test.
+        let look = PlayerAppearance { race: 1, female: true, face: 0 };
+        let sword = InventoryItem {
+            id: 1, name: "Sword".into(), slot: EquipSlot::RightHand, equipped: false,
+            weight_kg: 2.0, armor_rating: 0,
+            paperdoll_record: Some(13),
+            icon_source: None,
+            template_id: Some(42), // il template non esiste: fallback paperdoll
+            magic_item_param: None,
+            paperdoll_archive_override: None,
+            description: String::new(),
+        };
+        let empty = ItemTemplates::default();
+        let empty_magic = MagicItemsCatalog::default();
+        assert_eq!(
+            icon_location_full(look, &sword, &empty, &empty_magic),
+                   Some((234, 12)),
+        );
     }
 
     #[test]

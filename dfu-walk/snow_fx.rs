@@ -2,14 +2,14 @@
 //!
 //! Attiva quando il meteo effettivo è `Neve` (`CurrentPreset`, deciso da
 //! `calendar::sync_season_from_calendar`: calendario oppure override F4).
-
+//! Non si attiva sott'acqua: il tuffo despawna i fiocchi, la riemersione li ricrea.
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-
 use crate::player::Player;
 use crate::sky::dream_sky::CurrentPreset;
+use crate::underwater::UnderwaterState; // FIX: serve per sapere se siamo sott'acqua
 
 const PARTICLE_COUNT: usize = 3500;
 const RADIUS: f32 = 24.0;
@@ -34,6 +34,7 @@ impl Rng {
         self.0 = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
         self
     }
+
     #[inline]
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
@@ -41,6 +42,7 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
+
     #[inline]
     fn f32(&mut self) -> f32 {
         ((self.next() >> 40) as f32) / 16_777_216.0
@@ -87,13 +89,11 @@ fn create_soft_snowflake_image() -> Image {
     const SIZE: usize = 64;
     let mut data = Vec::with_capacity(SIZE * SIZE * 4);
     let center = (SIZE as f32 - 1.0) * 0.5;
-
     for y in 0..SIZE {
         for x in 0..SIZE {
             let dx = (x as f32 - center) / center;
             let dy = (y as f32 - center) / center;
             let dist_sq = dx * dx + dy * dy;
-
             let alpha = if dist_sq >= 1.0 {
                 0.0
             } else {
@@ -101,12 +101,10 @@ fn create_soft_snowflake_image() -> Image {
                 let falloff = ((1.0 - dist) * std::f32::consts::FRAC_PI_2).sin();
                 falloff.powf(1.6)
             };
-
             let a_byte = (alpha * 255.0).clamp(0.0, 255.0) as u8;
             data.extend_from_slice(&[255, 255, 255, a_byte]);
         }
     }
-
     Image::new(
         Extent3d {
             width: SIZE as u32,
@@ -129,7 +127,6 @@ fn setup_snow_assets(
     if state.mesh.is_some() {
         return;
     }
-
     let hw = 0.5;
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -169,19 +166,20 @@ fn update_snow_activation(
     preset: Option<Res<CurrentPreset>>,
     interior: Option<Res<crate::interior::InteriorState>>,
     dungeon: Option<Res<crate::dungeon::DungeonState>>,
+    underwater: Res<UnderwaterState>, // FIX: risorsa con lo stato subacqueo
     mut state: ResMut<SnowState>,
     player: Query<&Transform, With<Player>>,
 ) {
     let outside = !interior.as_ref().is_some_and(|i| i.is_inside())
     && !dungeon.as_ref().is_some_and(|d| d.is_inside());
-
     let snowing = preset.as_ref().is_some_and(|p| p.current.is_snow());
+    // FIX: sott'acqua non nevica. Il tuffo spegne la neve (despawn dei fiocchi),
+    // la riemersione la riaccende: tutto gestito dalla transizione qui sotto.
+    let should_be_active = outside && snowing && !underwater.is_underwater;
 
-    let should_be_active = outside && snowing;
     if should_be_active == state.active {
         return;
     }
-
     if !should_be_active {
         for e in state.particles.drain(..) {
             commands.entity(e).despawn();
@@ -190,19 +188,16 @@ fn update_snow_activation(
         info!("Neve: spenta");
         return;
     }
-
     let Ok(player_tf) = player.get_single() else {
         return;
     };
     let (Some(mesh), Some(material)) = (state.mesh.clone(), state.material.clone()) else {
         return;
     };
-
     let center = player_tf.translation;
     state.rng = std::mem::take(&mut state.rng).seed(
         center.x.to_bits() as u64 ^ ((center.z.to_bits() as u64).rotate_left(32)),
     );
-
     let mut new_particles = Vec::with_capacity(PARTICLE_COUNT);
     for _ in 0..PARTICLE_COUNT {
         let e = spawn_flake(&mut commands, &mesh, &material, center, &mut state.rng, false);
@@ -224,22 +219,18 @@ fn spawn_flake(
 ) -> Entity {
     let angle = rng.f32() * std::f32::consts::TAU;
     let radius = CAMERA_DEADZONE + rng.f32().sqrt() * (RADIUS - CAMERA_DEADZONE);
-
     let y_pos = if spawn_at_top {
         origin.y + HEIGHT * (0.85 + rng.f32() * 0.15)
     } else {
         origin.y + rng.f32() * HEIGHT
     };
-
     let pos = Vec3::new(
         origin.x + angle.cos() * radius,
                         y_pos,
                         origin.z + angle.sin() * radius,
     );
-
     let size_factor = rng.f32().powf(2.4);
     let size = FLAKE_MIN_SIZE + size_factor * (FLAKE_MAX_SIZE - FLAKE_MIN_SIZE);
-
     let flake = SnowFlake {
         fall_speed: BASE_FALL_SPEED * (0.7 + (1.0 - size_factor) * 0.6),
         sway_phase_x: rng.f32() * std::f32::consts::TAU,
@@ -248,7 +239,6 @@ fn spawn_flake(
         sway_amplitude: 0.25 + rng.f32() * 0.35,
         mass_factor: 0.6 + size_factor * 0.6,
     };
-
     commands
     .spawn((
         Mesh3d(mesh.clone()),
@@ -268,7 +258,6 @@ fn update_snow_particles(
     if !state.active {
         return;
     }
-
     let Ok(player_tf) = player_q.get_single() else {
         return;
     };
@@ -306,13 +295,11 @@ fn update_snow_particles(
                              (flake.sway_phase_x + flake.sway_phase_z).sin() * 0.1,
                              flake.sway_phase_z.cos() * (flake.sway_amplitude * 0.85),
         );
-
         let velocity = Vec3::new(
             current_wind.x * flake.mass_factor,
             -flake.fall_speed,
             current_wind.y * flake.mass_factor,
         );
-
         transform.translation += (velocity + sway) * dt;
 
         let offset_xz = Vec2::new(
@@ -320,7 +307,6 @@ fn update_snow_particles(
             transform.translation.z - center.z,
         );
         let dist_xz = offset_xz.length();
-
         if dist_xz > RADIUS {
             let normal_back = -offset_xz.normalize();
             transform.translation.x = center.x + normal_back.x * (RADIUS * 0.95);

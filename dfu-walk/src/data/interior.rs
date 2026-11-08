@@ -290,6 +290,31 @@ impl InteriorScene {
         self.door_open[i] = !self.door_open[i];
         Some(i)
     }
+
+    /// Restituisce l'indice della porta raggiungibile più vicina a `(x, z)`
+    /// (con `reach`), o `None` se non ce n'è. **Non modifica** lo stato della
+    /// porta.
+    ///
+    /// Usata da `interior_enter_exit` per dare priorità alla porta sull'uscita
+    /// dall'edificio (stesso principio di `BuiltDungeon::nearest_door`).
+    pub fn nearest_door(&self, x: f32, z: f32, feet_y: f32, reach: f32) -> Option<usize> {
+        let mut best: Option<(f32, usize)> = None;
+        for (i, d) in self.doors.iter().enumerate() {
+            if (d.center[1] - feet_y).abs() > 3.0 {
+                continue;
+            }
+            let mut dist = f32::MAX;
+            for t in &d.tris {
+                for k in 0..3 {
+                    dist = dist.min(dist_segment_xz(x, z, t[k], t[(k + 1) % 3]));
+                }
+            }
+            if dist <= reach && best.map_or(true, |(b, _)| dist < b) {
+                best = Some((dist, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
 }
 
 fn find_entrance_spawn(

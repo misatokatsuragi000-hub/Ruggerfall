@@ -691,6 +691,12 @@ pub fn choose_front_side(center: [f32; 2], half: [f32; 2], rot_deg: f32, bounds:
 pub struct CityBuilder {
     parts: [MeshPart; MATERIAL_COUNT],
     textured: Vec<((u16, u8), MeshPart)>,
+    /// Se `true`, le istanze ARCH3D (`add_arch3d_instance*`) vengono specchiate in Z locale
+    /// (z -> -z, winding invertito, normali coerenti, rot_x negata). Serve a completare il
+    /// flip nord-sud dei blocchi: `placed_models()` specchia posizione e rotazione Y, ma la
+    /// geometria del modello resta quella non specchiata. Non tocca `add()` (procedurali,
+    /// palazzo), che scelgono la facciata in coordinate mondo.
+    pub mirror_z: bool,
 }
 
 fn append_transformed(dst: &mut MeshPart, src: &MeshPart, offset: [f32; 3], s: f32, c: f32, position: [f32; 3]) {
@@ -809,11 +815,18 @@ impl CityBuilder {
         rot_z_deg: f32,
         position: [f32; 3],
     ) {
+        let mirror_z = self.mirror_z;
+        let mz = if mirror_z { -1.0f32 } else { 1.0 };
+        // M·Rx(a)·M = Rx(-a); Ry e' gia' in rot_deg (rot'), Rz resta invariata.
+        let rot_x_deg = if mirror_z { -rot_x_deg } else { rot_x_deg };
+
         let (s, c) = rot_deg.to_radians().sin_cos();
         let (sx, cx) = rot_x_deg.to_radians().sin_cos();
         let (sz, cz) = rot_z_deg.to_radians().sin_cos();
 
         let trans = |v: [f32; 3]| -> [f32; 3] {
+            // Specchio locale in Z, prima di inclinazioni, rotazione Y e traslazione.
+            let v = [v[0], v[1], v[2] * mz];
             // Z, poi X (attorno agli assi locali del modello)...
             let (x1, y1, z1) = (v[0] * cz - v[1] * sz, v[0] * sz + v[1] * cz, v[2]);
             let (x2, y2, z2) = (x1, y1 * cx - z1 * sx, y1 * sx + z1 * cx);
@@ -853,7 +866,9 @@ impl CityBuilder {
                 nz += (a[0] - b[0]) * (a[1] + b[1]);
             }
             let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-5);
-            let normal = [-nx / len, -ny / len, -nz / len];
+            // Con mirror il poligono e' gia' specchiato: la normale esterna e' +Newell.
+            let k = if mirror_z { 1.0 } else { -1.0 };
+            let normal = [k * nx / len, k * ny / len, k * nz / len];
 
             // Ear clipping: le facce concave (siepi, merli, croci) non si riempiono con un ventaglio
             // dal vertice 0, che lascia buchi e triangoli ribaltati.
@@ -876,14 +891,21 @@ impl CityBuilder {
                 dst.uvs.push(uv0);
                 dst.colors.push([1.0, 1.0, 1.0, 1.0]);
 
-                dst.positions.push(vert2);
+                // Winding: la riflessione lo inverte, quindi con mirror si emette (0,1,2).
+                let (va, ua, vb, ub) = if mirror_z {
+                    (vert1, uv1, vert2, uv2)
+                } else {
+                    (vert2, uv2, vert1, uv1)
+                };
+
+                dst.positions.push(va);
                 dst.normals.push(normal);
-                dst.uvs.push(uv2);
+                dst.uvs.push(ua);
                 dst.colors.push([1.0, 1.0, 1.0, 1.0]);
 
-                dst.positions.push(vert1);
+                dst.positions.push(vb);
                 dst.normals.push(normal);
-                dst.uvs.push(uv1);
+                dst.uvs.push(ub);
                 dst.colors.push([1.0, 1.0, 1.0, 1.0]);
 
                 dst.indices.extend_from_slice(&[base, base + 1, base + 2]);

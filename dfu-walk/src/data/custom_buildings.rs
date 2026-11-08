@@ -2,45 +2,38 @@
 //! - Templi Pagani Classici degli Otto Divini (crepidoma a gradoni, maestoso pronao con colonnato ellenico-romano,
 //!   trabeazione continua, grande timpano triangolare a due falde, portale ad arco in pietra con ante door.png).
 //! - Torre della Gilda dei Maghi: **ottagono** solido senza forature, portale ad arco su facciata Sud piana,
-//!   **7 piani** con **4 finestre per piano alternate** (lati pari) **in stile Palazzo Reale** a mezza scala
-//!   (davanzale, stipiti, arco a tutto sesto, chiave di volta, vetro con gradiente diagonale, inferriate).
+//!   piani configurabili (`floors`): 20 a Daggerfall (torre centrale, alta), 9 altrove
+//!   (torri di gilda più contenute), con **4 finestre per piano alternate** (lati pari)
+//!   **in stile Palazzo Reale** a mezza scala (davanzale, stipiti, arco a tutto sesto, chiave
+//!   di volta, vetro con gradiente diagonale, inferriate).
 //! - Fighters Hall / Maschio dei Guerrieri (torrette, feritoie e portale monumentale).
 //! - Thieves Guild & Hall generica (architettura fortificata con portale ad arco).
 //!
 //! ## Finestre arricchite (fix)
 //!
-//! Prima di questa fix, `generate_fighters_hall` e `generate_generic_hall` disegnavano
-//! le finestre come semplici box piatti (un quadrato nero per le feritoie, un quadrato
-//! blu per il vetro). Il risultato era "rozzo": nessuna cornice, nessuna inferriata,
-//! nessun davanzale.
-//!
-//! Ora entrambe usano `push_rich_window`, che disegna:
+//! `generate_fighters_hall` e `generate_generic_hall` usano `push_rich_window`, che disegna:
 //! - cornice in pietra (in `wall`, quindi eredita la stessa texture del muro);
 //! - architrave sporgente in cima e davanzale in fondo;
 //! - vetro blu (in `windows`);
 //! - due inferriate incrociate (in `trim`).
 //!
-//! Ispirata alle finestre del Palazzo Reale (`palace_gen.rs`), che hanno cornice
-//! in pietra, gradiente nel vetro e inferriate incrociate.
+//! ## Terrazzo e guglia (fix collisione)
 //!
-//! ## Cornicione in pietra (fix)
+//! La cupola e la guglia sono coni quasi-verticali (`|ny| ≈ 0.17`), quindi in
+//! `tiles.rs::Colliders::from_parts` vengono classificati come "muro scalabile" ma
+//! **non** come pavimento calpestabile. Risultato: il player le scala, ma appena
+//! rilascia Q cade nel vuoto e le attraversa (non c'è collider solido).
 //!
-//! La sporgenza a metà del secondo piano era un `push_box(trim, ...)` con colore
-//! fisso marrone scuro (`trim_c`). L'utente la vedeva come "senza texture": era
-//! un blocco di colore uniforme, privo della texture del muro. Ora è in `wall`
-//! (`stone`), quindi eredita la stessa texture del muro circostante (pietra,
-//! mattoni, legno, a seconda dell'edificio).
+//! Ora `generate_mage_tower` aggiunge:
 //!
-//! ## Torre dei Maghi ottagonale a 7 piani con finestre del Palazzo Reale
+//! - un **terrazzo** calpestabile alla base della guglia (r = 1.2 m, spessore 0.3 m,
+//!   con pavimento ottagonale a `ny = 1`) — dopo la cupola il player ci sta in piedi;
+//! - una **guglia cilindrica** (raggio costante 0.6 m) al posto del cono appuntito;
+//! - un **disco calpestabile** in cima alla guglia (r = 0.6 m), per poter sostare;
+//! - una **punta decorativa conica** sopra il disco, non scalabile.
 //!
-//! La torre era un cilindro quasi perfetto (`sides = 20`) a 5 piani, con finestre
-//! a quadrato blu piatto. Ora è un **ottagono** (`sides = 8`), quindi con **lati
-//! piatti** come nelle torri originali di Daggerfall, a **7 piani**, e ogni faccia
-//! **pari** di ogni piano ha una finestra in stile Palazzo Reale disegnata da
-//! `push_palace_window` a **mezza scala** (`scale = 0.5`). Le facce **dispari**
-//! restano senza finestre (4 finestre per piano, alternate). Il portale d'ingresso
-//! è sul lato con centro a 270° in direzione `-Z` (`door_side_idx = 5`, dispari),
-//! dove arriva il giocatore, quindi il portale non ha mai una finestra sopra.
+//! Così il player può scalare la cupola, sostare sul terrazzo, scalare la guglia
+//! cilindrica, e arrivare in cima senza cadere attraverso la superficie.
 use super::arch3d::BuildingTextures;
 use super::building_gen::{BuildingMesh, Footprint, MeshPart, Side};
 use std::f32::consts::{PI, TAU};
@@ -225,12 +218,6 @@ impl AxisFrame {
 ///
 /// Ispirata alle finestre del Palazzo Reale: cornice rettangolare, architrave
 /// e davanzale sporgenti, vetro con colore fisso, inferriate quasi nere.
-///
-/// # Parametri
-/// * `center` — punto di ancoraggio sulla superficie esterna del muro
-/// * `axis` — normale del muro (quale direzione è "fuori")
-/// * `width`, `height` — dimensioni del VETRO (la cornice sporge oltre)
-/// * `stone`, `glass`, `iron` — colori dei tre materiali
 pub fn push_rich_window(
     wall: &mut MeshPart,
     windows: &mut MeshPart,
@@ -865,21 +852,6 @@ pub fn generate_pagan_temple(fp: &Footprint, btex: BuildingTextures) -> Building
 // FINESTRA IN STILE PALAZZO REALE (con parametro di scala)
 // =========================================================================
 
-/// Disegna una finestra **in stile Palazzo Reale** (`palace_gen.rs`) su una
-/// faccia piana con normale `normal` (orizzontale, unitaria).
-///
-/// `base_center` è il punto sul muro al **centro della base** della finestra
-/// (alla quota `fy`, sotto lo stipite), non al centro geometrico. La finestra
-/// si estende verso l'esterno lungo `normal`.
-///
-/// `scale` scala **tutte** le dimensioni: con `scale = 1.0` la finestra è
-/// identica a quella del palazzo (davanzale, stipiti, arco a tutto sesto,
-/// chiave di volta, vetro con gradiente diagonale, inferriate a croce e
-/// bottone centrale). Con `scale = 0.5` è esattamente metà in ogni dimensione.
-///
-/// `win_r` e `win_h_rect` sono le dimensioni del **vetro** (raggio dell'arco
-/// e altezza del rettangolo). Devono essere già scalati coerentemente con
-/// `scale`: in genere `win_r = 0.92 * scale`, `win_h_rect = 2.05 * scale`.
 fn push_palace_window(
     wall: &mut MeshPart,
     windows: &mut MeshPart,
@@ -894,7 +866,6 @@ fn push_palace_window(
 ) {
     let sc = scale.max(1e-3);
 
-    // Sistema locale (t, up, n) destrorso: `t × up = n`.
     let n = [normal[0], 0.0, normal[2]];
     let t = [n[2], 0.0, -n[0]];
     let up = [0.0f32, 1.0, 0.0];
@@ -907,14 +878,12 @@ fn push_palace_window(
         ]
     };
 
-    // Punto dentro il muro: `push_face` lo usa per l'orientamento delle facce.
     let inside = [
         base_center[0] - n[0] * 1.0,
         base_center[1] + win_h_rect * 0.5,
         base_center[2] - n[2] * 1.0,
     ];
 
-    // Box orientato nel sistema (t, up, n).
     let mut obox = |part: &mut MeshPart,
     u0: f32, u1: f32,
     v0: f32, v1: f32,
@@ -933,14 +902,11 @@ fn push_palace_window(
     let wy_spring = win_h_rect;
     let wy_top = wy_spring + win_r;
 
-    // 1. Davanzale
     obox(wall, -1.25 * sc, 1.25 * sc, -0.25 * sc, 0.0, -0.04 * sc, 0.16 * sc, stone, 2.0);
 
-    // 2. Stipiti
     obox(wall, -1.20 * sc, -win_r, 0.0, wy_spring, 0.0, 0.16 * sc, stone, 1.5);
     obox(wall, win_r, 1.20 * sc, 0.0, wy_spring, 0.0, 0.16 * sc, stone, 1.5);
 
-    // 3. Arco a tutto sesto in pietra (12 segmenti)
     let r_out_win = win_r + 0.25 * sc;
     let n_arch = 12;
     for k in 0..n_arch {
@@ -957,7 +923,6 @@ fn push_palace_window(
         let u1_out = -r_out_win * a1.cos();
         let v1_out = wy_spring + r_out_win * a1.sin();
 
-        // Anello frontale
         push_face(wall, &[
             pw(u0_in, v0_in, 0.0),
                   pw(u1_in, v1_in, 0.0),
@@ -965,7 +930,6 @@ fn push_palace_window(
                   pw(u0_out, v0_out, 0.0),
         ], stone, 1.5, inside);
 
-        // Estrusione esterna
         push_face(wall, &[
             pw(u0_out, v0_out, 0.0),
                   pw(u1_out, v1_out, 0.0),
@@ -973,7 +937,6 @@ fn push_palace_window(
                   pw(u0_out, v0_out, 0.16 * sc),
         ], stone, 1.5, inside);
 
-        // Intradosso
         push_face(wall, &[
             pw(u0_in, v0_in, 0.0),
                   pw(u1_in, v1_in, 0.0),
@@ -982,14 +945,12 @@ fn push_palace_window(
         ], stone, 1.5, inside);
     }
 
-    // 4. Chiave di volta
     obox(wall,
          -0.16 * sc, 0.16 * sc,
          wy_top - 0.05 * sc, wy_top + 0.22 * sc,
          0.0, 0.20 * sc,
          stone, 1.0);
 
-    // 5. Vetro con gradiente diagonale
     let z_glass = 0.05 * sc;
     let glass_norm = [n[0], 0.0, n[2]];
     let glass_color_at = |u: f32, v: f32| -> [f32; 4] {
@@ -999,7 +960,6 @@ fn push_palace_window(
         [0.10 + 0.38 * diag, 0.22 + 0.50 * diag, 0.48 + 0.46 * diag, 1.0]
     };
 
-    // Rettangolo del vetro
     let g_base = windows.positions.len() as u32;
     let quad = [
         (pw(-win_r, 0.0, z_glass), glass_color_at(-win_r, 0.0), [0.0, 1.0]),
@@ -1018,7 +978,6 @@ fn push_palace_window(
         g_base, g_base + 2, g_base + 3,
     ]);
 
-    // Arco del vetro a ventaglio (semicerchio)
     let c_center = pw(0.0, wy_spring, z_glass);
     let c_idx = windows.positions.len() as u32;
     windows.positions.push(c_center);
@@ -1042,7 +1001,6 @@ fn push_palace_window(
         windows.indices.extend_from_slice(&[c_idx, p1, p0]);
     }
 
-    // 6. Inferriate incrociate
     let t_bar = 0.035 * sc;
     let bar_n0 = z_glass + 0.01 * sc;
     let bar_n1 = z_glass + 0.04 * sc;
@@ -1065,10 +1023,10 @@ fn push_palace_window(
 }
 
 // =========================================================================
-// TORRE DELLA GILDA DEI MAGHI (MAGE) — OTTAGONO A 7 PIANI
+// TORRE DELLA GILDA DEI MAGHI — piani configurabili, terrazzo, guglia cilindrica
 // =========================================================================
 
-pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMesh {
+pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures, floors: usize) -> BuildingMesh {
     let mut mesh = BuildingMesh::default();
     mesh.wall_texture = btex.wall.or(Some((335, 0)));
     mesh.roof_texture = btex.roof.or(Some((339, 0)));
@@ -1083,14 +1041,16 @@ pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMe
 
     let r = (fp.width.min(fp.depth) * 0.5).max(7.0);
     let total_h = fp.height.max(92.0);
-    // Ottagono: lati piatti come nelle torri dei maghi di Daggerfall.
     let sides = 8;
+
+    // Piani configurabili: 20 a Daggerfall (torre centrale, alta),
+    // 9 altrove (torri di gilda più contenute). `max(1)` evita
+    // divisioni per zero se qualcuno passa 0.
+    let n_floors = floors.max(1);
 
     let BuildingMesh { parts: [wall, roof, trim, _], doors, windows, .. } = &mut mesh;
 
     let angle_offset = PI / sides as f32;
-    // Lato con centro a 270° (verso -Z, dove arriva il giocatore):
-    //   angle_offset + (i + 0.5) * 2PI/sides = 270° → con sides = 8 → i = 5.
     let door_side_idx = 5usize;
     let wall_front_z = -r * (PI / sides as f32).cos();
 
@@ -1101,58 +1061,109 @@ pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMe
     push_ring(trim, 0.0, 0.0, r_base * 0.98, r_base * 1.02, 0.1, 0.3, sides,
               trim_c, 2.0, angle_offset, Some(door_side_idx));
 
-    // ===== CORPO A 7 PIANI =====
-    const N_FLOORS: usize = 20;
+    // ===== CORPO A `n_floors` PIANI =====
     let y_floor = 0.0;
-    let floor_h = total_h / N_FLOORS as f32;
-    let mut floor_ys = Vec::with_capacity(N_FLOORS + 1);
+    let floor_h = total_h / n_floors as f32;
+    let mut floor_ys = Vec::with_capacity(n_floors + 1);
     floor_ys.push(y_floor);
-    for i in 1..=N_FLOORS {
+    for i in 1..=n_floors {
         floor_ys.push(y_floor + floor_h * i as f32);
     }
 
-    for i in 0..N_FLOORS {
+    for i in 0..n_floors {
         push_cylinder(wall, 0.0, 0.0, r, floor_ys[i], floor_ys[i + 1],
                       sides, stone, 4.0, angle_offset, None);
     }
 
-    // Marcapiani tra i piani
     let r_cornice = r + 0.28;
-    for i in 1..N_FLOORS {
+    for i in 1..n_floors {
         let y = floor_ys[i];
         push_ring(wall, 0.0, 0.0, r, r_cornice, y - 0.15, y + 0.15, sides,
                   trim_c, 2.0, angle_offset, None);
     }
 
-    // Anello in cima
     let r_top = r + 0.55;
-    let y_top_ring = floor_ys[N_FLOORS];
+    let y_top_ring = floor_ys[n_floors];
     push_ring(trim, 0.0, 0.0, r, r_top, y_top_ring, y_top_ring + 0.65, sides,
               trim_c, 2.0, angle_offset, None);
 
-    // Cupola e guglia
+    // ===== CUPOLA (cono in roof, calpestabile solo parzialmente) =====
     let dome_r = r_top;
     let dome_h = r * 2.9;
     push_cone(roof, 0.0, 0.0, dome_r, y_top_ring + 0.65,
               y_top_ring + 0.65 + dome_h, sides, dome_c, 3.5, angle_offset);
     let spire_base_y = y_top_ring + 0.65 + dome_h;
-    push_cone(trim, 0.0, 0.0, 0.6, spire_base_y, spire_base_y + 3.5, 8,
-              gold_c, 1.5, 0.0);
+
+    // ===== TERRAZZO + GUGLIA (fix collisione) =====
+    //
+    // La cupola e la guglia sono coni quasi-verticali (|ny| ≈ 0.17):
+    // in `tiles.rs::Colliders::from_parts` sono classificate come muro
+    // scalabile ma NON come pavimento calpestabile, quindi il player le
+    // scala ma ci cade attraverso. Qui aggiungiamo:
+    //
+    //   - un "terrazzo" ottagonale calpestabile alla base della guglia
+    //     (r = 1.2 m, spessore 0.3 m). Dopo la cupola il player ci sta
+    //     in piedi e può guardare il panorama;
+    //   - una guglia **cilindrica** (raggio 0.6 m) al posto del cono
+    //     appuntito: il player ci si arrampica e non "scivola" verso il
+    //     centro perché il raggio è costante;
+    //   - un **disco** calpestabile in cima alla guglia (r = 0.6 m),
+    //     per poter sostare;
+    //   - una **punta** conica decorativa sopra il disco, non scalabile.
+    let terrace_r = 1.2f32;
+    push_cylinder(
+        trim, 0.0, 0.0, terrace_r,
+        spire_base_y - 0.3, spire_base_y,
+        sides, gold_c, 1.5, angle_offset, None,
+    );
+    for i in 0..sides {
+        let a0 = angle_offset + (i as f32 / sides as f32) * TAU;
+        let a1 = angle_offset + ((i + 1) as f32 / sides as f32) * TAU;
+        let p0 = [terrace_r * a0.cos(), spire_base_y, terrace_r * a0.sin()];
+        let p1 = [terrace_r * a1.cos(), spire_base_y, terrace_r * a1.sin()];
+        push_face(
+            trim,
+            &[[0.0, spire_base_y, 0.0], p0, p1],
+            gold_c, 1.5, [0.0, spire_base_y - 1.0, 0.0],
+        );
+    }
+
+    let spire_h = 5.0f32;
+    let spire_r = 0.6f32;
+    push_cylinder(
+        trim, 0.0, 0.0, spire_r,
+        spire_base_y, spire_base_y + spire_h,
+        sides, gold_c, 1.5, angle_offset, None,
+    );
+    for i in 0..sides {
+        let a0 = angle_offset + (i as f32 / sides as f32) * TAU;
+        let a1 = angle_offset + ((i + 1) as f32 / sides as f32) * TAU;
+        let p0 = [spire_r * a0.cos(), spire_base_y + spire_h, spire_r * a0.sin()];
+        let p1 = [spire_r * a1.cos(), spire_base_y + spire_h, spire_r * a1.sin()];
+        push_face(
+            trim,
+            &[[0.0, spire_base_y + spire_h, 0.0], p0, p1],
+            gold_c, 1.5, [0.0, spire_base_y + spire_h - 1.0, 0.0],
+        );
+    }
+    push_cone(
+        trim, 0.0, 0.0, spire_r,
+        spire_base_y + spire_h, spire_base_y + spire_h + 1.0,
+        sides, gold_c, 1.5, angle_offset,
+    );
 
     // ===== PORTALE =====
     build_arched_guild_portal(wall, doors, trim, stone, 0.0, wall_front_z, y_floor);
 
     // ===== FINESTRE IN STILE PALAZZO REALE (a mezza scala) =====
-    // Dimensioni fedeli del palazzo, dimezzate.
     let win_scale = 0.5f32;
-    let win_r = 0.92 * win_scale;         // 0.46 m
-    let win_h_rect = 2.05 * win_scale;    // 1.025 m
-    let win_h_total = win_h_rect + win_r; // 1.485 m
+    let win_r = 0.92 * win_scale;
+    let win_h_rect = 2.05 * win_scale;
+    let win_h_total = win_h_rect + win_r;
 
     let apothem = r * (PI / sides as f32).cos();
 
-    for floor_idx in 0..N_FLOORS {
-        // Piano terra: nessuna finestra (solo il portale).
+    for floor_idx in 0..n_floors {
         if floor_idx == 0 {
             continue;
         }
@@ -1160,7 +1171,6 @@ pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMe
         let floor_bottom = floor_ys[floor_idx];
         let local_floor_h = floor_ys[floor_idx + 1] - floor_bottom;
 
-        // Margine minimo di 0.3 m dal fondo del piano; se non basta, salta.
         let margin = (local_floor_h - win_h_total).max(0.0);
         let win_base_v = (margin * 0.5).max(0.3);
         if win_base_v + win_h_total > local_floor_h {
@@ -1168,12 +1178,6 @@ pub fn generate_mage_tower(fp: &Footprint, btex: BuildingTextures) -> BuildingMe
         }
         let win_base_y = floor_bottom + win_base_v;
 
-        // Alterna la parità del lato per piano, così le finestre di piani
-        // consecutivi non sono allineate verticalmente (zig-zag).
-        //   Piano 1 (parità 1): lati 1, 3, 5, 7
-        //   Piano 2 (parità 0): lati 0, 2, 4, 6
-        //   Piano 3 (parità 1): lati 1, 3, 5, 7
-        //   ...
         let face_parity = floor_idx % 2;
 
         for face_idx in 0..sides {
@@ -1229,8 +1233,6 @@ pub fn generate_fighters_hall(fp: &Footprint, btex: BuildingTextures) -> Buildin
     push_box(wall, [-hw, y_floor, -hd], [hw, y1, hd], stone, 4.0);
     push_box(wall, [-hw, y1, -hd], [hw, y2, hd], stone, 4.0);
 
-    // Cornicione in pietra (prima era in `trim` con colore fisso, "senza texture":
-    // ora è in `wall` e eredita la texture del muro).
     push_box(
         wall,
         [-hw - 0.25, y1 - 0.15, -hd - 0.25],
@@ -1246,7 +1248,6 @@ pub fn generate_fighters_hall(fp: &Footprint, btex: BuildingTextures) -> Buildin
 
     build_arched_guild_portal(wall, doors, trim, stone, 0.0, -hd, y_floor);
 
-    // Finestre arricchite (piano terra + secondo piano).
     for &wx in &[-hw * 0.6, hw * 0.6] {
         push_rich_window(
             wall, windows, trim,
@@ -1318,7 +1319,6 @@ pub fn generate_generic_hall(fp: &Footprint, btex: BuildingTextures) -> Building
     push_box(wall, [-hw, y_floor, -hd], [hw, y1, hd], stone, 4.0);
     push_box(wall, [-hw, y1, -hd], [hw, y2, hd], stone, 4.0);
 
-    // Cornicione in pietra (prima in `trim` con colore fisso).
     push_box(
         wall,
         [-hw - 0.25, y1 - 0.15, -hd - 0.25],
@@ -1332,7 +1332,6 @@ pub fn generate_generic_hall(fp: &Footprint, btex: BuildingTextures) -> Building
 
     build_arched_guild_portal(wall, doors, trim, stone, 0.0, -hd, y_floor);
 
-    // Finestre arricchite su fronte e retro (prima erano box blu piatti).
     for (fy, fh) in [(y_floor + 1.6, 1.0f32), (y1 + 1.2, 1.2)] {
         for &wx in &[-hw * 0.6, hw * 0.6] {
             push_rich_window(
@@ -1363,15 +1362,22 @@ pub enum GuildStyle {
     Hall,
 }
 
+/// Genera la mesh di una gilda.
+///
+/// `mage_floors` è usato solo da `GuildStyle::Mage`: 20 per la torre dei
+/// maghi di Daggerfall (torre centrale, alta), 9 per tutte le altre gilde
+/// dei maghi. Per gli altri stili il parametro è ignorato. Il chiamante
+/// (`city_buildings.rs`) decide il valore in base al nome della città.
 pub fn generate_guild_hall(
     fp: &Footprint,
     _front: Side,
     _seed: u32,
     btex: BuildingTextures,
     style: GuildStyle,
+    mage_floors: usize,
 ) -> BuildingMesh {
     match style {
-        GuildStyle::Mage => generate_mage_tower(fp, btex),
+        GuildStyle::Mage => generate_mage_tower(fp, btex, mage_floors),
         GuildStyle::Fighter => generate_fighters_hall(fp, btex),
         GuildStyle::Thief => generate_generic_hall(fp, btex),
         GuildStyle::Hall => generate_generic_hall(fp, btex),

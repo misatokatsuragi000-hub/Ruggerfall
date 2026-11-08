@@ -1,4 +1,26 @@
 //! Mappa locale della città (tasto L): edifici e punti di interesse.
+//!
+//! ## Allineamento con `city_buildings`
+//!
+//! `collect_city_map` **deve** produrre le stesse posizioni mondiali di
+//! `city_buildings::build_city_buildings`, altrimenti il check E in
+//! `interior_enter_exit` cerca la taverna in un posto dove la taverna visibile
+//! non è, e "le taverne non sono più accessibili".
+//!
+//! `build_city_buildings` usa:
+//!
+//! - `rmb.set_mirror_local(true)` (riflessione locale dei subrecord: `ln -> -ln`,
+//!   rotazioni Y negate);
+//! - `builder.mirror_z = true` (riflessione della geometria dei modelli ARCH3D);
+//! - `fp.cz = -fp.cz` prima di applicare la rotazione al centro del footprint.
+//!
+//! Qui replichiamo esattamente quei tre passaggi. In passato `city_map` usava
+//! `set_flip_ns(true)`, che produce `pm.n` **speculare** rispetto a
+//! `set_mirror_local(true)`: per esempio, con `s.z = -1024` e `o.z = 100`,
+//! `set_flip_ns` dava `pm.n = 924`, `set_mirror_local` dava `pm.n = 3172`
+//! (somma = 4096, speculari rispetto al centro del blocco). Risultato: la
+//! taverna visibile stava a `Z = 3172`, ma la mappa la segnalava a `Z = 924`
+//! e il tasto E non la trovava.
 
 use std::collections::{HashMap, HashSet};
 
@@ -124,7 +146,16 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
         for bx in 0..bw {
             let Some(name) = location.block_names.get(by * location.width + bx) else { continue };
             let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
-            let Ok(rmb) = RmbBlock::parse(raw) else { continue };
+            let Ok(mut rmb) = RmbBlock::parse(raw) else { continue };
+            // Allineato a `city_buildings::build_city_buildings`:
+            // `set_mirror_local(true)` (riflessione locale dei subrecord) +
+            // `builder.mirror_z = true` (riflessione geometria ARCH3D) +
+            // `fp.cz = -fp.cz` prima di applicare la rotazione al centro del
+            // footprint. **Non** `set_flip_ns(true)`: produrrebbe `pm.n`
+            // speculare rispetto a `set_mirror_local` e il tasto E non
+            // troverebbe più la taverna visibile in 3D.
+            rmb.set_mirror_local(true);
+
             let is_wall_block = name.to_ascii_uppercase().starts_with("WALL");
 
             let gx = start_bx + bx;
@@ -177,8 +208,12 @@ pub fn collect_city_map(location: &DFLocation, blocks_bsa: &BsaArchive, arch3d_b
                 let pz = -(bz0 + obj.n * DF_UNIT);
                 let rot = obj.rotation_deg;
                 let (s, c) = rot.to_radians().sin_cos();
-                let wx = px + fp.cx * c + fp.cz * s;
-                let wz = pz - fp.cx * s + fp.cz * c;
+                // Come `city_buildings::build_city_buildings` con
+                // `builder.mirror_z = true`: anche il centro Z del footprint
+                // si specchia (`f.cz = -f.cz` prima della rotazione).
+                let fp_cz = -fp.cz;
+                let wx = px + fp.cx * c + fp_cz * s;
+                let wz = pz - fp.cx * s + fp_cz * c;
 
                 if is_on_avenue(wx, wz) {
                     continue;

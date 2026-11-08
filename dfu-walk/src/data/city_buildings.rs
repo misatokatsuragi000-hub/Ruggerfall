@@ -1,37 +1,44 @@
 //! Assembla gli edifici e gli arredi urbani di Daggerfall.
 //!
+//! ## Convenzioni di coordinate (Unity vs Bevy)
+//!
+//! Unity usa un sistema left-handed con Z verso nord (forward), mentre Bevy usa
+//! un sistema right-handed con Z verso sud (forward). Questo causa un'inversione
+//! nord-sud se non gestita correttamente.
+//!
+//! La conversione avviene qui, in `block_px_pz_rot`:
+//! - Negare la coordinata Z per invertire la direzione
+//! - Mantenere X invariata
+//! - Le rotazioni sono già nel `PlacedModel` (`pm.rotation_deg`)
+//!
+//! ## Flip nord-sud
+//!
+//! Il flip del contenuto del blocco è **locale**: `rmb.set_mirror_local(true)`
+//! (in `blocks.rs`) specchia gli offset dei subrecord e nega le rotazioni,
+//! mentre `builder.mirror_z = true` (in `building_gen.rs`) specchia la
+//! geometria dei modelli ARCH3D attorno al proprio pivot. Le **posizioni**
+//! dei subrecord e dei misc object non vengono specchiate (`flip_ns` resta
+//! `false`, il default di `RmbBlock::parse`). Vedi il doc di `blocks.rs`.
+//!
+//! Il Palazzo Reale non viene toccato da nessuna delle due: è spawnato al
+//! centro del blocco (non è un `pm`) e ha il portale rivolto a sud per design.
 //! ## Fix: gilde e templi solo dove la mappa li segna
 //!
 //! `city_map.rs::poi_kind` marca come gilda un edificio con `building_type == 11`
-//! e come tempio un edificio con `building_type == 14`. Prima di questa fix,
-//! `build_city_buildings` aveva un fallback (`landmark_pm_index`) che — quando
-//! un blocco aveva prefisso MAGE/FIGH/THIE/TEMP/GUIL/PTEM/DARK, oppure conteneva
-//! almeno un edificio di tipo 11/14 — trasformava in gilda/tempio **l'edificio
-//! più grande del blocco**, anche se il suo `building_type` non era né 11 né 14.
-//!
-//! Risultato: un castello (`CAST...RMB`) con dentro una dépendance di tipo 11
-//! diventava una "generic hall" procedurale (merli, portale, finestre blu piatte,
-//! texture legno) ma **senza puntino blu sulla mappa locale**, perché la mappa
-//! continuava a considerare gilda solo il piccolo edificio di tipo 11.
-//!
-//! Ora le gilde ei templi procedurali si applicano **solo** agli edifici che la
-//! mappa stessa riconosce come tali (`is_guild_sub` / `is_temple_sub`). Il
-//! resto resta ARCH3D originale.
+//! e come tempio un edificio con `building_type == 14`. Le gilde e i templi
+//! procedurali si applicano solo agli edifici che la mappa riconosce come tali.
 //!
 //! ## Mura, bastioni e sgombero della via reale
 //!
 //! - I bastioni d'angolo del perimetro (`bx == 0`/`bw-1` e `by == 0`/`bh-1`)
-//!   vengono ingranditi (1.8× in pianta, altezza ≥ 35 m) e classificati come
-//!   `WallKind::Tower`.
+//!   vengono ingranditi (1.8× in pianta, altezza ≥ 35 m).
 //! - Le mura normali di Daggerfall hanno altezza minima 18 m.
 //! - La porta sud ha altezza minima 18 m.
 //! - Gli edifici (`pm.is_building`) che cadono sulla via reale (avenue) vengono
-//!   scartati, per evitare che case/gilde/templi si sovrappongano al viale
-//!   centrale. Il viale è largo 12 m (22 m a nord).
+//!   scartati.
 use std::collections::HashMap;
-
 use super::arch3d::{Arch3dModel, BuildingTextures};
-use super::blocks::RmbBlock;
+use super::blocks::{PlacedModel, RmbBlock};
 use super::bsa::BsaArchive;
 use super::building_gen::{
     choose_front_side, generate_building, seed_for, BuildingMesh, CityBuilder, Footprint,
@@ -45,18 +52,43 @@ use super::wall_gen::{classify_wall, generate_wall, wall_footprint, WallKind};
 // =============================================================================
 // CONFIGURAZIONE
 // =============================================================================
-
-/// Palazzo Reale, Templi e Gilde procedurali.
 const PROCEDURAL_LANDMARKS: bool = true;
-
-/// Case comuni (RESI, GENR, ecc.) procedurali.
 const PROCEDURAL_HOUSES: bool = false;
-
-/// Mura e porte procedurali.
 const PROCEDURAL_WALLS: bool = true;
+/// Specchio nord-sud delle POSIZIONI nel blocco (`n' = BLOCK_UNITS - n`).
+/// Con `mirror_z` attivo sul builder la geometria locale e la rotazione sono gia' specchiate;
+/// `block_px_pz_rot` fa gia' la conversione Unity -> Bevy con `pz = -(bz0 + n * DF_UNIT)`.
+/// Aggiungere anche il flip su `n` raddoppia lo specchio e rimette la lapide a sud:
+/// per questo e' `false`. Se dopo il test gli oggetti sono ancora invertiti, mettilo a `true`.
 
-/// Prefissi il cui contenuto usa SEMPRE ARCH3D (cimitero, rovine, fattorie).
 const ALWAYS_ARCH3D: [&str; 4] = ["GRVE", "SHRI", "RUIN", "FARM"];
+
+/// Posizione e rotazione di un oggetto piazzato in un blocco.
+///
+/// Il flip nord-sud è **già** applicato da `rmb.placed_models()`: se il
+/// chiamante ha fatto `rmb.set_flip_ns(true)`, `pm.n` è già specchiato.
+/// Qui si fa solo la conversione Unity → Bevy:
+///   - X mondiale invariata: `px = bx0 + pm.x * DF_UNIT`
+///   - Z mondiale negata:    `pz = -(bz0 + pm.n * DF_UNIT)`
+///
+/// `rotate` e `fp` non sono più usati: la rotazione 180° di
+/// `pm.rotation_deg` è gestita dentro `placed_models`. Teniamo i parametri
+/// per compatibilità con la firma precedente e per eventuali esperimenti
+/// futuri.
+fn block_px_pz_rot(
+    bx0: f32,
+    bz0: f32,
+    pm: &PlacedModel,
+    _rmb: &RmbBlock,
+    _rotate: bool,
+    _fp: Option<&Footprint>,
+) -> (f32, f32, f32) {
+    (
+        bx0 + pm.x * DF_UNIT,
+     -(bz0 + pm.n * DF_UNIT),
+     pm.rotation_deg,
+    )
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CityStats {
@@ -66,6 +98,32 @@ pub struct CityStats {
     pub missing_models: usize,
 }
 
+/// `true` se `(x, z)` (coordinate del tile) cade sulla via reale di Daggerfall
+/// (il corridoio che va dalla porta sud al palazzo). Stessa geometria usata per
+/// scartare gli edifici sulla via; `margin` allarga il corridoio in larghezza
+/// (utile per gli alberi, che hanno una chioma). Per le altre citta' e' sempre
+/// `false`.
+pub fn royal_avenue_contains(location: &DFLocation, x: f32, z: f32, margin: f32) -> bool {
+    if !PROCEDURAL_LANDMARKS || location.name.to_ascii_uppercase() != "DAGGERFALL" {
+        return false;
+    }
+    let bw = location.width.min(8);
+    let bh = location.height.min(8);
+    let start_bx = (8 - bw) / 2;
+    let start_by = (8 - bh) / 2;
+    let palace_target_bx = 5.min(bw.saturating_sub(2));
+    let palace_target_by = 6.min(bh.saturating_sub(2));
+    let road_x = (start_bx + palace_target_bx) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5;
+    let road_z_south = -((start_by + 1) as f32 * BLOCK_SIZE_M);
+    let road_z_north =
+    -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5) + 32.0;
+    if z > (road_z_south + 4.0) || z < (road_z_north - 40.0) {
+        return false;
+    }
+    let dist_x = (x - road_x).abs();
+    dist_x < 12.0 + margin || (z <= road_z_north && dist_x < 22.0 + margin)
+}
+
 pub fn build_city_buildings(
     location: &DFLocation,
     blocks_bsa: &BsaArchive,
@@ -73,6 +131,9 @@ pub fn build_city_buildings(
     ground_height: &dyn Fn(f32, f32) -> f32,
 ) -> (CityBuilder, CityStats) {
     let mut builder = CityBuilder::new();
+    // Completa il flip nord-sud: specchia la geometria locale dei modelli ARCH3D.
+    // Se dopo il test le posizioni risultano invertite, rimuovi `rmb.set_flip_ns(true)`.
+    builder.mirror_z = true;
     let mut stats = CityStats::default();
 
     let bw = location.width.min(8);
@@ -84,8 +145,8 @@ pub fn build_city_buildings(
 
     let mut model_cache: HashMap<u32, Option<(Arch3dModel, Option<Footprint>, BuildingTextures)>> =
     HashMap::new();
-    let mut palace_spawned = false;
 
+    let mut palace_spawned = false;
     let palace_target_bx = 5.min(bw.saturating_sub(2));
     let palace_target_by = 6.min(bh.saturating_sub(2));
 
@@ -95,40 +156,40 @@ pub fn build_city_buildings(
     -((start_by + palace_target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5) + 32.0;
 
     let avenue_active = PROCEDURAL_LANDMARKS && is_daggerfall_city;
-    // Larghezza del viale reale: 12 m (22 m a nord del palazzo). Gli edifici che
-    // cadono dentro questa fascia vengono scartati per non finire sulla strada.
+
     let is_on_avenue_strict = |x: f32, z: f32| -> bool {
-        if !avenue_active {
-            return false;
-        }
-        if z > (road_z_south + 4.0) || z < (road_z_north - 40.0) {
-            return false;
-        }
-        let dist_x = (x - road_x).abs();
-        dist_x < 12.0 || (z <= road_z_north && dist_x < 22.0)
+        avenue_active && royal_avenue_contains(location, x, z, 0.0)
     };
 
     let model_debug = std::env::var_os("DF_MODEL_DEBUG").is_some();
-    let block_debug = std::env::var("DF_MODEL_DEBUG_BLOCK").ok().map(|v| v.to_ascii_uppercase());
-    // DF_MODEL_DUMP=750,753: stampa una volta sola l'intera geometria di quei modelli.
+    let block_debug = std::env::var("DF_MODEL_DEBUG_BLOCK")
+    .ok()
+    .map(|v| v.to_ascii_uppercase());
+
     let dump_ids: Vec<u32> = std::env::var("DF_MODEL_DUMP")
     .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
     .unwrap_or_default();
+
     let mut dumped: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    // DF_SUBREC_DEBUG=GENRAS02: dati grezzi dei sottoblocchi (edifici) e dei loro oggetti 3D, con
-    // dove finiscono nel blocco. Serve a capire se pali e travi seguono la posizione dell'edificio.
-    let subrec_debug = std::env::var("DF_SUBREC_DEBUG").ok().map(|v| v.to_ascii_uppercase());
+
+    let subrec_debug = std::env::var("DF_SUBREC_DEBUG")
+    .ok()
+    .map(|v| v.to_ascii_uppercase());
     let mut subrec_dumped: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for by in 0..bh {
         for bx in 0..bw {
-            let Some(name) = location.block_names.get(by * location.width + bx) else { continue };
-            let upper_name = name.to_ascii_uppercase();
+            let Some(name) = location.block_names.get(by * location.width + bx) else {
+                continue;
+            };
 
+            let upper_name = name.to_ascii_uppercase();
             let gx = start_bx + bx;
             let gz = start_by + by;
+
             let bx0 = gx as f32 * BLOCK_SIZE_M;
             let bz0 = gz as f32 * BLOCK_SIZE_M;
+
             let bounds = [bx0, -(bz0 + BLOCK_SIZE_M), bx0 + BLOCK_SIZE_M, -bz0];
 
             let is_special_block = ALWAYS_ARCH3D.iter().any(|p| upper_name.starts_with(p));
@@ -152,12 +213,25 @@ pub fn build_city_buildings(
                 continue;
             }
 
-            let Some(raw) = blocks_bsa.get_by_name(name) else { continue };
-            let Ok(rmb) = RmbBlock::parse(raw) else { continue };
+            let Some(raw) = blocks_bsa.get_by_name(name) else {
+                continue;
+            };
+
+            let Ok(mut rmb) = RmbBlock::parse(raw) else {
+                continue;
+            };
+            // Flip nord-sud del contenuto del blocco: le posizioni degli
+            // edifici, dei misc object e delle ancore dei subrecord vengono
+            // specchiate rispetto al centro del blocco in `placed_models()`.
+            // Il terreno (`ground_tiles`) non è toccato.
+
+            // Riflessione completa del layout (offset dei subrecord e rotazioni), coerente con
+            // `builder.mirror_z` che specchia la geometria locale dei modelli.
+            rmb.set_mirror_local(true);
 
             let is_wall_block = upper_name.starts_with("WALL");
 
-            // Palazzo Reale per building_type 16
+            // Palazzo Reale per building_type 16.
             if PROCEDURAL_LANDMARKS
                 && is_daggerfall_city
                 && !palace_spawned
@@ -173,18 +247,17 @@ pub fn build_city_buildings(
                     continue;
                 }
 
-                // Identificazione Tempio: blocco con prefisso TEMP/PTEM oppure con
-                // almeno un edificio di tipo 14. La generazione vera avviene poi
-                // per-singolo-edificio più sotto (`is_temple_building`).
                 let is_temple_block = PROCEDURAL_LANDMARKS
                 && !is_wall_block
                 && (upper_name.starts_with("TEMP")
                 || upper_name.starts_with("PTEM")
                 || rmb.buildings.iter().any(|b| b.building_type == 14));
 
-                // Stile Gilda per il blocco (solo classificazione: la generazione
-                // vera avviene poi per-singolo-edificio più sotto `is_guild_building`).
-                let guild_style = if PROCEDURAL_LANDMARKS && !is_special_block && !is_wall_block && !is_temple_block {
+                let guild_style = if PROCEDURAL_LANDMARKS
+                && !is_special_block
+                && !is_wall_block
+                && !is_temple_block
+                {
                     if upper_name.starts_with("MAGE") {
                         Some(GuildStyle::Mage)
                     } else if upper_name.starts_with("FIGH") {
@@ -208,65 +281,53 @@ pub fn build_city_buildings(
 
                 let is_south_gate_block =
                 is_wall_block && bx == palace_target_bx && by < palace_target_by;
+
                 let mut south_gate_spawned = false;
 
-                // Unica chiamata a `placed_models()` per l'intero blocco: prima
-                // veniva invocata più volte (una per il landmark_pm_index rimosso,
-                // una per il loop). `pm_idx` non serve più.
                 let placed_models = rmb.placed_models();
+
                 if let Some(filter) = subrec_debug.as_deref() {
                     if upper_name.contains(filter) && subrec_dumped.insert(upper_name.clone()) {
-                        eprintln!("SUBREC {name}: {} sottoblocchi, {} oggetti 3D | PROCEDURAL_HOUSES={PROCEDURAL_HOUSES} PROCEDURAL_WALLS={PROCEDURAL_WALLS}", rmb.subrecords.len(), rmb.objects_3d.len());
+                        eprintln!(
+                            "SUBREC {name}: {} sottoblocchi, {} oggetti 3D",
+                            rmb.subrecords.len(),
+                                  rmb.objects_3d.len()
+                        );
                         for (i, sr) in rmb.subrecords.iter().enumerate() {
                             let b = rmb.buildings.get(i);
                             eprintln!(
                                 "  sub {i}: ancora x {} z {} rot {:.1} gradi | edificio tipo {:?} fazione {:?} qualita' {:?}",
-                                sr.x, sr.z, sr.rotation_deg, b.map(|b| b.building_type), b.map(|b| b.faction_id), b.map(|b| b.quality),
+                                sr.x, sr.z, sr.rotation_deg,
+                                b.map(|b| b.building_type),
+                                      b.map(|b| b.faction_id),
+                                      b.map(|b| b.quality),
                             );
                         }
                         for (k, (o, pm)) in rmb.objects_3d.iter().zip(placed_models.iter()).enumerate() {
-                            // Ingombro del modello (metri, nel suo riferimento) e posizione locale in metri:
-                            // permette di confrontare dove stanno pali e casa dentro lo stesso sottoblocco.
-                            let bb = arch3d_bsa
-                                .get_by_id(o.model_id)
-                                .and_then(|raw| Arch3dModel::parse(o.model_id, raw).ok())
-                                .map(|m| {
-                                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-                                    for v in &m.vertices {
-                                        for a in 0..3 {
-                                            lo[a] = lo[a].min(v[a]);
-                                            hi[a] = hi[a].max(v[a]);
-                                        }
-                                    }
-                                    (lo, hi)
-                                });
-                            if let Some((lo, hi)) = bb {
-                                eprintln!(
-                                    "           ingombro modello x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] m | locale in m: x {:.2} y {:.2} z {:.2}",
-                                    lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
-                                    o.x as f32 * DF_UNIT, o.y as f32 * DF_UNIT, o.z as f32 * DF_UNIT,
-                                );
-                            }
                             eprintln!(
-                                "  ogg {k:>3}: sub {:?} modello {} tipo {} | locale x {} y {} z {} | pivot {:?} | rot Y {:.1} X {:.1} Z {:.1} | -> blocco x {:.0} n {:.0} rot {:.1}",
-                                o.block, o.model_id, o.object_type, o.x, o.y, o.z, o.pivot,
-                                o.rotation_y_deg, o.rotation_x_deg, o.rotation_z_deg, pm.x, pm.n, pm.rotation_deg,
+                                "  ogg {k:>3}: sub {:?} modello {} tipo {} | locale x {} y {} z {} | rot Y {:.1} X {:.1} Z {:.1} | -> blocco x {:.0} n {:.0} rot {:.1}",
+                                o.block, o.model_id, o.object_type, o.x, o.y, o.z,
+                                o.rotation_y_deg, o.rotation_x_deg, o.rotation_z_deg,
+                                pm.x, pm.n, pm.rotation_deg,
                             );
                         }
                     }
                 }
+
                 for pm in placed_models.iter() {
                     stats.objects += 1;
 
                     let (model, fp, btex) = match model_cache.entry(pm.model_id).or_insert_with(|| {
-                        // Con DF_MODEL_DEBUG=1 dice perche' un modello viene scartato (una sola
-                        // volta per id: il risultato e' in cache): assente dal BSA o parse fallito.
                         let Some(raw) = arch3d_bsa.get_by_id(pm.model_id) else {
                             if model_debug {
-                                eprintln!("ARCH3D modello {}: assente da ARCH3D.BSA (blocco {name})", pm.model_id);
+                                eprintln!(
+                                    "ARCH3D modello {}: assente da ARCH3D.BSA (blocco {name})",
+                                          pm.model_id
+                                );
                             }
                             return None;
                         };
+
                         let m = match Arch3dModel::parse(pm.model_id, raw) {
                             Ok(m) => m,
                                                                                                 Err(e) => {
@@ -280,6 +341,7 @@ pub fn build_city_buildings(
                                                                                                     return None;
                                                                                                 }
                         };
+
                         let fp = Footprint::from_model(&m);
                         let btex = m.building_textures();
                         Some((m, fp, btex))
@@ -291,23 +353,31 @@ pub fn build_city_buildings(
                         }
                     };
 
+                    // Con la riflessione in Z anche il centro del footprint si specchia.
+                    let fp = fp.map(|mut f| {
+                        f.cz = -f.cz;
+                        f
+                    });
+
                     if dump_ids.contains(&pm.model_id) && dumped.insert(pm.model_id) {
-                        // Un file per modello nella cartella di lavoro (non dipende dalla redirezione
-                        // dei log, che mescola le righe di piu' thread).
                         let path = format!("df_model_{}.txt", pm.model_id);
                         match std::fs::write(&path, model.dump()) {
-                            Ok(()) => eprintln!("DUMP modello {} scritto in {path} (blocco {name})", pm.model_id),
-                            Err(e) => eprintln!("DUMP modello {}: impossibile scrivere {path}: {e}", pm.model_id),
+                            Ok(()) => eprintln!(
+                                "DUMP modello {} scritto in {path} (blocco {name})",
+                                                pm.model_id
+                            ),
+                            Err(e) => eprintln!(
+                                "DUMP modello {}: impossibile scrivere {path}: {e}",
+                                pm.model_id
+                            ),
                         }
                     }
 
-                    // DF_MODEL_DEBUG_BLOCK=GRVE: elenca ogni modello piazzato nei blocchi il cui nome
-                    // contiene il testo (id, posizione, vertici, facce e texture) per confrontarlo
-                    // con quello che si vede in gioco.
                     if let Some(filter) = block_debug.as_deref() {
                         if upper_name.contains(filter) {
                             let mut by_len = std::collections::BTreeMap::<usize, usize>::new();
                             let mut textures: Vec<(u16, u8)> = Vec::new();
+
                             for f in &model.faces {
                                 *by_len.entry(f.vertex_indices.len()).or_default() += 1;
                                 let t = (f.texture_archive, f.texture_record);
@@ -315,48 +385,34 @@ pub fn build_city_buildings(
                                     textures.push(t);
                                 }
                             }
+
                             eprintln!(
-                                "BLOCCO {name}: modello {} a ({:.1}, {:.1}) rot {:.0} | {} vertici, {} facce (punti per faccia: {by_len:?}) | texture {textures:?} | edificio: {}",
-                                      pm.model_id,
-                                      pm.x,
-                                      pm.n,
-                                      pm.rotation_deg,
-                                      model.vertices.len(),
-                                      model.faces.len(),
-                                      pm.is_building,
+                                "BLOCCO {name}: modello {} a ({:.1}, {:.1}) rot {:.0} | {} vertici, {} facce | texture {:?} | edificio: {}",
+                                      pm.model_id, pm.x, pm.n, pm.rotation_deg,
+                                      model.vertices.len(), model.faces.len(), textures, pm.is_building,
                             );
                         }
                     }
 
-                    let px = bx0 + pm.x * DF_UNIT;
-                    let pz = -(bz0 + pm.n * DF_UNIT);
-                    let rot = pm.rotation_deg;
+                    // --- POSIZIONE E ROTAZIONE ---
+                    let (px, pz, rot) = block_px_pz_rot(bx0, bz0, pm, &rmb, false, fp.as_ref());
+                    // ----------------------------------------
+
                     let (s, c) = rot.to_radians().sin_cos();
-                    let (wx, wz) = fp
-                    .as_ref()
-                    .map_or((px, pz), |f| {
+                    let (wx, wz) = fp.as_ref().map_or((px, pz), |f| {
                         (px + f.cx * c + f.cz * s, pz - f.cx * s + f.cz * c)
                     });
 
-                    // --- Sgombero della via reale ---
-                    // Se è un edificio (non un muro o un flat) e cade dentro la
-                    // fascia del viale, saltalo: case, gilde e templi non devono
-                    // sovrapporsi alla strada principale di Daggerfall.
                     if pm.is_building && is_on_avenue_strict(wx, wz) {
                         stats.skipped += 1;
                         continue;
                     }
-                    // ---------------------------------
 
                     // Mura procedurali
                     if is_wall_block && PROCEDURAL_WALLS && !is_special_block {
                         if let Some(mut wfp) = fp.as_ref().map(wall_footprint) {
-                            let is_wall_model = pm.model_id == 446 || classify_wall(&wfp).is_some();
-
-                            // --- Bastioni angolari e mura alte a Daggerfall ---
-                            // I bastioni d'angolo del perimetro diventano più larghi,
-                            // profondi e alti; le mura normali di Daggerfall vengono
-                            // alzate per dare un aspetto più imponente al viale.
+                            let is_wall_model =
+                            pm.model_id == 446 || classify_wall(&wfp).is_some();
                             let is_corner = (bx == 0 || bx == bw.saturating_sub(1))
                             && (by == 0 || by == bh.saturating_sub(1));
 
@@ -367,7 +423,6 @@ pub fn build_city_buildings(
                             } else if is_daggerfall_city {
                                 wfp.height = wfp.height.max(18.0);
                             }
-                            // ----------------------------------------------
 
                             if is_south_gate_block && is_wall_model {
                                 if !south_gate_spawned {
@@ -375,15 +430,26 @@ pub fn build_city_buildings(
                                     gate_fp.width = BLOCK_SIZE_M;
                                     gate_fp.depth = gate_fp.depth.max(3.0);
                                     gate_fp.height = gate_fp.height.max(18.0);
+
                                     let seed = seed_for(
                                         pm.model_id,
                                         gx as i32 * 4096 + 2048,
                                         gz as i32 * 4096 + pm.n as i32,
                                     );
+
                                     let wall_tex = btex.wall.or(Some((317, 0)));
-                                    let mesh = generate_wall(&gate_fp, WallKind::Gate, seed, wall_tex);
+                                    let mesh =
+                                    generate_wall(&gate_fp, WallKind::Gate, seed, wall_tex);
                                     let gy = ground_height(road_x, pz);
-                                    place_procedural(&mut builder, &mesh, [0.0, 0.0, 0.0], rot, road_x, pz, gy);
+                                    place_procedural(
+                                        &mut builder,
+                                        &mesh,
+                                        [0.0, 0.0, 0.0],
+                                        rot,
+                                        road_x,
+                                        pz,
+                                        gy,
+                                    );
                                     stats.built += 1;
                                     south_gate_spawned = true;
                                 }
@@ -404,42 +470,41 @@ pub fn build_city_buildings(
                                     pm.x as i32 + gx as i32 * 4096,
                                     pm.n as i32 + gz as i32 * 4096,
                                 );
+
                                 let wall_tex = btex.wall.or(Some((317, 0)));
                                 let mesh = generate_wall(&wfp, wkind, seed, wall_tex);
                                 let gy = ground_height(px, pz);
-                                place_procedural(&mut builder, &mesh, [0.0, 0.0, 0.0], rot, px, pz, gy);
+                                place_procedural(
+                                    &mut builder,
+                                    &mesh,
+                                    [0.0, 0.0, 0.0],
+                                    rot,
+                                    px,
+                                    pz,
+                                    gy,
+                                );
                                 stats.built += 1;
                                 continue;
                             }
                         }
                     }
 
-                    // Tempio: SOLO l'edificio che la mappa segna come tale
-                    // (`building_type == 14`). Niente fallback "edificio più
-                    // grande del blocco": quel fallback trasformava in tempio
-                    // l'edificio più grosso anche quando il blocco aveva un
-                    // tempio solo come dépendance, producendo palazzi/castelli
-                    // con la facciata del tempio e senza puntino sulla mappa.
-                    let is_temple_sub = pm.subrecord.map_or(false, |i| {
+                    let is_temple_sub = pm
+                    .subrecord
+                    .map_or(false, |i| {
                         rmb.buildings
                         .get(i as usize)
                         .map_or(false, |b| b.building_type == 14)
                     });
+
                     let is_temple_building = is_temple_block && is_temple_sub;
 
-                    // Gilda: SOLO l'edificio che la mappa segna come tale
-                    // (`building_type == 11`). Il vecchio `landmark_pm_index`
-                    // trasformava in gilda l'edificio più grande del blocco
-                    // anche se non aveva tipo 11 — per esempio il castello di
-                    // un blocco CAST che conteneva una dépendance di tipo 11.
-                    // Sintomo osservato: castello con merli procedurali,
-                    // finestre blu piatte e texture legno, ma **senza puntino
-                    // blu** sulla mappa locale.
                     let is_guild_sub = pm.subrecord.map_or(false, |i| {
                         rmb.buildings
                         .get(i as usize)
                         .map_or(false, |b| b.building_type == 11)
                     });
+
                     let is_guild_building = !is_temple_building && is_guild_block && is_guild_sub;
 
                     let is_palace_sub = pm.subrecord.map_or(false, |i| {
@@ -459,10 +524,10 @@ pub fn build_city_buildings(
                     && pm.model_id != 74
                     && fp.as_ref().map_or(false, |f| f.classify().is_some());
 
-                    // Case procedurali (il check avenue è già stato fatto sopra,
-                    // prima delle mura: qui non serve ripeterlo).
                     if PROCEDURAL_HOUSES && is_procedural_house_candidate {
-                        let Some(fp_ref) = fp.as_ref() else { continue };
+                        let Some(fp_ref) = fp.as_ref() else {
+                            continue;
+                        };
 
                         let kind = fp_ref.classify().unwrap();
                         let front = choose_front_side(
@@ -471,6 +536,7 @@ pub fn build_city_buildings(
                             rot,
                             bounds,
                         );
+
                         let seed = seed_for(
                             pm.model_id,
                             pm.x as i32 + gx as i32 * 4096,
@@ -478,55 +544,80 @@ pub fn build_city_buildings(
                         );
 
                         let mut house_tex = btex;
-                        if house_tex.wall.is_none() { house_tex.wall = Some((317, 0)); }
-                        if house_tex.roof.is_none() { house_tex.roof = Some((69, 0)); }
+                        if house_tex.wall.is_none() {
+                            house_tex.wall = Some((317, 0));
+                        }
+                        if house_tex.roof.is_none() {
+                            house_tex.roof = Some((69, 0));
+                        }
 
                         let mesh = generate_building(&fp_ref, kind, front, seed, house_tex);
                         let gy = ground_height(px, pz);
-                        place_procedural(&mut builder, &mesh, [fp_ref.cx, 0.0, fp_ref.cz], rot, px, pz, gy);
+                        place_procedural(
+                            &mut builder,
+                            &mesh,
+                            [fp_ref.cx, 0.0, fp_ref.cz],
+                            rot,
+                            px,
+                            pz,
+                            gy,
+                        );
                         stats.built += 1;
                         continue;
                     }
 
-                    // =========================================================
-                    // TEMPIO PAGANO CLASSICO
-                    // =========================================================
                     if is_temple_building {
                         let Some(fp_ref) = fp.as_ref() else {
                             let gy = ground_height(px, pz);
-                            let min_model_y = model.vertices.iter().map(|v| v[1]).fold(f32::MAX, f32::min);
+                            let min_model_y = model
+                            .vertices
+                            .iter()
+                            .map(|v| v[1])
+                            .fold(f32::MAX, f32::min);
                             builder.add_arch3d_instance(&model, rot, [px, gy - min_model_y, pz]);
                             stats.built += 1;
                             continue;
                         };
+
                         let mut temple_tex = btex;
                         temple_tex.wall = btex.wall.or(Some((317, 0)));
                         temple_tex.roof = btex.roof.or(Some((69, 0)));
 
                         let mesh = generate_pagan_temple(&fp_ref, temple_tex);
                         let gy = ground_height(px, pz);
-                        place_procedural(&mut builder, &mesh, [fp_ref.cx, 0.0, fp_ref.cz], rot, px, pz, gy);
+                        place_procedural(
+                            &mut builder,
+                            &mesh,
+                            [fp_ref.cx, 0.0, fp_ref.cz],
+                            rot,
+                            px,
+                            pz,
+                            gy,
+                        );
                         stats.built += 1;
                         continue;
                     }
 
-                    // =========================================================
-                    // GILDE PROCEDURALI (Maghi, Guerrieri, Ladri)
-                    // =========================================================
                     if is_guild_building {
                         let Some(fp_ref) = fp.as_ref() else {
                             let gy = ground_height(px, pz);
-                            let min_model_y = model.vertices.iter().map(|v| v[1]).fold(f32::MAX, f32::min);
+                            let min_model_y = model
+                            .vertices
+                            .iter()
+                            .map(|v| v[1])
+                            .fold(f32::MAX, f32::min);
                             builder.add_arch3d_instance(&model, rot, [px, gy - min_model_y, pz]);
                             stats.built += 1;
                             continue;
                         };
+
                         let front = choose_front_side(
                             [wx, wz],
                             [fp_ref.width * 0.5, fp_ref.depth * 0.5],
                             rot,
                             bounds,
                         );
+
                         let seed = seed_for(
                             pm.model_id,
                             pm.x as i32 + gx as i32 * 4096,
@@ -535,6 +626,7 @@ pub fn build_city_buildings(
 
                         let mut guild_tex = btex;
                         let style = guild_style.unwrap_or(GuildStyle::Hall);
+
                         match style {
                             GuildStyle::Mage => {
                                 guild_tex.wall = Some((335, 0));
@@ -550,34 +642,39 @@ pub fn build_city_buildings(
                             }
                         }
 
-                        let mesh = generate_guild_hall(&fp_ref, front, seed, guild_tex, style);
+                        let mage_floors = if is_daggerfall_city { 20 } else { 9 };
+                        let mesh = generate_guild_hall(&fp_ref, front, seed, guild_tex, style, mage_floors);
                         let gy = ground_height(px, pz);
-                        place_procedural(&mut builder, &mesh, [fp_ref.cx, 0.0, fp_ref.cz], rot, px, pz, gy);
+                        place_procedural(
+                            &mut builder,
+                            &mesh,
+                            [fp_ref.cx, 0.0, fp_ref.cz],
+                            rot,
+                            px,
+                            pz,
+                            gy,
+                        );
                         stats.built += 1;
                         continue;
                     }
 
-                    // =========================================================
-                    // REGOLA 3: TUTTO IL RESTO (ARCH3D originale)
-                    // =========================================================
                     let gy = ground_height(px, pz);
                     let min_model_y = model
                     .vertices
                     .iter()
                     .map(|v| v[1])
                     .fold(f32::MAX, f32::min);
-                    // Oggetti con quota (YPos) o inclinati (travi, pali, insegne): come in DFU il modello
-                    // sta con l'origine a terreno + quota, ruotato su Z, X e Y; non si appoggia la base
-                    // a terra. Disattivabile con DF_OBJ_FULL_TRANSFORM=0 (comportamento di prima).
+
                     let tilted = pm.rotation_x_deg.abs() > 0.5 || pm.rotation_z_deg.abs() > 0.5;
                     let full = obj_full_transform() && (tilted || pm.y != 0);
+
                     let final_y = if full {
                         gy + obj_y_sign() * pm.y as f32 * DF_UNIT + obj_y_offset()
                     } else {
                         gy - min_model_y
                     };
+
                     if dump_ids.contains(&pm.model_id) {
-                        // DF_MODEL_DUMP: dove finisce davvero l'istanza (mondo, altezza terreno, ingombro).
                         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
                         for v in &model.vertices {
                             for k in 0..3 {
@@ -585,15 +682,13 @@ pub fn build_city_buildings(
                                 hi[k] = hi[k].max(v[k]);
                             }
                         }
+
                         eprintln!(
-                            "PIAZZATO {name}: modello {} -> mondo ({px:.1}, {final_y:.2}, {pz:.1}) rot {rot:.0} | terreno {gy:.2}, y minima modello {min_model_y:.2} | ingombro x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] m",
+                            "PIAZZATO {name}: modello {} -> mondo ({px:.1}, {final_y:.2}, {pz:.1}) rot {rot:.0} | ingombro x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] m",
                                   pm.model_id, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
                         );
-                        eprintln!(
-                            "   grezzi: y {} ({:.2} m) | centro del modello a {:.2} m dal terreno | rot Y {:.1} X {:.1} Z {:.1} gradi | trasformazione completa: {full} | tail(+46..+66) {:?}",
-                                  pm.y, pm.y as f32 * DF_UNIT, final_y - gy, pm.rotation_deg, pm.rotation_x_deg, pm.rotation_z_deg, pm.tail,
-                        );
                     }
+
                     if full {
                         builder.add_arch3d_instance_tilted(
                             &model,
@@ -605,6 +700,7 @@ pub fn build_city_buildings(
                     } else {
                         builder.add_arch3d_instance(&model, rot, [px, final_y, pz]);
                     }
+
                     stats.built += 1;
                 }
         }
@@ -613,30 +709,39 @@ pub fn build_city_buildings(
     (builder, stats)
 }
 
-/// `DF_OBJ_FULL_TRANSFORM=0` ripristina il posizionamento di prima (base a terra, solo rotazione Y).
 fn obj_full_transform() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("DF_OBJ_FULL_TRANSFORM").map_or(true, |v| v != "0"))
 }
 
-/// Segno della quota degli oggetti (`DF_OBJ_Y_SIGN`, default -1: in DF la Y cresce verso il basso).
 fn obj_y_sign() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("DF_OBJ_Y_SIGN").ok().and_then(|v| v.parse().ok()).unwrap_or(-1.0))
+    *V.get_or_init(|| {
+        std::env::var("DF_OBJ_Y_SIGN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-1.0)
+    })
 }
 
-/// Spostamento verticale in metri applicato agli oggetti con quota (`DF_OBJ_Y_OFFSET`, default 0).
-/// Serve a calibrare a occhio la quota dei pali: per esempio -3.2 li abbassa di un piano.
 fn obj_y_offset() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("DF_OBJ_Y_OFFSET").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+    *V.get_or_init(|| {
+        std::env::var("DF_OBJ_Y_OFFSET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+    })
 }
 
-/// Moltiplicatore del verso delle inclinazioni X/Z (`DF_TILT_SIGN`, default 1: segue gia' il
-/// segno di `DF_ROTATION_SIGN` applicato in `placed_models`).
 fn tilt_sign() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("DF_TILT_SIGN").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
+    *V.get_or_init(|| {
+        std::env::var("DF_TILT_SIGN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0)
+    })
 }
 
 fn place_procedural(
@@ -655,10 +760,12 @@ fn place_procedural(
     .chain(mesh.doors.positions.iter().map(|v| v[1]))
     .chain(mesh.windows.positions.iter().map(|v| v[1]))
     .fold(f32::MAX, f32::min);
+
     let final_y = if min_y < -0.05 {
         ground_y - min_y - offset[1]
     } else {
         ground_y
     };
+
     builder.add(mesh, offset, rot, [px, final_y, pz]);
 }

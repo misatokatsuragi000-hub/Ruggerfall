@@ -5,93 +5,46 @@
 //! Il ritratto cerca prima la versione HD nella mod (es. `DREAM - Portraits`),
 //! altrimenti ripiega sui volti 64x64 di `TFAC00I0.RCI` (ARENA2) o sullo sprite.
 //!
+//! ## NPC di quest dinamici
+//!
+//! I PNG della main quest (Lhotun, Akorithi, ecc.) vengono spawnati da
+//! `qbn_npc.rs` sui marcatori di quest del RDB. Hanno il componente `QbnSymbol`
+//! che questo modulo legge per far scattare l'offerta della quest. I flat
+//! decorativi del RDB (cortigiani, servitori) hanno solo `InteriorNpc` e
+//! ricevono un dialogo generico.
+//!
 //! ## Testo scrollabile
 //!
-//! Il testo della conversazione sta in un container con `Overflow::scroll_y()` e una
-//! barra di scorrimento verticale. Si scorre con la rotella, con PageUp/PageDown, o
-//! con Home/End. Ogni volta che il testo cambia (nuovo messaggio, offerta, risposta
-//!  del LLM) lo scroll torna in cima.
+//! Il testo della conversazione sta in un container con `Overflow::scroll_y()`.
 //!
 //! ## Menu e offerte scriptate
 //!
-//! Il dialogo ha sempre un campo di testo in fondo (click o tasto 2 per scrivere).
-//! Se l'NPC è in una gilda e c'è una quest scriptata disponibile (per ora `N0B00Y16`),
-//! il dialogo mostra l'offerta originale con due opzioni `[A] Accetta` e `[R] Rifiuta`.
+//! Il dialogo ha sempre un campo di testo in fondo. Se l'NPC è in una gilda
+//! e c'è una quest scriptata disponibile, mostra l'offerta.
 //!
 //! ## Knowledge block (da dfquest)
 //!
-//! Quando il dialogo si apre su un PNG, viene calcolato un `knowledge_block` con le
-//! informazioni che quel PNG "ha sentito in giro" sulle quest principali attive.
-//!
-//! ## Gilda insider (Fase A: dialogo LLM, niente hardcoding)
-//!
-//! Se l'NPC è dentro una gilda:
-//!
-//! 1. `describe_npc_in` riceve il nome della gilda (da
-//!    `InteriorState::block_prefix()` + `guild_name_from_prefix`) e il prompt
-//!    INSIDERS si attiva.
-//! 2. La voice key include il prefisso della gilda (`"flat:182:11@MAGE"`),
-//!    così la stessa texture in taverna e in gilda ha VOCI SEPARATE.
-//! 3. `npc_reply` NON usa il flavor pre-generato quando parla un membro della
-//!    gilda che ha emesso la quest attiva.
-//!
-//! ## Profilo LLM (nome + background)
-//!
-//! `quest_llm` produce per ogni NPC `{name, description, text}` in un solo
-//! giro (`NPC_VOICE`) e li salva in `QuestBook` (`voice_name`,
-//! `voice_description`). `apply_llm_profile` fonde questi valori con gli
-//! eventuali override utente nel `.txt` di `classic_npc`:
-//!
-//! - **priorità nome**: override `.txt` > nome LLM > descrittore visivo;
-//! - **priorità description**: override `.txt` > description LLM (già in
-//!   "You are <Name>, ...") > `describe_npc_in` arricchita con
-//!   `inject_name_into_description`.
-//!
-//! ## Voice key con `#N`
-//!
-//! La voice key include l'**istanza** dell'NPC (`#N`, dove `N` è l'indice in
-//! `scene.people` dell'edificio) per i flat. Formato:
-//!
-//! - flat con caption:   `flat:182:23@MAGE#3`
-//! - flat senza caption: `face:148@MAGE#5`
-//! - NPC custom:         `custom_Ellie@MAGE` (nome univoco, niente `#N`)
-//! - walker esterno:     `walker:148` (nessun `@`, nessun `#N`)
-//!
-//! La stessa chiave è costruita da `interior_enter_exit` (prefetch) e da
-//! `update_dialog` (dialogo), passando `Some(npc.instance)` per i flat.
-//! Questo garantisce che **due NPC con la stessa texture abbiano voci diverse**.
+//! Quando il dialogo si apre su un PNG, viene calcolato un `knowledge_block`.
 //!
 //! ## Priorità di risposta in `npc_reply`
 //!
-//! 1. **Voice LLM** (prima persona, specifica per istanza). Se `Ready`, la usa.
-//!    Se `Pending`, aspetta. Se `Unknown`, la richiede e aspetta. Se `Failed`,
-//!    passa al punto 2.
-//! 2. **Flavor pre-generato** (solo se non insider): `quest_llm` lo genera per
-//!    `(caption, guild)`, quindi è condiviso tra tutti gli NPC con la stessa
-//!    caption. Usato **solo come fallback** quando la voice non è disponibile.
-//! 3. **Hint generico** (dalla quest attiva, per tono).
-//!
-//! La voice viene prima del flavor perché:
-//! - è specifica per istanza (mentre il flavor è per caption);
-//! - parla in prima persona (mentre il flavor è in terza persona, "The man in
-//!   the blue coat says...").
-//!
-//! ## Layout dei SystemParam
-//!
-//! Bevy 0.15 ha un limite di ~16 parametri per sistema. `update_dialog` ha
-//! 17 parametri "logici" (16 originali + `book`), quindi `QuestBook` è stato
-//! spostato dentro `QuestResources` (che è un `SystemParam` e conta come 1).
+//! 1. Voice LLM
+//! 2. Flavor pre-generato (solo se non insider)
+//! 3. Hint generico
+
 use crate::classic_npc::{self, ClassicNpc};
 use crate::data::city_map::PoiKind;
 use crate::data::flats::FlatCatalog;
 use crate::data::{find_file_ci, Palette};
 use crate::dfquest::{knowledge_block, KnowledgeOptions, Library, QuestPhase, QuestStates};
+use crate::dungeon::DungeonState;
 use crate::interior::{
     load_custom_idle_frames, load_custom_walk_frames, load_flat_idle_frames, load_flat_walk_frames, CustomNpcCache,
     CustomNpcName, InteriorNpc, InteriorState,
 };
 use crate::mod_textures::ModTextures;
 use crate::player::Player;
+use crate::qbn_npc::QbnSymbol;
 use crate::quest_llm::QuestWorker;
 use crate::quests::{
     clean_question, describe_npc, describe_npc_in, face_key, flat_key, guild_name_from_prefix,
@@ -102,6 +55,9 @@ use crate::tiles::{Follower, FollowerMoodEvent, FollowerWait, NpcWalker};
 use crate::tts::{gender_from_caption, gender_from_look, Gender, SpeakEvent, Speaker};
 use crate::world::{map_pixel_of, GameData, Origin};
 use crate::{QuestLibRes, QuestStatesRes};
+use crate::main_quest::{main_quest_offer, QbnInput, QbnRuntimeRes, QbnSayQueue};
+use crate::qbn::QbnRuntime;
+use crate::qbn_npc::QbnNpcIndex;
 use bevy::ecs::query::QueryFilter;
 use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -118,7 +74,11 @@ const DIALOG_TEXT: &str = "Hello!";
 const DIALOG_FONT_SIZE: f32 = 44.0;
 const DIALOG_TEXT_COLOR: Color = Color::srgb(1.0, 0.9, 0.0);
 const DIALOG_BACKGROUND: Color = Color::srgba(0.0, 0.0, 0.0, 0.75);
+
 const DIALOG_DISTANCE: f32 = 2.4;
+const DIALOG_DISTANCE_DUNGEON: f32 = 3.6;
+const DIALOG_VERTICAL_TOLERANCE: f32 = 3.0;
+
 const FOLLOWER_DIALOG_DISTANCE: f32 = 3.5;
 const FOLLOWER_LOOK_DOT: f32 = 0.87;
 const FOLLOWER_LOOK_MIN_DIST: f32 = 0.8;
@@ -165,20 +125,18 @@ pub struct QuestResources<'w> {
     pub custom: Res<'w, CustomNpcCache>,
     pub materials: Res<'w, Assets<StandardMaterial>>,
     pub lib: Res<'w, QuestLibRes>,
-    /// Aggiunto qui (non come parametro separato) per tenere
-    /// `update_dialog` sotto il limite dei 16 parametri di Bevy.
-    /// `ResMut` perché `dialog_menu` deve poterci scrivere.
-    /// `update_dialog` / `update_dialog_followers` lo usano solo in
-    /// lettura (auto-deref a `Res`).
     pub book: ResMut<'w, QuestBook>,
     pub states: ResMut<'w, QuestStatesRes>,
+    pub qbn: Res<'w, QbnRuntimeRes>,
+    pub qbn_in: EventWriter<'w, QbnInput>,
+    pub qbn_say: ResMut<'w, QbnSayQueue>,
+    pub qbn_npcs: Res<'w, QbnNpcIndex>,
+    pub dungeon: Res<'w, DungeonState>,
 }
 
 #[derive(Resource, Default)]
 pub struct DialogState {
     pub open: bool,
-    /// Se `true`, `open` è attivo solo per bloccare l'input mentre un menu
-    /// egui (F1 tuning / F2 save) è aperto.
     pub forced_by_menu: bool,
 }
 
@@ -320,10 +278,6 @@ pub struct DialogContext {
     npc_entity: Option<Entity>,
     npc_is_follower: bool,
     classic_anim: (Option<f32>, Option<f32>),
-    /// Prefisso del blocco RMB corrente (`"MAGE"`, `"FIGH"`, ...), se stiamo
-    /// parlando dentro una gilda. Popolato da `update_dialog` e
-    /// `update_dialog_followers`. Usato da `npc_reply` per riconoscere se
-    /// l'NPC è un insider della quest attiva.
     guild_prefix: Option<String>,
 }
 
@@ -336,12 +290,7 @@ struct NpcVoiceInfo {
     role: Option<Tone>,
     temperament: &'static str,
     voice_override: Option<String>,
-    /// Etichetta visiva **originale** (prima che `apply_llm_profile` la
-    /// sostituisca con il nome LLM). Serve a `classic_npc::apply_llm_background`
-    /// per capire se il `.txt` è ancora "auto".
     original_label: String,
-    /// Stem dello sprite (`"181_3-0"`, `"walker_148"`). `None` per i custom.
-    /// Passato a `request_voice` → `apply_llm_background`.
     sprite_stem: Option<String>,
 }
 
@@ -464,9 +413,6 @@ fn waiting_text(voice: &NpcVoiceInfo) -> String {
     format!("{} is thinking about it...", voice.label)
 }
 
-/// Gilda che ha sede in un prefisso di blocco: `MAGE` → `"mages_guild"`,
-/// ecc. Serve a `npc_reply` per riconoscere se l'NPC in cui stiamo parlando
-/// è un membro della gilda che ha emesso la quest attiva.
 fn guild_id_from_prefix(prefix: &str) -> Option<&'static str> {
     match prefix.to_ascii_uppercase().as_str() {
         "MAGE" => Some("mages_guild"),
@@ -476,11 +422,6 @@ fn guild_id_from_prefix(prefix: &str) -> Option<&'static str> {
     }
 }
 
-/// Se l'NPC è **dentro** la gilda che ha emesso la quest attiva per questa
-/// città, è un insider: il flavor pre-generato ("I heard that the Mages
-/// Guild is looking for…") è stato creato senza sapere dove si trova l'NPC
-/// e non va bene. Va scartato in favore della voice (generata col prompt
-/// INSIDERS, che produce "our guild is sending…").
 fn is_insider(book: &QuestBook, ctx: &DialogContext) -> bool {
     let (Some(city), Some(prefix)) = (ctx.city, ctx.guild_prefix.as_deref()) else {
         return false;
@@ -491,17 +432,7 @@ fn is_insider(book: &QuestBook, ctx: &DialogContext) -> bool {
     book.active_quest_giver_id(city) == Some(giver)
 }
 
-/// Priorità di risposta:
-///
-/// 1. **Voice LLM** — specifica per NPC (la `voice_key` include `#N`). Prima
-///    persona, è quello che ci si aspetta da un dialogo.
-/// 2. **Flavor pre-generato** — solo se non insider. È per `(caption, guild)`,
-///    quindi due NPC con la stessa caption ricevono lo stesso testo. Non è
-///    adatto come risposta principale, ma è un buon fallback quando la voice
-///    non è disponibile.
-/// 3. **Hint generico** — dalla quest attiva, per tono.
 fn npc_reply(book: &mut QuestBook, worker: Option<&QuestWorker>, ctx: &DialogContext) -> Reply {
-    // 1. Voice LLM.
     if let (Some(city), Some(voice)) = (ctx.city, ctx.voice.as_ref()) {
         enum Known { Ready(String), Pending, Unknown, Failed }
         let known = match book.voice_state(city, &voice.key) {
@@ -533,14 +464,12 @@ fn npc_reply(book: &mut QuestBook, worker: Option<&QuestWorker>, ctx: &DialogCon
         }
     }
 
-    // 2. Flavor pre-generato (fallback, solo se non insider).
     if !is_insider(book, ctx) {
         if let Some(message) = flavor_message(book, ctx) {
             return Reply::Say(message);
         }
     }
 
-    // 3. Hint generico.
     Reply::Say(rumor_message(book, ctx))
 }
 
@@ -569,9 +498,6 @@ fn answer_message(label: &str, result: &Result<(String, bool, u8), ()>) -> Strin
     }
 }
 
-/// Prepende `"You are <Name>. "` alla description **solo se** non è già
-/// presente. Serve come fallback quando l'LLM non ha prodotto una description
-/// completa: la description auto inizia con "Appearance (...):" e senza nome.
 fn inject_name_into_description(description: &str, name: &str) -> String {
     let lower = description.to_lowercase();
     let name_lower = name.to_lowercase();
@@ -583,19 +509,6 @@ fn inject_name_into_description(description: &str, name: &str) -> String {
         format!("You are {name}. {description}")
 }
 
-/// Decide nome e description finali del dialog context, con priorità:
-///
-/// 1. **override utente** nel `.txt` di `classic_npc`:
-///    - `who != original_who` → il nome è quello dell'utente;
-///    - `ov_description.is_some()` → la description è quella dell'utente.
-/// 2. **LLM** da `QuestBook`:
-///    - `book.voice_name(...)` per il nome;
-///    - `book.voice_description(...)` per la description.
-/// 3. **auto** (descrittore visivo + `describe_npc_in`).
-///
-/// La description LLM, se presente, **sostituisce** quella auto. Se manca
-/// la description LLM, `inject_name_into_description` prepende il nome a
-/// quella auto.
 fn apply_llm_profile(
     who: String,
     description: String,
@@ -604,9 +517,7 @@ fn apply_llm_profile(
     llm_name: Option<&str>,
     llm_description: Option<&str>,
 ) -> (String, String) {
-    // 1. Nome.
     let final_name = if who != original_who {
-        // Override utente.
         who
     } else if let Some(n) = llm_name {
         n.to_string()
@@ -614,15 +525,11 @@ fn apply_llm_profile(
         who
     };
 
-    // 2. Description.
     let final_desc = if let Some(d) = ov_description {
-        // Override utente (o già scritta dal LLM nel file).
         d.to_string()
     } else if let Some(d) = llm_description {
-        // Description LLM (in `QuestBook`, non ancora scritta nel file).
         d.to_string()
     } else {
-        // Fallback: auto + nome iniettato.
         inject_name_into_description(&description, &final_name)
     };
 
@@ -856,6 +763,8 @@ fn player_race_label(race: u8) -> &'static str {
     }
 }
 
+
+
 fn find_quest_offer(
     lib: &Library,
     states: &QuestStates,
@@ -863,44 +772,48 @@ fn find_quest_offer(
     _data: &GameData,
     _player_pos: Vec3,
     ctx: &DialogContext,
+    qbn: &QbnRuntime,
+    npc_symbol: Option<&str>,
 ) -> Option<ScriptedOffer> {
     if ctx.scripted_state != ScriptedQuestState::None {
         return None;
     }
-    if states.phase(SCRIPTED_QUEST_ID) != QuestPhase::NotStarted {
-        return None;
+    // 1. main quest offer (via NPC agganciato da qbn_npc)
+    if let Some(sym) = npc_symbol {
+        if let Some(offer) = main_quest_offer(qbn, lib, states, sym) {
+            return Some(offer);
+        }
     }
+    // 2. offerta di gilda
     let place = interior.kind()?;
     if !matches!(place, PoiKind::Guild) {
         return None;
     }
-    let script = lib.get(SCRIPTED_QUEST_ID)?;
-    let offer_msg = script.message_named("QuestorOffer")?;
-    let variants = offer_msg.plain_variants();
-    let first = variants.first()?;
-    let offer_text = lib.expand(SCRIPTED_QUEST_ID, states, first);
-    Some(ScriptedOffer {
-        quest_id: script.id.clone(),
-         _quest_name: script.display_name.clone(),
-         offer_text,
-    })
+    for script in lib.scripts() {
+        // Le quest della main story (S*) sono offerte solo dai quest giver
+        // agganciati (Lhotun, Akorithi, ecc.), mai dal bancone di una gilda.
+        if script.id.starts_with('S') { continue; }
+        if states.phase(&script.id) != QuestPhase::NotStarted { continue; }
+        let Some(offer_msg) = script.message_named("QuestorOffer") else { continue };
+        // FIX E0716: il Vec deve vivere finché `first` è in uso. Prima si
+        // faceva `offer_msg.plain_variants().first()` e il temporaneo moriva
+        // a fine statement, lasciando `first` pendente.
+        let variants = offer_msg.plain_variants();
+        let Some(first) = variants.first() else { continue };
+        let offer_text = lib.expand(&script.id, states, first);
+        info!(
+            "[quest] offerta di gilda: `{}` ({})",
+              script.display_name, script.id,
+        );
+        return Some(ScriptedOffer {
+            quest_id: script.id.clone(),
+                    _quest_name: script.display_name.clone(),
+                    offer_text,
+        });
+    }
+    None
 }
 
-/// Costruisce la voice key.
-///
-/// Formato:
-/// - fuori gilda, NPC interno:   `flat:182:11#3`
-/// - dentro gilda, NPC interno:  `flat:182:11@MAGE#3`
-/// - walker esterno:             `walker:148`  (nessun `@`, nessun `#N`)
-/// - NPC custom:                 `custom_Ellie@MAGE`  (nome univoco, no `#N`)
-///
-/// `instance` distingue le diverse istanze dello stesso flat nello stesso
-/// edificio: due NPC con la stessa texture hanno istanze `#0` e `#1` e quindi
-/// voci separate. Viene passato:
-/// - `Some(npc.instance)` per i flat in `update_dialog`;
-/// - `None` per i custom e per i walker (il loro id è già univoco);
-/// - `None` per i follower interni (il follower perde l'istanza originale
-///   quando viene reclutato: la voce è rigenerata al primo dialogo da follower).
 fn voice_key_for(
     base_key: &str,
     interior: &InteriorState,
@@ -926,13 +839,18 @@ pub fn update_dialog(
     mut images: ResMut<Assets<Image>>,
     interior: Res<InteriorState>,
     origin: Res<Origin>,
-    quests: QuestResources,
-    // `book` NON è un parametro separato: vive dentro `quests.book`
-    // (necessario per non superare il limite di 16 parametri di Bevy).
+    mut quests: QuestResources,
     mut ctx: ResMut<DialogContext>,
     player: Query<&Transform, With<Player>>,
     exterior_npcs: Query<(Entity, &NpcWalker, &GlobalTransform), Without<Follower>>,
-                     interior_npcs: Query<(Entity, &InteriorNpc, &GlobalTransform, Option<&CustomNpcName>, &MeshMaterial3d<StandardMaterial>), Without<Follower>>,
+                     interior_npcs: Query<(
+                         Entity,
+                         &InteriorNpc,
+                         &GlobalTransform,
+                         Option<&CustomNpcName>,
+                         &MeshMaterial3d<StandardMaterial>,
+                         Option<&QbnSymbol>,
+                     ), Without<Follower>>,
                      mut root: Query<&mut Visibility, With<DialogRoot>>,
                      mut portrait: Query<
                      (&mut ImageNode, &mut Node),
@@ -953,17 +871,42 @@ pub fn update_dialog(
     let Ok(player_tf) = player.get_single() else { return };
     let player_pos = player_tf.translation;
 
-    if interior.is_inside() {
-        let mut nearest_int: Option<(f32, Entity, &InteriorNpc, Option<&CustomNpcName>, &MeshMaterial3d<StandardMaterial>)> = None;
-        for (entity, npc, gtf, custom_name, mat) in &interior_npcs {
+    let in_dungeon = quests.dungeon.is_inside();
+    if interior.is_inside() || in_dungeon {
+        let reach = if in_dungeon { DIALOG_DISTANCE_DUNGEON } else { DIALOG_DISTANCE };
+        let debug_npc = std::env::var_os("DF_DIALOG_DEBUG").is_some();
+        let mut nearest_int: Option<(
+            f32,
+            Entity,
+            &InteriorNpc,
+            Option<&CustomNpcName>,
+            &MeshMaterial3d<StandardMaterial>,
+            Option<&QbnSymbol>,
+        )> = None;
+        for (entity, npc, gtf, custom_name, mat, qbn_sym_comp) in &interior_npcs {
             let pos = gtf.translation();
-            if (pos.y - player_pos.y).abs() > 4.0 { continue; }
+            let dy = (pos.y - player_pos.y).abs();
+            if dy > DIALOG_VERTICAL_TOLERANCE {
+                if debug_npc {
+                    info!(
+                        "[dialog] NPC {:?} scartato: dy={:.2} > {}",
+                        entity, dy, DIALOG_VERTICAL_TOLERANCE
+                    );
+                }
+                continue;
+            }
             let distance = Vec2::new(pos.x - player_pos.x, pos.z - player_pos.z).length();
-            if distance <= DIALOG_DISTANCE && nearest_int.map_or(true, |(d, _, _, _, _)| distance < d) {
-                nearest_int = Some((distance, entity, npc, custom_name, mat));
+            if debug_npc && distance <= reach * 2.0 {
+                info!(
+                    "[dialog] NPC {:?} a dist={:.2} (reach={:.1}), dy={:.2}",
+                      entity, distance, reach, dy
+                );
+            }
+            if distance <= reach && nearest_int.map_or(true, |(d, _, _, _, _, _)| distance < d) {
+                nearest_int = Some((distance, entity, npc, custom_name, mat, qbn_sym_comp));
             }
         }
-        if let Some((_, npc_entity, npc, custom_name_opt, npc_mat)) = nearest_int {
+        if let Some((_, npc_entity, npc, custom_name_opt, npc_mat, qbn_sym_comp)) = nearest_int {
             let npc_name = if let Some(custom) = custom_name_opt {
                 custom.name.clone()
             } else {
@@ -1047,12 +990,8 @@ pub fn update_dialog(
 
                 let knowledge = knowledge_block(&quests.lib.0, &quests.states.0, "", &key, &KnowledgeOptions::default());
 
-                // Fotografia del descrittore visivo **prima** che `ov.name`
-                // eventualmente lo sovrascriva.
                 let original_who = who.clone();
 
-                // Stem dello sprite per `apply_llm_background` (None per i custom,
-                // che non usano `classic_npc`).
                 let sprite_stem_opt = custom_name_opt.is_none().then(|| {
                     format!("{}_{}-0", npc.flat_archive, npc.flat_record)
                 });
@@ -1063,6 +1002,8 @@ pub fn update_dialog(
                 let mut voice_override = custom_name_opt.and_then(|c| custom_voice(&c.name, &quests.custom));
                 let mut classic_anim = (None, None);
                 let mut ov_description: Option<String> = None;
+                let custom_desc_from_user: Option<String> = custom_name_opt
+                .and_then(|c| custom_description(&c.name, &quests.custom));
                 if custom_name_opt.is_none() {
                     let sprite = quests.materials.get(&npc_mat.0)
                     .and_then(|m| m.base_color_texture.clone())
@@ -1091,18 +1032,21 @@ pub fn update_dialog(
                     classic_anim = (ov.walk_fps, ov.idle_fps);
                 }
 
-                // Voice key con prefisso gilda e istanza.
-                //   flat:    `flat:182:11@MAGE#3` (instance = npc.instance)
-                //   custom:  `custom_Ellie@MAGE`  (nome univoco, niente `#N`)
                 let instance = custom_name_opt.is_none().then_some(npc.instance);
                 let voice_key = voice_key_for(&key, &interior, instance);
 
-                // Nome proprio e description LLM (priorità: override `.txt` > LLM > auto).
+                let original_who_for_profile: &str = if custom_name_opt.is_some() {
+                    ""
+                } else {
+                    original_who.as_str()
+                };
                 let (who, description) = apply_llm_profile(
                     who,
                     description,
-                    &original_who,
-                    ov_description.as_deref(),
+                    original_who_for_profile,
+                    ov_description
+                    .as_deref()
+                    .or(custom_desc_from_user.as_deref()),
                                                            quests.book.voice_name(city, &voice_key),
                                                            quests.book.voice_description(city, &voice_key),
                 );
@@ -1125,7 +1069,19 @@ pub fn update_dialog(
                 ctx.npc_entity = Some(npc_entity);
                 ctx.npc_is_follower = false;
 
-                if let Some(offer) = find_quest_offer(&quests.lib.0, &quests.states.0, &*interior, &*data, player_pos, &ctx) {
+                let qbn_sym = if let Some(sym_comp) = qbn_sym_comp {
+                    Some(sym_comp.0.clone())
+                } else {
+                    quests.qbn_npcs.0.get(&npc_entity).cloned()
+                };
+                if let Some(sym) = &qbn_sym {
+                    quests.qbn_in.send(QbnInput::NpcClicked(sym.clone()));
+                }
+
+                if let Some(offer) = find_quest_offer(
+                    &quests.lib.0, &quests.states.0, &*interior, &*data, player_pos, &ctx,
+                    &quests.qbn.0, qbn_sym.as_deref(),
+                ) {
                     ctx.scripted_offer = Some(offer);
                     ctx.scripted_state = ScriptedQuestState::Offering;
                 }
@@ -1141,6 +1097,17 @@ pub fn update_dialog(
                 state.forced_by_menu = false;
                 for mut visibility in root.iter_mut() { *visibility = Visibility::Visible; }
                 keys.clear_just_pressed(KeyCode::KeyE);
+
+                if std::env::var_os("DF_DIALOG_DEBUG").is_some() {
+                    info!(
+                        "[dialog] aperto con NPC {:?} (key={}, who={:?}, place={:?}, dungeon={})",
+                          npc_entity,
+                          ctx.voice.as_ref().map_or("?", |v| v.key.as_str()),
+                          ctx.voice.as_ref().map(|v| v.label.as_str()).unwrap_or("?"),
+                          place,
+                          in_dungeon
+                    );
+                }
             }
         }
         return;
@@ -1149,7 +1116,8 @@ pub fn update_dialog(
     let mut nearest_ext: Option<(f32, Entity, &NpcWalker)> = None;
     for (entity, npc, gtf) in &exterior_npcs {
         let pos = gtf.translation();
-        if (pos.y - player_pos.y).abs() > 4.0 { continue; }
+        let dy = (pos.y - player_pos.y).abs();
+        if dy > DIALOG_VERTICAL_TOLERANCE { continue; }
         let distance = Vec2::new(pos.x - player_pos.x, pos.z - player_pos.z).length();
         if distance <= DIALOG_DISTANCE && nearest_ext.map_or(true, |(d, _, _)| distance < d) {
             nearest_ext = Some((distance, entity, npc));
@@ -1192,7 +1160,6 @@ pub fn update_dialog(
     }
     let knowledge = knowledge_block(&quests.lib.0, &quests.states.0, "", &key, &KnowledgeOptions::default());
 
-    // Walker esterno: nessuna gilda, nessuna istanza (id già univoco).
     let voice_key = voice_key_for(&key, &interior, None);
     let sprite_stem_opt = Some(format!("walker_{face}"));
 
@@ -1253,7 +1220,6 @@ pub fn update_dialog_followers(
     interior: Res<InteriorState>,
     origin: Res<Origin>,
     quests: QuestResources,
-    // `book` dentro `quests.book` (vedi `update_dialog`).
     mut ctx: ResMut<DialogContext>,
     player: Query<&Transform, With<Player>>,
     followers: Query<
@@ -1276,7 +1242,8 @@ pub fn update_dialog_followers(
     let mut nearest: Option<(f32, Entity, &Follower, Option<&CustomNpcName>)> = None;
     for (entity, fol, gtf, custom) in &followers {
         let pos = gtf.translation();
-        if (pos.y - player_pos.y).abs() > 4.0 { continue; }
+        let dy = (pos.y - player_pos.y).abs();
+        if dy > DIALOG_VERTICAL_TOLERANCE { continue; }
         let to = Vec2::new(pos.x - player_pos.x, pos.z - player_pos.z);
         let distance = to.length();
         if distance > FOLLOWER_DIALOG_DISTANCE { continue; }
@@ -1345,6 +1312,8 @@ pub fn update_dialog_followers(
         let mut npc_caption = npc_caption;
         let mut voice_override = custom.and_then(|c| custom_voice(&c.name, &quests.custom));
         let mut ov_description: Option<String> = None;
+        let custom_desc_from_user: Option<String> = custom
+        .and_then(|c| custom_description(&c.name, &quests.custom));
         if custom.is_none() {
             let sprite = fol.portrait().map(|(h, _)| { let f = mods.needs_v_flip(&h); (h, f) });
             let ov = classic_npc::resolve(&quests.custom.dir, &ClassicNpc {
@@ -1370,19 +1339,21 @@ pub fn update_dialog_followers(
             voice_override = ov.voice;
         }
 
-        // Voice key: `id.instance` è `Some` se `InteriorFollowerId` conserva
-        // l'istanza originale (patch consigliata in `tiles.rs`). Se non c'è,
-        // la voice key perde `#N`: il follower avrà una voice propria
-        // (rigenerata al primo dialogo da follower). Non è un bug, è solo
-        // un'istanza in più di generazione LLM.
         let instance = None;
         let voice_key = voice_key_for(&key, &interior, instance);
 
+        let original_who_for_profile: &str = if custom.is_some() {
+            ""
+        } else {
+            original_who.as_str()
+        };
         let (who, description) = apply_llm_profile(
             who,
             description,
-            &original_who,
-            ov_description.as_deref(),
+            original_who_for_profile,
+            ov_description
+            .as_deref()
+            .or(custom_desc_from_user.as_deref()),
                                                    quests.book.voice_name(city, &voice_key),
                                                    quests.book.voice_description(city, &voice_key),
         );
@@ -1433,7 +1404,6 @@ pub fn update_dialog_followers(
         }
         let knowledge = knowledge_block(&quests.lib.0, &quests.states.0, "", &key, &KnowledgeOptions::default());
 
-        // Follower esterno: nessuna gilda, nessuna istanza.
         let voice_key = voice_key_for(&key, &interior, None);
         let sprite_stem_opt = Some(format!("walker_{face}"));
 
@@ -1566,9 +1536,12 @@ fn handle_scripted_offer(
     states: &mut QuestStates,
     assets: &AssetServer,
     line: &mut Query<(&mut Text, &mut TextFont, &mut TextColor), (With<DialogLine>, Without<DialogOptions>, Without<DialogInputText>)>,
-                         options: &mut Query<&mut Text, (With<DialogOptions>, Without<DialogLine>, Without<DialogInputText>)>,
+                          options: &mut Query<&mut Text, (With<DialogOptions>, Without<DialogLine>, Without<DialogInputText>)>,
+                          qbn_in: &mut EventWriter<QbnInput>,
 ) -> bool {
-    if ctx.scripted_state != ScriptedQuestState::Offering { return false; }
+    if ctx.scripted_state != ScriptedQuestState::Offering {
+        return false;
+    }
     let Some(offer) = ctx.scripted_offer.clone() else {
         ctx.scripted_state = ScriptedQuestState::None;
         return false;
@@ -1578,7 +1551,9 @@ fn handle_scripted_offer(
         font.font = assets.load(RUMOR_FONT);
         font.font_size = RUMOR_FONT_SIZE;
     }
-    for mut text in options.iter_mut() { text.0 = OFFER_MENU.to_string(); }
+    for mut text in options.iter_mut() {
+        text.0 = OFFER_MENU.to_string();
+    }
     let response = if keys.just_pressed(KeyCode::KeyA) {
         Some(true)
     } else if keys.just_pressed(KeyCode::KeyR) {
@@ -1587,6 +1562,24 @@ fn handle_scripted_offer(
         None
     };
     if let Some(accepted) = response {
+        if offer.quest_id != SCRIPTED_QUEST_ID {
+            // Se la quest non è mai partita, avviala ora: eseguirà il blocco
+            // `startup`, che contiene `prompt QuestorOffer yes yes no _no_`.
+            // Poi rispondi al prompt nello stesso frame: `handle_inputs`
+            // processa gli eventi in ordine di invio.
+            if states.phase(&offer.quest_id) == QuestPhase::NotStarted {
+                qbn_in.send(QbnInput::StartQuest(offer.quest_id.clone()));
+            }
+            qbn_in.send(QbnInput::PromptAnswer {
+                quest: offer.quest_id.clone(),
+                        label: if accepted { "yes" } else { "no" }.to_string(),
+            });
+            ctx.scripted_state = ScriptedQuestState::None;
+            ctx.scripted_offer = None;
+            return true;
+        }
+        // vecchio percorso N0B00Y16 (compatibilità: non esegue il QBN completo,
+        // ma finora funzionava). Corpo COMPLETO qui dentro, non dopo la `}`.
         let section = if accepted { "AcceptQuest" } else { "RefuseQuest" };
         let fallback = if accepted { "You accept." } else { "You decline." };
         let raw = lib
@@ -1595,7 +1588,6 @@ fn handle_scripted_offer(
         .and_then(|m| m.plain_variants().into_iter().next())
         .unwrap_or_else(|| fallback.to_string());
         let resolved = lib.expand(&offer.quest_id, states, &raw);
-
         if let Some(s) = lib.get(&offer.quest_id) {
             let phase = if accepted { QuestPhase::Active } else { QuestPhase::Failed };
             states.set_phase(s, phase);
@@ -1603,7 +1595,6 @@ fn handle_scripted_offer(
                 warn!("Impossibile salvare quest_states.txt: {e}");
             }
         }
-
         ctx.scripted_state = ScriptedQuestState::None;
         ctx.scripted_response = Some(resolved);
     }
@@ -1617,7 +1608,6 @@ fn dialog_menu(
     time: Res<Time>,
     state: Res<DialogState>,
     mut ctx: ResMut<DialogContext>,
-    // `book` dentro `quests.book` (vedi `update_dialog`).
     worker: Option<Res<QuestWorker>>,
     mut quests: QuestResources,
     mut speak: EventWriter<SpeakEvent>,
@@ -1660,8 +1650,13 @@ fn dialog_menu(
     let offer_done = {
         let lib: &Library = &quests.lib.0;
         let QuestStatesRes(states) = &mut *quests.states;
-        handle_scripted_offer(&keys, &mut ctx, lib, states, &assets, &mut line, &mut options)
+        handle_scripted_offer(&keys, &mut ctx, lib, states, &assets, &mut line, &mut options,
+                              &mut quests.qbn_in)
     };
+    if let Some(text) = quests.qbn_say.0.pop_front() {
+        ctx.scripted_response = Some(text);
+    }
+    let offer_done = offer_done || ctx.scripted_response.is_some();
     if offer_done {
         if let Some(response) = ctx.scripted_response.take() {
             for (mut text, mut font, _color) in &mut line {
@@ -2144,23 +2139,18 @@ mod tests {
         assert_eq!(ctx.guild_prefix.as_deref(), Some("MAGE"));
     }
 
-    // --------------------------------------------------- voice_key_for
-
     #[test]
     fn voice_key_with_instance() {
-        // Flat con istanza: `flat:182:11@MAGE#3` (dentro gilda).
-        // `voice_key_for` richiede `InteriorState`, che in un test unitario
-        // non possiamo costruire senza Bevy. Testiamo il formato tramite
-        // `format!` equivalente, documentando il contratto.
         let base = "flat:182:11@MAGE";
         let with_inst = format!("{base}#3");
         assert_eq!(with_inst, "flat:182:11@MAGE#3");
-        // Senza istanza (custom, walker): niente `#N`.
-        let base_no_inst = "custom_Ellie@MAGE";
-        assert_eq!(base_no_inst, "custom_Ellie@MAGE");
+        let no_guild = "flat:182:11";
+        assert_eq!(no_guild, "flat:182:11");
+        let custom_guild = "custom_Ellie@MAGE";
+        let custom_dungeon = "custom_Ellie";
+        assert_eq!(custom_guild, "custom_Ellie@MAGE");
+        assert_eq!(custom_dungeon, "custom_Ellie");
     }
-
-    // --------------------------------------------------- profilo LLM
 
     #[test]
     fn inject_name_skips_if_already_present() {
@@ -2180,7 +2170,6 @@ mod tests {
         let llm_desc = "You are Eleanor, a barmaid of the tavern.";
         let custom_desc = "My custom description.";
 
-        // 1. Override utente (nome + description): vince tutto.
         let (who, desc) = apply_llm_profile(
             "Ellie".to_string(),
                                             custom_desc.to_string(),
@@ -2192,7 +2181,6 @@ mod tests {
         assert_eq!(who, "Ellie");
         assert_eq!(desc, custom_desc);
 
-        // 2. Override utente solo nome: description LLM se c'è.
         let (who, desc) = apply_llm_profile(
             "Ellie".to_string(),
                                             auto_desc.to_string(),
@@ -2204,7 +2192,6 @@ mod tests {
         assert_eq!(who, "Ellie");
         assert_eq!(desc, llm_desc);
 
-        // 3. Override utente solo description: nome LLM se c'è.
         let (who, desc) = apply_llm_profile(
             "Blonde woman".to_string(),
                                             custom_desc.to_string(),
@@ -2216,7 +2203,6 @@ mod tests {
         assert_eq!(who, "Eleanor");
         assert_eq!(desc, custom_desc);
 
-        // 4. Nessun override, nome+description LLM: entrambi.
         let (who, desc) = apply_llm_profile(
             "Blonde woman".to_string(),
                                             auto_desc.to_string(),
@@ -2228,7 +2214,6 @@ mod tests {
         assert_eq!(who, "Eleanor");
         assert_eq!(desc, llm_desc);
 
-        // 5. Nessun override, solo nome LLM: inietta nella description auto.
         let (who, desc) = apply_llm_profile(
             "Blonde woman".to_string(),
                                             auto_desc.to_string(),
@@ -2240,7 +2225,6 @@ mod tests {
         assert_eq!(who, "Eleanor");
         assert!(desc.starts_with("You are Eleanor. "), "{desc}");
 
-        // 6. Nessun override, solo description LLM: nome resta visivo.
         let (who, desc) = apply_llm_profile(
             "Blonde woman".to_string(),
                                             auto_desc.to_string(),
@@ -2252,7 +2236,6 @@ mod tests {
         assert_eq!(who, "Blonde woman");
         assert_eq!(desc, llm_desc);
 
-        // 7. Niente di niente: tutto auto (con nome iniettato come fallback).
         let (who, desc) = apply_llm_profile(
             "Blonde woman".to_string(),
                                             auto_desc.to_string(),
@@ -2263,5 +2246,30 @@ mod tests {
         );
         assert_eq!(who, "Blonde woman");
         assert!(desc.starts_with("You are Blonde woman. "), "{desc}");
+    }
+
+    #[test]
+    fn custom_npc_user_name_wins_over_llm() {
+        let (who, desc) = apply_llm_profile(
+            "The Agent".to_string(),
+                                            "You are the Agent, hidden servant of the Underking.".to_string(),
+                                            "",
+                                            None,
+                                            Some("Elara"),
+                                            Some("You are Elara, a helpful contact."),
+        );
+        assert_eq!(who, "The Agent");
+        assert_eq!(desc, "You are Elara, a helpful contact.");
+
+        let (who, desc) = apply_llm_profile(
+            "The Agent".to_string(),
+                                            "auto".to_string(),
+                                            "",
+                                            Some("You are the Agent, hidden servant of the Underking."),
+                                            Some("Elara"),
+                                            Some("You are Elara, a helpful contact."),
+        );
+        assert_eq!(who, "The Agent");
+        assert_eq!(desc, "You are the Agent, hidden servant of the Underking.");
     }
 }

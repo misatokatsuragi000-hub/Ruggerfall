@@ -7,6 +7,13 @@
 //! `dungeon_builder::build_dungeon` in `BuiltDungeon::enemies`. Vengono gestiti
 //! da `dungeon_enemies` tramite l'evento `SpawnDungeonEnemies`.
 //!
+//! ## NPC di quest
+//!
+//! I PNG della main quest (Lhotun, Akorithi, ecc.) NON sono flat del RDB.
+//! Vengono spawnati dinamicamente da `qbn_npc.rs` sui marcatori di quest
+//! (flat dell'archivio 199). Questo modulo spawna solo i flat decorativi
+//! originali del RDB.
+//!
 //! ## Fix crash all'uscita
 //!
 //! All'uscita il root del dungeon viene despawnato (deferred). La coda
@@ -15,25 +22,55 @@
 //! figli a un'entità già despawnata (panic in Bevy 0.15). Per questo
 //! `dungeon_enter_exit` azzera la coda prima del `despawn_recursive`.
 //!
-//! Inoltre, se sei vicino all'uscita, il tasto E deve servire a uscire e non
-//! ad aprire una porta vicina: `dungeon_move` salta il toggle delle porte
-//! quando `d_exit < DUNGEON_EXIT_DISTANCE`.
+//! ## Priorità porta vs uscita (fix palazzo reale)
+//!
+//! Prima, `dungeon_enter_exit` usciva dal dungeon ogni volta che il player
+//! premeva E entro `DUNGEON_EXIT_DISTANCE` (4 m) da `exit_pos`. Nei dungeon
+//! senza marker 70300 vero (come il palazzo reale), `exit_pos` è il fallback
+//! `spawn_pos`: premere E su una porta vicino allo spawn teletrasportava il
+//! player fuori dal dungeon. Inoltre, anche con marker vero, una porta a
+//! portata veniva ignorata perché il marker vinceva.
+//!
+//! Ora:
+//!
+//! 1. `dungeon_enter_exit` dà **priorità alla porta**: se c'è una porta entro
+//!    `DOOR_INTERACTION_REACH` dal player, il tasto E non esce (lo gestirà
+//!    `dungeon_move` aprendola).
+//! 2. L'uscita con E scatta se il player è entro `DUNGEON_EXIT_DISTANCE` da
+//!    `exit_pos` **e** non c'è una porta a portata, indipendentemente da
+//!    `has_exit_marker`. Backspace esce sempre.
+//! 3. `dungeon_move` non ha più il check "sei vicino all'uscita?": apre la
+//!    porta se ce n'è una a portata, indipendentemente dall'uscita.
+//!
+//! ## Ingresso nel palazzo (Sentinel, Wayrest, ...)
+//!
+//! In Daggerfall il palazzo di ogni città è un **dungeon RDB** (come per la
+//! città di Daggerfall stessa), non un interno. Il centro del palazzo viene
+//! calcolato da `palace_center_in_tile`:
+//!
+//! - **Daggerfall**: layout procedurale hardcoded nel blocco `(5, 6)` (dove
+//!   `city_buildings.rs` piazza il palazzo procedurale);
+//! - **Altre città**: si cerca un qualunque blocco con un subrecord
+//!   `building_type == 16` (la stessa logica di `city_map::poi_kind`), e si
+//!   usa l'ancora di quel subrecord come centro. In alcune città il palazzo
+//!   non è un blocco `PALA*`/`CAST*` ma può stare in `RESI*`, `GENR*`, `BLDG*`
+//!   e simili — per questo filtrare per nome non basta.
+//!
+//! Se non si trova nessun blocco con `building_type == 16`,
+//! `player_distance_from_palace` ritorna `None` e `spawn_and_enter_dungeon`
+//! esce con un log esplicito (invece del vecchio `return false` silenzioso).
 //!
 //! ## Collisione per i follower
 //!
-//! `DungeonState::blocked(x, z, feet_y, radius)` (metodo pubblico su `impl
-//! DungeonState`) permette a `tiles::update_followers` di far fermare i
-//! follower sui muri e sulle porte chiuse del dungeon corrente. Senza questo
-//! metodo, la query `TileCollision` (usata fuori, per le città) non copre i
-//! dungeon e i follower attraversavano i muri sotterranei.
-//!
-//! Le coordinate accettate sono **mondo** (come `Transform::translation` del
-//! giocatore e dei follower), e vengono convertite in locali sottraendo
-//! `ActiveDungeon::origin` prima di chiamare `BuiltDungeon::blocked`.
+//! `DungeonState::blocked(x, z, feet_y, radius)` permette a
+//! `tiles::update_followers` di far fermare i follower sui muri e sulle porte
+//! chiuse. Le coordinate sono **mondo**; vengono convertite in locali
+//! sottraendo `ActiveDungeon::origin`.
 
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
+use crate::data::blocks::RmbBlock;
 use crate::data::bsa::BsaArchive;
 use crate::data::building_gen::{BLOCK_SIZE_M, DF_UNIT};
 use crate::data::dungeon_builder::{
@@ -66,6 +103,10 @@ const SNAP_DOWN: f32 = 0.8;
 
 const SPAWN_CLEARANCE: f32 = 0.6;
 const PALACE_DUNGEON_RADIUS: f32 = 50.0;
+/// Raggio entro cui E attiva l'ingresso di una località dungeon (quest, fortezze...)
+/// che non ha un palazzo. Si misura dalla porta del dungeon, o dal centro della
+/// località se il modello della porta non è noto.
+const DUNGEON_ENTRANCE_RADIUS: f32 = 12.0;
 
 const DOOR_OPEN_DURATION: f32 = 1.5;
 const DOOR_INTERACTION_REACH: f32 = 2.8;
@@ -77,6 +118,12 @@ const CLICK_OPENS_DOORS: bool = true;
 pub struct DungeonFlat;
 
 #[derive(Component)]
+pub struct DungeonFlatSource {
+    pub archive: u16,
+    pub record: u8,
+    pub size: Vec2,
+}
+#[derive(Component)]
 pub struct DungeonDoorEntity {
     pub index: usize,
     pub closed_yaw: f32,
@@ -85,6 +132,8 @@ pub struct DungeonDoorEntity {
 
 pub struct ActiveDungeon {
     pub root: Entity,
+    /// Nome della località (es. "Castle Faallem"): serve a piazzare gli oggetti di quest.
+    pub name: String,
     pub origin: Vec3,
     pub dungeon: BuiltDungeon,
     pub saved_translation: Vec3,
@@ -106,15 +155,6 @@ impl DungeonState {
     /// True se un cerchio di raggio `radius` centrato in `(x, z)` (coordinate
     /// **mondo**, come `Transform::translation`) alla quota `feet_y` (piedi,
     /// sempre **mondo**) tocca un muro o una porta chiusa del dungeon corrente.
-    ///
-    /// Usata da `tiles::update_followers` per far fermare i follower sui muri
-    /// sotterranei invece di attraversarli. La query `TileCollision` usata fuori
-    /// per i chunk delle città non copre i dungeon, quindi senza questo metodo
-    /// i follower "passavano attraverso" pareti e porte chiuse.
-    ///
-    /// Fuori dal dungeon (`active == None`) restituisce `false`: nessuna
-    /// collisione da applicare. Il chiamante deve decidere in base a
-    /// `is_inside()` se chiamarlo.
     pub fn blocked(&self, x: f32, z: f32, feet_y: f32, radius: f32) -> bool {
         match &self.active {
             Some(a) => a.dungeon.blocked(
@@ -199,19 +239,121 @@ fn ensure_spawn_is_free(built: &mut BuiltDungeon) {
     }
 }
 
-fn palace_center_in_tile(loc: &DFLocation) -> Option<(f32, f32)> {
-    if !loc.name.eq_ignore_ascii_case("DAGGERFALL") {
-        return None;
-    }
+// =============================================================================
+// Riconoscimento del palazzo reale (robusto al nome della location)
+// =============================================================================
+
+/// `true` se il map pixel contiene il palazzo reale (procedurale per
+/// Daggerfall, o un `building_type == 16` in un altro blocco).
+pub fn is_palace_dungeon(loc: &DFLocation, data: &GameData) -> bool {
+    palace_center_in_tile(loc, data).is_some()
+}
+
+/// Centro del palazzo nel map pixel, in coordinate tile (metri, come
+/// `tile_translation`).
+fn palace_center_in_tile(loc: &DFLocation, data: &GameData) -> Option<(f32, f32)> {
     let bw = loc.width.min(8);
     let bh = loc.height.min(8);
     let start_bx = (8 - bw) / 2;
     let start_by = (8 - bh) / 2;
-    let target_bx = 5.min(bw.saturating_sub(2));
-    let target_by = 6.min(bh.saturating_sub(2));
-    let cx = (start_bx + target_bx) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5;
-    let cz = -((start_by + target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5);
-    Some((cx, cz))
+
+    // Daggerfall: layout procedurale hardcoded, blocco (5, 6).
+    if loc.name.eq_ignore_ascii_case("DAGGERFALL") {
+        let target_bx = 5.min(bw.saturating_sub(2));
+        let target_by = 6.min(bh.saturating_sub(2));
+        let cx = (start_bx + target_bx) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5;
+        let cz = -((start_by + target_by) as f32 * BLOCK_SIZE_M + BLOCK_SIZE_M * 0.5);
+        return Some((cx, cz));
+    }
+
+    // Altre città: cerca un qualunque blocco con un subrecord di tipo 16.
+    let blocks = BsaArchive::parse(&data.blocks_buf).ok()?;
+    let mut scanned = 0usize;
+    let mut with_type16 = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let Some(name) = loc.block_names.get(by * loc.width + bx) else { continue };
+            scanned += 1;
+            let Some(raw) = blocks.get_by_name(name) else { continue };
+            let Ok(mut rmb) = RmbBlock::parse(raw) else { continue };
+            rmb.set_mirror_local(true);
+
+            let Some(sub) = rmb.buildings.iter().position(|b| b.building_type == 16) else {
+                continue;
+            };
+            with_type16 += 1;
+
+            let Some(ax) = rmb.subrecord_anchor_x(sub) else { continue };
+            let Some(an) = rmb.subrecord_anchor_n(sub) else { continue };
+
+            let gx = start_bx + bx;
+            let gz = start_by + by;
+            let bx0 = gx as f32 * BLOCK_SIZE_M;
+            let bz0 = gz as f32 * BLOCK_SIZE_M;
+            let cx = bx0 + ax * DF_UNIT;
+            let cz = -(bz0 + an * DF_UNIT);
+            println!(
+                "Palazzo '{}' trovato: blocco {} ({}), sub {} (building_type 16), centro ({:.1}, {:.1})",
+                     loc.name, name, name.to_ascii_uppercase(), sub, cx, cz
+            );
+            return Some((cx, cz));
+        }
+    }
+    println!(
+        "Nessun building_type 16 in '{}' ({} blocchi scansionati, {} con tipo 16)",
+             loc.name, scanned, with_type16
+    );
+    None
+}
+
+/// Modelli ARCH3D delle porte d'ingresso dei dungeon. Si possono indicare anche con
+/// la variabile d'ambiente `DF_DUNGEON_DOOR_MODELS="1234,5678"`.
+const DUNGEON_DOOR_MODEL_IDS: &[u32] = &[];
+
+fn dungeon_door_models() -> Vec<u32> {
+    let mut ids: Vec<u32> = DUNGEON_DOOR_MODEL_IDS.to_vec();
+    if let Ok(v) = std::env::var("DF_DUNGEON_DOOR_MODELS") {
+        ids.extend(v.split(',').filter_map(|t| t.trim().parse::<u32>().ok()));
+    }
+    ids
+}
+
+/// Posizione (coordinate tile) dell'ingresso di una località dungeon senza palazzo.
+fn dungeon_entrance_in_tile(loc: &DFLocation, data: &GameData) -> (f32, f32) {
+    let bw = loc.width.min(8);
+    let bh = loc.height.min(8);
+    let start_bx = (8 - bw) / 2;
+    let start_by = (8 - bh) / 2;
+    let door_ids = dungeon_door_models();
+
+    if !door_ids.is_empty() {
+        if let Ok(blocks) = BsaArchive::parse(&data.blocks_buf) {
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let Some(name) = loc.block_names.get(by * loc.width + bx) else { continue };
+                    let Some(raw) = blocks.get_by_name(name) else { continue };
+                    let Ok(mut rmb) = RmbBlock::parse(raw) else { continue };
+                    rmb.set_mirror_local(true);
+                    let bx0 = (start_bx + bx) as f32 * BLOCK_SIZE_M;
+                    let bz0 = (start_by + by) as f32 * BLOCK_SIZE_M;
+                    for pm in rmb.placed_models().iter() {
+                        if door_ids.contains(&pm.model_id) {
+                            let (ex, ez) = (bx0 + pm.x * DF_UNIT, -(bz0 + pm.n * DF_UNIT));
+                            println!(
+                                "Dungeon '{}': porta (modello {}) nel blocco {} a ({:.1}, {:.1}).",
+                                     loc.name, pm.model_id, name, ex, ez
+                            );
+                            return (ex, ez);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let cx = (start_bx as f32 + bw as f32 * 0.5) * BLOCK_SIZE_M;
+    let cz = -((start_by as f32 + bh as f32 * 0.5) * BLOCK_SIZE_M);
+    (cx, cz)
 }
 
 fn player_distance_from_palace(
@@ -220,8 +362,9 @@ fn player_distance_from_palace(
     mx: i32,
     my: i32,
     translation: Vec3,
+    data: &GameData,
 ) -> Option<f32> {
-    let (px, pz) = palace_center_in_tile(loc)?;
+    let (px, pz) = palace_center_in_tile(loc, data)?;
     let tile = tile_translation(origin, mx, my);
     let dx = translation.x - tile.x - px;
     let dz = translation.z - tile.z - pz;
@@ -247,23 +390,65 @@ pub fn spawn_and_enter_dungeon(
     mx: i32,
     my: i32,
 ) -> bool {
-    if let Some(dist) = player_distance_from_palace(loc, origin, mx, my, tf.translation) {
-        if dist > PALACE_DUNGEON_RADIUS {
-            return false;
+    let near_external_dungeon_entrance =
+    match player_distance_from_palace(loc, origin, mx, my, tf.translation, data) {
+        Some(dist) => {
+            if dist > PALACE_DUNGEON_RADIUS {
+                println!(
+                    "Palazzo '{}': sei a {:.1} m dal centro, servono entro {:.0} m.",
+                    loc.name, dist, PALACE_DUNGEON_RADIUS
+                );
+                return false;
+            }
+            println!(
+                "Vicino al palazzo reale ({:.1} m): provo a entrare nel dungeon di {}.",
+                     dist, loc.name,
+            );
+            true
         }
-        println!(
-            "Vicino al palazzo reale ({:.1} m): provo a entrare nel dungeon di {}.",
-                 dist, loc.name,
-        );
-    }
+        None => {
+            let (ex, ez) = dungeon_entrance_in_tile(loc, data);
+            let tile = tile_translation(origin, mx, my);
+            let dx = tf.translation.x - tile.x - ex;
+            let dz = tf.translation.z - tile.z - ez;
+            let d = (dx * dx + dz * dz).sqrt();
+            if d > DUNGEON_ENTRANCE_RADIUS {
+                println!(
+                    "Dungeon '{}': sei a {:.1} m dall'ingresso, servono entro {:.0} m.",
+                    loc.name, d, DUNGEON_ENTRANCE_RADIUS
+                );
+                return false;
+            }
+            println!(
+                "Vicino all'ingresso del dungeon '{}' ({:.1} m): provo a entrare.",
+                     loc.name, d
+            );
+            true
+        }
+    };
+    let _ = near_external_dungeon_entrance;
 
-    let Ok(maps_bsa) = BsaArchive::parse(&data.maps_buf) else { return false };
-    let Ok(blocks_bsa) = BsaArchive::parse(&data.blocks_buf) else { return false };
-    let Ok(arch_bsa) = BsaArchive::parse(&data.arch3d_buf) else { return false };
+    let Ok(maps_bsa) = BsaArchive::parse(&data.maps_buf) else {
+        println!("Impossibile parsare MAPS.BSA");
+        return false;
+    };
+    let Ok(blocks_bsa) = BsaArchive::parse(&data.blocks_buf) else {
+        println!("Impossibile parsare BLOCKS.BSA");
+        return false;
+    };
+    let Ok(arch_bsa) = BsaArchive::parse(&data.arch3d_buf) else {
+        println!("Impossibile parsare ARCH3D.BSA");
+        return false;
+    };
 
     let Some(dungeon_data) =
     DungeonData::read_from_maps(&maps_bsa, loc.region_index, loc.location_id)
     else {
+        println!(
+            "DungeonData mancante per '{}' (region {}, loc_id {}): \
+MAPDITEM non contiene RDB per questo location_id.",
+loc.name, loc.region_index, loc.location_id
+        );
         return false;
     };
 
@@ -274,9 +459,21 @@ pub fn spawn_and_enter_dungeon(
              loc.location_id,
     );
     let Some(mut built) = build_dungeon(&dungeon_data, &blocks_bsa, &arch_bsa) else {
-        println!("Costruzione dungeon fallita.");
+        println!(
+            "build_dungeon fallito per '{}' ({} blocchi RDB).",
+                 loc.name, dungeon_data.blocks.len()
+        );
         return false;
     };
+
+    if !built.has_exit_marker {
+        info!(
+            "Dungeon di {}: nessun marker di uscita (modello 70300) nel RDB. \
+`exit_pos` è il fallback a `spawn_pos` ({:.1},{:.1}): il tasto E (vicino al \
+punto d'ingresso) e Backspace escono. Le porte vicino allo spawn ora si aprono.",
+loc.name, built.spawn_pos[0], built.spawn_pos[2]
+        );
+    }
 
     ensure_spawn_is_free(&mut built);
 
@@ -286,6 +483,7 @@ pub fn spawn_and_enter_dungeon(
     let root = commands
     .spawn((Transform::from_translation(origin_world), Visibility::default()))
     .with_children(|parent| {
+        // Mesh principale (muri, pavimenti, soffitti).
         for sm in &built.mesh.submeshes {
             if sm.indices.is_empty() { continue; }
             let size = wall_textures.original_size(sm.texture_archive, sm.texture_record, data);
@@ -306,6 +504,28 @@ pub fn spawn_and_enter_dungeon(
             ));
         }
 
+        // Porta d'uscita (modello 70300).
+        for sm in &built.visible_only.submeshes {
+            if sm.indices.is_empty() { continue; }
+            let size = wall_textures.original_size(sm.texture_archive, sm.texture_record, data);
+            let handle = wall_textures.material(
+                sm.texture_archive, sm.texture_record, climate,
+                data, mods, images, materials,
+            );
+            if let Some(m) = materials.get_mut(&handle) {
+                m.double_sided = true;
+                m.cull_mode = None;
+            }
+            let mut bevy_mesh = submesh_to_bevy(&built.visible_only, sm, size);
+            wall_textures.prepare_mesh(&handle, &mut bevy_mesh);
+            parent.spawn((
+                Mesh3d(meshes.add(bevy_mesh)),
+                          MeshMaterial3d(handle),
+                          Transform::IDENTITY,
+            ));
+        }
+
+        // Porte apribili.
         for (i, d) in built.doors.iter().enumerate() {
             parent
             .spawn((
@@ -343,6 +563,7 @@ pub fn spawn_and_enter_dungeon(
             });
         }
 
+        // Luci puntuali del dungeon.
         for (l_pos, radius) in &built.lights {
             parent.spawn((
                 PointLight {
@@ -356,6 +577,7 @@ pub fn spawn_and_enter_dungeon(
             ));
         }
 
+        // Luce d'ingresso.
         parent.spawn((
             PointLight {
                 color: Color::srgb(1.0, 0.80, 0.45),
@@ -371,25 +593,31 @@ pub fn spawn_and_enter_dungeon(
             ),
         ));
 
+        // Flat decorativi originali del RDB (arazzi, quadri, cortigiani, ecc.).
+        // Gli NPC di quest sono spawnati da `qbn_npc.rs`, non qui.
         for (f_pos, archive, record) in &built.flats {
             let Some((material, w_px, h_px)) = wall_textures.flat_material(
                 *archive, *record, data, mods, images, materials,
             ) else { continue };
 
             let (w, h) = (w_px * DF_UNIT, h_px * DF_UNIT);
+
             parent.spawn((
                 Mesh3d(meshes.add(Rectangle::new(w, h))),
                           MeshMaterial3d(material),
                           Transform::from_xyz(f_pos[0], f_pos[1], f_pos[2]),
                           DungeonFlat,
+                          DungeonFlatSource {
+                              archive: *archive,
+                              record: *record,
+                              size: Vec2::new(w, h),
+                          },
             ));
         }
     })
     .id();
 
-    // --- Nemici ---
-    // Invia l'evento PRIMA di spostare `built` in `ActiveDungeon` (che lo consuma).
-    // Il plugin `dungeon_enemies` farà nascere i nemici come figli di `root`.
+    // Nemici.
     enemy_events.send(SpawnDungeonEnemies::from_built(
         root,
         &built,
@@ -405,12 +633,13 @@ pub fn spawn_and_enter_dungeon(
 
     state.active = Some(ActiveDungeon {
         root,
-        origin: origin_world,
-        dungeon: built,
-        saved_translation: tf.translation,
-        saved_feet_y: p.feet_y,
-        saved_yaw: p.yaw,
-        saved_origin: (origin.east, origin.north),
+        name: loc.name.clone(),
+                        origin: origin_world,
+                        dungeon: built,
+                        saved_translation: tf.translation,
+                        saved_feet_y: p.feet_y,
+                        saved_yaw: p.yaw,
+                        saved_origin: (origin.east, origin.north),
     });
 
     p.feet_y = origin_world.y + floor_y;
@@ -504,12 +733,22 @@ pub fn dungeon_enter_exit(
         let d_exit = (local.x - active.dungeon.exit_pos[0])
         .hypot(local.z - active.dungeon.exit_pos[2]);
 
-        let exit_now = leave || (act && d_exit < DUNGEON_EXIT_DISTANCE);
+        // Priorità alla porta.
+        let feet_local = p.feet_y - active.origin.y;
+        let door_in_reach = active.dungeon.doors.iter().any(|d| {
+            if (d.center[1] - feet_local).abs() > 2.5 {
+                return false;
+            }
+            let dist = (d.center[0] - local.x).hypot(d.center[2] - local.z);
+            dist <= DOOR_INTERACTION_REACH
+        });
+
+        let real_exit_in_reach = d_exit < DUNGEON_EXIT_DISTANCE;
+        let exit_now = leave || (act && real_exit_in_reach && !door_in_reach);
+
         if exit_now {
             let active = state.active.take().unwrap();
 
-            // Svuota la coda nemici prima di despawnare il root: evita il
-            // panic "entity already despawned" in `stream_dungeon_enemies`.
             let cleared = pending_enemies.items.len();
             pending_enemies.items.clear();
             if cleared > 0 {
@@ -532,7 +771,9 @@ pub fn dungeon_enter_exit(
 
             commands.entity(active.root).despawn_recursive();
             clear.0 = Color::srgb(0.55, 0.72, 0.92);
-            println!("Sei uscito dal dungeon.");
+
+            let reason = if leave { "Backspace" } else { "E sull'uscita" };
+            println!("Sei uscito dal dungeon ({reason}).");
 
             keys.clear_just_pressed(KeyCode::KeyE);
             keys.clear_just_pressed(KeyCode::Backspace);
@@ -542,7 +783,10 @@ pub fn dungeon_enter_exit(
 
     if !act { return; }
     let (mx, my) = map_pixel_of(&origin, tf.translation);
-    let Some(loc) = data.locations.get(&(mx, my)) else { return };
+    let Some(loc) = data.locations.get(&(mx, my)) else {
+        println!("Nessuna location al map pixel ({}, {}).", mx, my);
+        return;
+    };
 
     if spawn_and_enter_dungeon(
         &mut commands, &mut enemy_events, &data, &origin, &mut state, &mut clear,
@@ -571,12 +815,6 @@ pub fn handle_dungeon_door_click(
     let local = tf.translation - active.origin;
     let feet_local = local.y - EYE_HEIGHT;
 
-    // Se sei vicino all'uscita, il click sinistro non deve aprire porte:
-    // l'uscita è gestita dal tasto E e dal Backspace in `dungeon_enter_exit`.
-    let d_exit = (local.x - active.dungeon.exit_pos[0])
-    .hypot(local.z - active.dungeon.exit_pos[2]);
-    if d_exit < DUNGEON_EXIT_DISTANCE { return; }
-
     if let Some(i) = active
         .dungeon
         .toggle_nearest_door(local.x, local.z, feet_local, DOOR_INTERACTION_REACH)
@@ -592,7 +830,7 @@ pub fn handle_dungeon_door_click(
 pub fn dungeon_move(
     dialog: Res<DialogState>,
     time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
     mut state: ResMut<DungeonState>,
     mut doors_q: Query<(&mut Transform, &mut DungeonDoorEntity), Without<Player>>,
                     mut player: Query<(&mut Player, &mut Transform)>,
@@ -608,19 +846,13 @@ pub fn dungeon_move(
         let (lx, lz) = (tf.translation.x - o.x, tf.translation.z - o.z);
         let feet = p.feet_y - o.y;
 
-        // Se sei vicino all'uscita, E deve servire a uscire (gestito da
-        // `dungeon_enter_exit`, che gira prima in chain), NON ad aprire
-        // una porta vicina. Questo evita il doppio effetto "esci + apri
-        // porta" quando una porta si trova a ridosso dell'uscita.
-        let d_exit = (lx - dungeon.exit_pos[0]).hypot(lz - dungeon.exit_pos[2]);
-        if d_exit >= DUNGEON_EXIT_DISTANCE {
-            if let Some(door_idx) = dungeon.toggle_nearest_door(lx, lz, feet, DOOR_INTERACTION_REACH) {
-                println!(
-                    "Porta {} {}.",
-                    door_idx,
-                    if dungeon.door_open[door_idx] { "aperta" } else { "chiusa" }
-                );
-            }
+        if let Some(door_idx) = dungeon.toggle_nearest_door(lx, lz, feet, DOOR_INTERACTION_REACH) {
+            println!(
+                "Porta {} {}.",
+                door_idx,
+                if dungeon.door_open[door_idx] { "aperta" } else { "chiusa" }
+            );
+            keys.clear_just_pressed(KeyCode::KeyE);
         }
     }
 
@@ -658,24 +890,19 @@ pub fn dungeon_move(
     if step != Vec3::ZERO {
         for _ in 0..steps {
             let feet = p.feet_y - o.y;
-            let mut moved = false;
+            let cur = dungeon.clearance(pos.x - o.x, pos.z - o.z, feet, RADIUS);
             for cand in [step, Vec3::new(step.x, 0.0, 0.0), Vec3::new(0.0, 0.0, step.z)] {
                 if cand == Vec3::ZERO { continue; }
                 let n = pos + cand;
-                if !dungeon.blocked(n.x - o.x, n.z - o.z, feet, RADIUS) {
+                let (nx, nz) = (n.x - o.x, n.z - o.z);
+                let ok = if cur >= RADIUS {
+                    !dungeon.blocked(nx, nz, feet, RADIUS)
+                } else {
+                    dungeon.clearance(nx, nz, feet, RADIUS) >= cur - 1e-4
+                };
+                if ok {
                     pos = n;
-                    moved = true;
                     break;
-                }
-            }
-            if !moved {
-                for cand in [step, Vec3::new(step.x, 0.0, 0.0), Vec3::new(0.0, 0.0, step.z)] {
-                    if cand == Vec3::ZERO { continue; }
-                    let n = pos + cand;
-                    if !dungeon.blocked(n.x - o.x, n.z - o.z, feet, 0.15) {
-                        pos = n;
-                        break;
-                    }
                 }
             }
         }
@@ -711,12 +938,22 @@ pub fn dungeon_move(
     }
 
     if p.feet_y - o.y < dungeon.bounds_min[1] - 10.0 {
-        pos = Vec3::new(
-            o.x + dungeon.spawn_pos[0],
-            0.0,
-            o.z + dungeon.spawn_pos[2],
+        let open_doors: Vec<usize> = dungeon
+        .door_open
+        .iter()
+        .enumerate()
+        .filter(|(_, open)| **open)
+        .map(|(i, _)| i)
+        .collect();
+        println!(
+            "Dungeon: CADUTO fuori dalla mappa (locale x={:.1} z={:.1} feet_y={:.1}, \
+minimo mesh y={:.1}); porte aperte: {:?}. Respawn all'ingresso.",
+pos.x - o.x, pos.z - o.z, p.feet_y - o.y, dungeon.bounds_min[1], open_doors,
         );
-        p.feet_y = o.y + dungeon.spawn_pos[1];
+        let sp = dungeon.spawn_pos;
+        let fy = dungeon.floor_at(sp[0], sp[2], sp[1], 2.0).unwrap_or(sp[1]);
+        pos = Vec3::new(o.x + sp[0], 0.0, o.z + sp[2]);
+        p.feet_y = o.y + fy;
         p.vel_y = 0.0;
         p.on_ground = true;
     }

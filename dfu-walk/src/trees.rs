@@ -102,14 +102,14 @@ pub fn nature_archive_for_climate(climate: i32, season: Season) -> u32 {
 fn tree_count_for_climate(climate: i32) -> usize {
     match climate {
         223 => 0,
-        224 | 225 => 30,
-        226 => 55,
-        227 => 220,
-        228 => 180,
-        229 => 140,
-        230 => 160,
-        231 | 232 => 200,
-        _ => 120,
+        224 | 225 => 60,   // Deserto
+        226 => 110,        // Montagna
+        227 => 450,        // Foresta pluviale
+        228 => 360,        // Palude
+        229 => 280,        // Sub-tropicale
+        230 => 320,        // Boschi di montagna
+        231 | 232 => 400,  // Boschi (Daggerfall)
+        _ => 240,
     }
 }
 
@@ -215,12 +215,12 @@ impl NaturePool {
         materials: &mut Assets<StandardMaterial>,
     ) -> &[TreeType] {
         if !self.cache.contains_key(&archive_id) {
-            let mut species =
+            let mut by_rec =
             Self::build_archive(archive_id, data, mods, images, meshes, materials);
             // Fallback: se l'archivio invernale (505, 507, 509, 511) non
             // esiste, usa il corrispondente estivo (archive_id - 1). Meglio
             // alberi estivi che nessun albero.
-            if species.is_empty()
+            if by_rec.is_empty()
                 && matches!(archive_id, 505 | 507 | 509 | 511)
                 {
                     let base = archive_id - 1;
@@ -228,15 +228,17 @@ impl NaturePool {
                         "Archivio vegetazione invernale {} mancante, uso il corrispondente estivo {}",
                         archive_id, base
                     );
-                    species = Self::build_archive(base, data, mods, images, meshes, materials);
+                    by_rec = Self::build_archive(base, data, mods, images, meshes, materials);
                 }
-                self.cache.insert(archive_id, species);
-        }
-        if !self.by_record.keys().any(|(a, _)| *a == archive_id) {
-            let species = self.cache.get(&archive_id).cloned().unwrap_or_default();
-            for (r, tt) in species.into_iter().enumerate() {
-                self.by_record.insert((archive_id, r as u32), tt);
+            // Lookup per VERO numero di record (serve ai flat/scenery RMB delle
+            // città). `species` invece e' ordinata per dimensione e serve solo
+            // alla scelta casuale degli alberi selvatici.
+            for (r, tt) in &by_rec {
+                self.by_record.insert((archive_id, *r), tt.clone());
             }
+            let mut species: Vec<TreeType> = by_rec.into_iter().map(|(_, tt)| tt).collect();
+            species.sort_by(|a, b| b.size.partial_cmp(&a.size).unwrap_or(std::cmp::Ordering::Equal));
+            self.cache.insert(archive_id, species);
         }
         self.cache.get(&archive_id).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -248,7 +250,7 @@ impl NaturePool {
         images: &mut Assets<Image>,
         meshes: &mut Assets<Mesh>,
         materials: &mut Assets<StandardMaterial>,
-    ) -> Vec<TreeType> {
+    ) -> Vec<(u32, TreeType)> {
         let filename = archive_file_name(archive_id);
         let Some(path) = find_file_ci(&data.dir, &filename) else {
             warn!("Archivio vegetazione `{filename}` non trovato in ARENA2");
@@ -318,15 +320,14 @@ impl NaturePool {
                                            cull_mode: None,
                                            ..default()
             });
-            species.push(TreeType {
+            species.push((r as u32, TreeType {
                 mesh: mesh_handle,
                 material: mat_handle,
                 size: h_meters * w_meters,
                 w_meters,
                 h_meters,
-            });
+            }));
         }
-        species.sort_by(|a, b| b.size.partial_cmp(&a.size).unwrap_or(std::cmp::Ordering::Equal));
         species
     }
 
@@ -402,7 +403,7 @@ pub fn spawn_trees_for_chunk(
             let tree = &tree_species[species_idx];
             let local_x = gx * CELL_SIZE;
             let local_z = -(gy * CELL_SIZE);
-            let scale_var = rng.gen_f32(1.0, 1.7);
+            let scale_var = rng.gen_f32(0.5, 0.9);
             parent.spawn((
                 Mesh3d(tree.mesh.clone()),
                           MeshMaterial3d(tree.material.clone()),

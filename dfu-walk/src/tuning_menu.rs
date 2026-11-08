@@ -1,34 +1,27 @@
-//! Menu di tuning (tasto F1), con tre schede separate:
+//! Menu di tuning (tasto F1), con quattro schede:
 //!
 //! * **Finto rilievo** — uno slider per ogni parametro di `FakeRelief`.
-//! * **Torcia** — sovrascritture di intensità, range, colore, flickering
-//!   (`TorchTuning`), salvate su `torch_settings.txt`.
-//! * **Colore** — saturazione, luminosità e contrasto applicati dopo tutti
-//!   gli altri post-processing (in spazio gamma). Il contrasto ha due
-//!   modalità: pivot fisso (default 0.5) oppure adaptive (pivot = luminanza
-//!   media locale, così alzare il contrasto non sposta la luminosità media
-//!   della zona: gli interni scuri restano scuri e gli esterni chiari
-//!   restano chiari).
+//! * **Torcia** — sovrascritture di `TorchTuning`, salvate su `torch_settings.txt`.
+//! * **Colore** — saturazione, luminosità e contrasto (`FakeRelief`).
+//! * **Luce cielo** — override di `DirectionalLight` e `AmbientLight` e
+//!   parametri del buio del dungeon, salvati su `sky_settings.txt`. Include
+//!   il controllo dell'esponente della curva stanza (`dungeon_room_curve_exponent`),
+//!   che decide quanto rapidamente la luce cresce con la dimensione della stanza.
 //!
 //! ## Caricamento all'avvio
 //!
-//! `Plugin::build` legge **entrambi** i file:
+//! `Plugin::build` legge tre file:
 //!
-//! * `relief_settings.txt` in `SavedRelief`. Il sistema `apply_saved_on_add`
-//!   (in `Update`) usa `Added<FakeRelief>`: si attiva nel frame in cui la
-//!   camera riceve il componente da `attach_to_cameras` (`relief_post.rs`),
-//!   indipendentemente dall'ordine dei sistemi, e applica il testo del file.
-//! * `torch_settings.txt` in un `TorchTuning`, che **sostituisce** il default
-//!   creato da `TorchPlugin::init_resource`. `insert_resource` sovrascrive
-//!   senza conflitti (in `main.rs` `tuning_menu` viene aggiunto dopo `torch`).
-//!
-//! Non serve cliccare "Carica tutto" all'avvio. Se un file non esiste, il
-//! log lo dice e si usano i valori predefiniti.
+//! * `relief_settings.txt` in `SavedRelief`, applicato quando una camera
+//!   riceve `FakeRelief` (`apply_saved_on_add`).
+//! * `torch_settings.txt` in `TorchTuning`, che sostituisce il default di
+//!   `TorchPlugin`.
+//! * `sky_settings.txt` in `SkyLightTuning`, che sostituisce il default di
+//!   `sky::setup_sky`.
 //!
 //! ## Integrazione
 //!
-//! * `Cargo.toml`: `bevy_egui = "0.33"` (la tua API corrisponde a una versione
-//!   <= 0.30: `EguiPlugin` senza campi, `ctx_mut()` restituisce `&mut Context`).
+//! * `Cargo.toml`: `bevy_egui = "0.33"`.
 //! * `main.rs`: `mod tuning_menu;` e `.add_plugins(tuning_menu::TuningMenuPlugin)`.
 //!
 //! ## Cursore
@@ -41,6 +34,7 @@ use std::path::Path;
 
 use crate::dialog::DialogState;
 use crate::relief_post::FakeRelief;
+use crate::sky::{SkyLightTuning, SKY_SETTINGS_FILE};
 use crate::torch::TorchTuning;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, PrimaryWindow};
@@ -49,7 +43,7 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin};
 const SETTINGS_FILE: &str = "relief_settings.txt";
 const TORCH_SETTINGS_FILE: &str = "torch_settings.txt";
 
-const DEBUG_NAMES: [&str; 7] = [
+const DEBUG_NAMES: [&str; 8] = [
     "0 Nessuna",
 "1 Shading",
 "2 Cavita'",
@@ -57,19 +51,15 @@ const DEBUG_NAMES: [&str; 7] = [
 "4 Maschera pelle",
 "5 Mappa bump",
 "6 Normal map",
+"7 Profondita'",
 ];
 
-/// Stato del menu.
 #[derive(Resource, Default)]
 pub struct TuningMenuState {
     pub open: bool,
-    /// `DialogState::open` prima che il menu lo forzasse a `true`. Serve a
-    /// restituire il dialogo NPC alla chiusura del menu.
     was_dialog_open_before_menu: bool,
 }
 
-/// Testo del file di impostazioni letto all'avvio, da applicare alla camera
-/// quando nasce (la camera non esiste ancora in `Startup`).
 #[derive(Resource, Default)]
 struct SavedRelief(Option<String>);
 
@@ -77,9 +67,13 @@ pub struct TuningMenuPlugin;
 
 impl Plugin for TuningMenuPlugin {
     fn build(&self, app: &mut App) {
+        // `EguiPlugin` può essere aggiunto anche da altri plugin del progetto
+        // (`character.rs`, `savegame.rs`, ecc.): se è già presente, non lo
+        // riaggiungiamo (Bevy va in panic con "plugin was already added").
+        if !app.is_plugin_added::<EguiPlugin>() {
+            app.add_plugins(EguiPlugin);
+        }
         app
-        // Nella tua versione `EguiPlugin` e' una unit struct.
-        .add_plugins(EguiPlugin)
         .init_resource::<TuningMenuState>()
         .insert_resource({
             // Log esplicito: utile quando "sembra che non carichi".
@@ -100,11 +94,6 @@ impl Plugin for TuningMenuPlugin {
         .insert_resource({
             // Torcia: leggi il file e sovrascrivi il `TorchTuning` di
             // default creato da `TorchPlugin::init_resource`.
-            //
-            // `insert_resource` rimpiazza la risorsa se esiste gia', la
-            // crea se manca. In `main.rs` `tuning_menu` viene aggiunto
-            // DOPO `torch`, quindi il default e' gia' presente e questo
-            // `insert_resource` lo sovrascrive col file (se c'e').
             let path = Path::new(TORCH_SETTINGS_FILE);
             let torch = TorchTuning::load_or_default(path);
             if path.exists() {
@@ -119,6 +108,23 @@ impl Plugin for TuningMenuPlugin {
                 );
             }
             torch
+        })
+        .insert_resource({
+            // Cielo: leggi il file e sostituisci il default di `sky::setup_sky`.
+            let path = Path::new(SKY_SETTINGS_FILE);
+            let sky = SkyLightTuning::load_or_default(path);
+            if path.exists() {
+                info!(
+                    "Tuning: {} trovato, parametri luce cielo caricati",
+                    SKY_SETTINGS_FILE
+                );
+            } else {
+                info!(
+                    "Tuning: {} non trovato, uso i valori predefiniti della luce cielo",
+                    SKY_SETTINGS_FILE
+                );
+            }
+            sky
         })
         .add_systems(
             PreUpdate,
@@ -276,9 +282,6 @@ fn apply_menu_state(
 /// `FakeRelief`**. `Added<FakeRelief>` è vero solo per il frame di aggiunta
 /// (più il successivo, per gestire i cambi di schedule in Bevy 0.15), quindi
 /// l'applicazione avviene una volta sola senza `Local<bool>` da mantenere.
-///
-/// Funziona anche se `attach_to_cameras` (in `relief_post.rs`) gira dopo
-/// questo sistema: il flag `Added` resta vero anche al frame successivo.
 fn apply_saved_on_add(
     mut cameras: Query<&mut FakeRelief, Added<FakeRelief>>,
     saved: Res<SavedRelief>,
@@ -297,7 +300,7 @@ fn apply_saved_on_add(
 }
 
 // ---------------------------------------------------------------------------
-// Interfaccia
+// UI helpers
 // ---------------------------------------------------------------------------
 
 fn slider(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, name: &str) {
@@ -310,12 +313,60 @@ fn flag(ui: &mut egui::Ui, value: &mut u32, name: &str) {
     *value = on as u32;
 }
 
+/// Slider per un override `Option<f32>`. Se `None`, mostra il default e
+/// il checkbox è spento; quando l'utente lo accende, parte da `default`.
+fn optional_slider(
+    ui: &mut egui::Ui,
+    value: &mut Option<f32>,
+    range: std::ops::RangeInclusive<f32>,
+    default: f32,
+        name: &str,
+) {
+    let mut enabled = value.is_some();
+    if ui.checkbox(&mut enabled, format!("{name} (override)")).changed() {
+        *value = if enabled { Some(default) } else { None };
+    }
+    if let Some(v) = value.as_mut() {
+        ui.add(egui::Slider::new(v, range).text(name));
+    }
+}
+
+/// Slider RGB (sRGB 0..1) per un override `Option<[f32;3]>`.
+fn optional_color(
+    ui: &mut egui::Ui,
+    value: &mut Option<[f32; 3]>,
+    default: [f32; 3],
+        name: &str,
+) {
+    let mut enabled = value.is_some();
+    if ui.checkbox(&mut enabled, format!("{name} (override)")).changed() {
+        *value = if enabled { Some(default) } else { None };
+    }
+    if let Some(c) = value.as_mut() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut c[0], 0.0..=1.0).text("R"));
+            ui.add(egui::Slider::new(&mut c[1], 0.0..=1.0).text("G"));
+            ui.add(egui::Slider::new(&mut c[2], 0.0..=1.0).text("B"));
+        });
+        ui.label(
+            egui::RichText::new(format!("anteprima: [{:.2}, {:.2}, {:.2}]", c[0], c[1], c[2]))
+            .weak()
+            .small(),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UI principale
+// ---------------------------------------------------------------------------
+
 #[allow(clippy::too_many_arguments)]
 fn menu_ui(
     mut contexts: EguiContexts,
     menu: Res<TuningMenuState>,
     mut cameras: Query<&mut FakeRelief>,
     mut torch: ResMut<TorchTuning>,
+    mut sky: ResMut<SkyLightTuning>,
     mut status: Local<String>,
     mut active_tab: Local<usize>,
 ) {
@@ -326,13 +377,14 @@ fn menu_ui(
     let ctx = contexts.ctx_mut();
 
     egui::Window::new("Tuning (F1)")
-    .default_width(400.0)
+    .default_width(440.0)
     .show(ctx, |ui| {
         // --- Selettore schede ---
         ui.horizontal(|ui| {
             ui.selectable_value(&mut *active_tab, 0, "Finto rilievo");
             ui.selectable_value(&mut *active_tab, 1, "Torcia");
             ui.selectable_value(&mut *active_tab, 2, "Colore");
+            ui.selectable_value(&mut *active_tab, 3, "Luce cielo");
         });
         ui.separator();
 
@@ -341,6 +393,7 @@ fn menu_ui(
             0 => relief_ui(ui, &mut cameras, &mut status),
           1 => torch_ui(ui, &mut torch, &mut status),
           2 => color_ui(ui, &mut cameras, &mut status),
+          3 => sky_ui(ui, &mut sky, &mut status),
           _ => {}
         }
 
@@ -375,6 +428,10 @@ fn menu_ui(
                             *status = "Colore: valori predefiniti".into();
                         }
                     }
+                    3 => {
+                        *sky = SkyLightTuning::default();
+                        *status = "Luce cielo: valori predefiniti".into();
+                    }
                     _ => {}
                 }
             }
@@ -393,6 +450,12 @@ fn menu_ui(
                     1 => {
                         *status = match std::fs::write(TORCH_SETTINGS_FILE, torch.to_text()) {
                             Ok(()) => format!("Salvato in {TORCH_SETTINGS_FILE}"),
+                      Err(e) => format!("Errore di salvataggio: {e}"),
+                        };
+                    }
+                    3 => {
+                        *status = match std::fs::write(SKY_SETTINGS_FILE, sky.to_text()) {
+                            Ok(()) => format!("Salvato in {SKY_SETTINGS_FILE}"),
                       Err(e) => format!("Errore di salvataggio: {e}"),
                         };
                     }
@@ -416,6 +479,10 @@ fn menu_ui(
                         *torch = TorchTuning::load_or_default(Path::new(TORCH_SETTINGS_FILE));
                         *status = format!("Caricato da {TORCH_SETTINGS_FILE}");
                     }
+                    3 => {
+                        *sky = SkyLightTuning::load_or_default(Path::new(SKY_SETTINGS_FILE));
+                        *status = format!("Caricato da {SKY_SETTINGS_FILE}");
+                    }
                     _ => {}
                 }
             }
@@ -427,8 +494,9 @@ fn menu_ui(
                     ok &= std::fs::write(SETTINGS_FILE, to_text(&r)).is_ok();
                 }
                 ok &= std::fs::write(TORCH_SETTINGS_FILE, torch.to_text()).is_ok();
+                ok &= std::fs::write(SKY_SETTINGS_FILE, sky.to_text()).is_ok();
                 *status = if ok {
-                    "Salvati entrambi i file".into()
+                    "Salvati tutti e tre i file".into()
                 } else {
                     "Errore di salvataggio".into()
                 };
@@ -447,8 +515,12 @@ fn menu_ui(
                     Ok(text) => *torch = TorchTuning::from_text(&text),
                       Err(_) => ok = false,
                 }
+                match std::fs::read_to_string(SKY_SETTINGS_FILE) {
+                    Ok(text) => *sky = SkyLightTuning::parse(&text),
+                      Err(_) => ok = false,
+                }
                 *status = if ok {
-                    "Caricati entrambi i file".into()
+                    "Caricati tutti e tre i file".into()
                 } else {
                     "Errore di lettura".into()
                 };
@@ -691,5 +763,189 @@ Disattivato: pivot fisso (impostabile sotto).",
 matematica no-op, ma consuma ~6 ALU per pixel (più un tap per il \
 pivot adattivo). Se non ti serve, disattiva 'Attivo'.",
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Scheda "Luce cielo"
+// ---------------------------------------------------------------------------
+
+/// Scheda "Luce cielo": override di `DirectionalLight` e `AmbientLight`, più
+/// i valori del buio del dungeon e la curva stanza.
+///
+/// Ogni override è un `Option`: se il checkbox è spento, il valore calcolato
+/// astronomicamente/meteo resta in uso (comportamento predefinito). Se
+/// l'utente lo accende, il valore parte dal default e viene applicato in
+/// `sky::update_sky`. Gli override **non** si applicano in dungeon, dove
+/// `in_dungeon` short-circuita con i campi `dungeon_*`.
+///
+/// La sezione "Buio del dungeon" contiene:
+/// - i valori **base** (fattore 1.0) di sole e ambient;
+/// - il colore dell'ambient e la nebbia;
+/// - la **curva stanza**: dimensione minima/massima, fattore minimo e
+///   `dungeon_room_curve_exponent`, che controlla quanto rapidamente la luce
+///   cresce con la stanza. Con `exponent = 1.0` è smoothstep puro; con
+///   `> 1.0` la curva è più selettiva (favorisce le stanze grandi, penalizza
+///   le medie). Vedi il doc di `SkyLightTuning` per la formula completa.
+fn sky_ui(ui: &mut egui::Ui, sky: &mut SkyLightTuning, _status: &mut String) {
+    egui::ScrollArea::vertical().max_height(540.0).show(ui, |ui| {
+        ui.label(
+            "Override manuali della luce solare e ambientale. Senza override, \
+il cielo segue l'ora del giorno e il meteo. Con override, il valore \
+sostituisce il calcolo astronomico.",
+        );
+        ui.add_space(6.0);
+
+        egui::CollapsingHeader::new("DirectionalLight (sole)")
+        .default_open(true)
+        .show(ui, |ui| {
+            optional_slider(
+                ui,
+                &mut sky.sun_illuminance_override,
+                0.0..=40_000.0,
+                11_000.0,
+                "Illuminance (lux)",
+            );
+            optional_color(
+                ui,
+                &mut sky.sun_color_override,
+                [1.0, 0.96, 0.88],
+                "Colore sole (sRGB)",
+            );
+        });
+
+        egui::CollapsingHeader::new("AmbientLight")
+        .default_open(true)
+        .show(ui, |ui| {
+            optional_slider(
+                ui,
+                &mut sky.ambient_brightness_override,
+                0.0..=1000.0,
+                450.0,
+                "Brightness",
+            );
+            optional_color(
+                ui,
+                &mut sky.ambient_color_override,
+                [0.85, 0.9, 1.0],
+                "Colore ambient (sRGB)",
+            );
+        });
+
+        ui.separator();
+
+        egui::CollapsingHeader::new("Buio del dungeon")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label(
+                "Valori applicati quando sei in un dungeon, MOLTIPLICATI per un \
+fattore che dipende dalla dimensione della stanza: tunnel = buio, \
+sale grandi = luce. Vedi 'Curva stanza' sotto.",
+            );
+            ui.add_space(4.0);
+            slider(
+                ui,
+                &mut sky.dungeon_sun_illuminance,
+                0.0..=9000.0,
+                "Illuminance sole (base, fattore 1.0)",
+            );
+            slider(
+                ui,
+                &mut sky.dungeon_ambient_brightness,
+                0.0..=900.0,
+                "Ambient brightness (base, fattore 1.0)",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Colore ambient:");
+                ui.add(egui::Slider::new(&mut sky.dungeon_ambient_color[0], 0.0..=1.0).text("R"));
+                ui.add(egui::Slider::new(&mut sky.dungeon_ambient_color[1], 0.0..=1.0).text("G"));
+                ui.add(egui::Slider::new(&mut sky.dungeon_ambient_color[2], 0.0..=1.0).text("B"));
+            });
+            slider(
+                ui,
+                &mut sky.dungeon_fog_start,
+                0.0..=200.0,
+                "Fog start (m)",
+            );
+            slider(
+                ui,
+                &mut sky.dungeon_fog_end,
+                10.0..=1000.0,
+                "Fog end (m)",
+            );
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut sky.dungeon_headlamp,
+                "Luce che segue lo sguardo (uniforme su tutte le facce)",
+            );
+            ui.add_enabled_ui(sky.dungeon_headlamp, |ui| {
+                slider(
+                    ui,
+                    &mut sky.dungeon_headlamp_pitch,
+                    0.0..=89.0,
+                    "Inclinazione luce verso il basso (gradi)",
+                );
+            });
+        });
+
+        egui::CollapsingHeader::new("Curva stanza (dungeon)")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                "Il fattore si basa sulla dimensione MINIMA della stanza \
+(16 raggi orizzontali dal player, accoppiati in corde; vale la seconda \
+corda piu' corta). Un tunnel 2x100 m ha dim = 2, una sala 30x30 ha \
+dim = 30. Con DF_DUNGEON_LIGHT_DEBUG=1 il log mostra la dimensione \
+misurata nella stanza in cui ti trovi.",
+            );
+            ui.checkbox(
+                &mut sky.dungeon_room_scale_enabled,
+                "Scala automatica (disattiva per uniforme)",
+            );
+            ui.add_enabled_ui(sky.dungeon_room_scale_enabled, |ui| {
+                slider(
+                    ui,
+                    &mut sky.dungeon_room_dim_min,
+                    0.5..=20.0,
+                    "Dim. min (m): fattore minimo",
+                );
+                slider(
+                    ui,
+                    &mut sky.dungeon_room_dim_max,
+                    2.0..=60.0,
+                    "Dim. max (m): fattore 1.0",
+                );
+                slider(
+                    ui,
+                    &mut sky.dungeon_room_factor_min,
+                    0.0..=0.2,
+                    "Fattore minimo (mai zero)",
+                );
+                // NUOVO: esponente della curva. 1.0 = smoothstep puro,
+                // > 1.0 = più selettiva (favorisce le stanze grandi).
+                slider(
+                    ui,
+                    &mut sky.dungeon_room_curve_exponent,
+                    0.5..=3.0,
+                    "Esponente curva (1 = smoothstep, >1 = selettiva)",
+                );
+                if sky.dungeon_room_dim_max <= sky.dungeon_room_dim_min {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 90, 90),
+                                     "Attenzione: dim_max <= dim_min, la curva è piatta.",
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Suggerimento: con i default (dim 3-20 m, factor_min 0.03, \
+exponent 1.5) un tunnel 2x100 m riceve ~3% del valore base, una stanza \
+8x8 ~9%, una 15x15 ~76%, la sala del trono 20x20+ il 100%.",
+                )
+                .weak()
+                .small(),
+            );
+        });
     });
 }

@@ -363,7 +363,7 @@ fn encode_png_rgba(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 }
 
 fn parse(content: &str) -> ClassicOverride {
-    let (name, description, voice, _position) = parse_custom_txt(content);
+    let (name, description, voice, _position, _qbn_symbol) = parse_custom_txt(content);
     ClassicOverride {
         name: (!name.is_empty()).then_some(name),
         description,

@@ -11,30 +11,43 @@
 //!   T = viaggio rapido (mappa dell'Iliac Bay)
 //!   M = mappa dell'Iliac Bay
 //!   L = mappa locale della città (taverne verdi, negozi rossi, gilde blu)
+//!   L (in dungeon) = mappa orbitante 3D del dungeon
 //!   G = attiva/disattiva l'erba
 //!   F11 = schermo intero senza bordi (on/off)
-//!   E / U = entra nel locale/dungeon / esci vicino alla porta
+//!   E = entra nel locale/dungeon, apri/chiudi porta vicina
 //!   Backspace = esci sempre da dungeon/locali
 //!   C = equipaggiamento
+//!   H = scheda del personaggio (attributi, abilità, livello)
 //!   Z = sguaina/rinfodera arma
 //!   X = intensità torcia
+//!   V = apri il bottino di un cadavere vicino
 mod torch;
 mod data;
 mod equipment;
+mod character;
 mod npc_home;
 mod calendar;
 mod grass;
 mod npc_anim;
+mod underwater_fx;
 mod fps_weapon;
 mod snow_fx;
+mod pathfind;
+mod spell_guide;
+mod underwater;
+mod magic_items;
 mod dungeon_enemies;
 mod interior;
 mod local_map;
+mod character_sheet;
+mod dungeon_map;
 mod dialog;
+mod item_templates;
 mod ship;
+mod ships;
 mod classic_npc;
 mod map;
-mod fast_travel; // <-- Aggiunto modulo viaggio rapido
+mod fast_travel;
 mod rain_fx;
 mod mod_textures;
 mod music;
@@ -51,13 +64,29 @@ mod tiles;
 mod trees;
 mod tts;
 mod wall_textures;
+mod water; // mantenuto per depth_map (usato in tiles.rs)
+mod ocean; // ← pipeline FFT
 mod world;
 mod compass;
 mod vitals;
 mod dungeon;
+// --- main quest (QBN): interprete, PNG, giornale, oggetti, pickup, notifiche ---
+mod qbn;
+mod qbn_npc;
+mod main_quest;
+mod journal;
+mod quest_items;
+mod quest_pickups;
+mod quest_save;
+mod toast;
+mod combat;
+mod damage_fx;
+mod loot;
 mod relief_post;
 mod custom_cursor;
+
 use crate::data::blocks::RmbBlock;
+
 use crate::data::bsa::{BsaArchive, BsaDirectory};
 use crate::data::maps::{DFLocation, MapsReader};
 use crate::data::Season;
@@ -89,15 +118,6 @@ pub struct QuestStatesRes(pub dfquest::QuestStates);
 // =============================================================================
 // Evento ponte quest_llm → main
 // =============================================================================
-/// Emesso da `quest_llm.rs` (Fase 2 del runtime unificato) quando un nuovo
-/// script QRC/QBN è stato generato dall'LLM e salvato in `quests/generated/`.
-///
-/// `main.rs` reagisce con `reload_quest_library`, che rilegge il file e lo
-/// inserisce nella `Library` già in uso. Da quel momento la quest diventa
-/// attiva nel gioco, esattamente come una quest originale di Daggerfall.
-///
-/// Finché `quest_llm.rs` non emette l'evento, il sistema di reload è inerte
-/// e il gioco funziona come prima.
 #[derive(Event, Debug, Clone)]
 pub struct QuestScriptReadyEvent {
     /// Id dello script (`Quest: X` nel file, es. `"N0B00Y16"`).
@@ -110,7 +130,8 @@ pub struct QuestScriptReadyEvent {
 
 const USAGE: &str = "uso: dfu-walk <cartella ARENA2> [--mods <cartella>] [--textures <cartella>]
 [--pixel X Y] [--radius N] [--winter] [--hour H] [--day-minutes M] [--outside]";
-const SKY: Color = Color::srgb(0.55, 0.72, 0.92);
+const SKY: Color = Color::srgb(0.0, 0.9, 0.92);
+
 // =============================================================================
 // Risorse di avvio
 // =============================================================================
@@ -118,6 +139,7 @@ const SKY: Color = Color::srgb(0.55, 0.72, 0.92);
 pub struct StartDungeonConfig {
     pub start_in_dungeon: bool,
 }
+
 struct Args {
     dir: PathBuf,
     mods_dir: PathBuf,
@@ -131,13 +153,16 @@ struct Args {
     start_day: u8,
     start_dungeon: bool,
 }
+
 #[derive(Resource)]
 struct StartInfo {
     mx: i32,
     my: i32,
 }
+
 #[derive(Resource)]
 struct RadiusSetting(i32);
+
 // =============================================================================
 // Utility di parsing
 // =============================================================================
@@ -145,11 +170,13 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("errore: {msg}");
     std::process::exit(1)
 }
+
 fn next_value<T: std::str::FromStr>(it: &mut impl Iterator<Item = String>, what: &str) -> T {
     it.next()
     .and_then(|v| v.parse().ok())
     .unwrap_or_else(|| fail(format!("{what} vuole un numero\n{USAGE}")))
 }
+
 fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     let dir = it.next().unwrap_or_else(|| fail(USAGE));
@@ -178,7 +205,7 @@ fn parse_args() -> Args {
         winter: false,
         hour: 10.5,
         day_minutes: 24.0,
-        start_month: 0,   // Morning Star
+        start_month: 0,
         start_day: 5,
         start_dungeon: true,
     };
@@ -205,7 +232,7 @@ fn parse_args() -> Args {
             "--radius" => args.radius = next_value::<i32>(&mut it, "--radius").clamp(1, 8),
             "--winter" => args.winter = true,
             "--start-month" => args.start_month = next_value::<u8>(&mut it, "--start-month") % 12,
-            "--start-day"   => args.start_day   = next_value::<u8>(&mut it, "--start-day").clamp(1, 30),
+            "--start-day" => args.start_day = next_value::<u8>(&mut it, "--start-day").clamp(1, 30),
             "--hour" => args.hour = next_value(&mut it, "--hour"),
             "--day-minutes" => {
                 args.day_minutes = next_value::<f32>(&mut it, "--day-minutes").max(0.0)
@@ -215,6 +242,7 @@ fn parse_args() -> Args {
     }
     args
 }
+
 // =============================================================================
 // Caricamento dati
 // =============================================================================
@@ -255,6 +283,7 @@ fn load_data(args: &Args) -> GameData {
         "Caricate {} località (città, villaggi, dungeon) dalla mappa.",
              locations.len()
     );
+
     if let Ok(blocks_bsa_for_fix) = BsaArchive::parse(&blocks_buf) {
         fix_missing_block_names(&mut locations, &blocks_bsa_for_fix);
     }
@@ -265,15 +294,8 @@ fn load_data(args: &Args) -> GameData {
         palette: Arc::new(Palette::open(open("ART_PAL.COL")).unwrap_or_else(|e| fail(e))),
         season: {
             if args.winter {
-                // Flag deprecato: utile solo per test rapidi.
-                // Meglio usare --start-month 11 --start-day 1.
                 Season::Winter
             } else {
-                // Stagione coerente con la data di partenza, così il primo
-                // frame di `stream_tiles` costruisce i tile con l'archivio
-                // giusto. Senza questo, con data Morning Star (Winter) ma
-                // `season = Summer` di default, i primi 2-4 tile sono verdi
-                // e restano tali finché non escono dal raggio di streaming.
                 crate::calendar::GameDate::new(
                     405,
                     args.start_month,
@@ -289,6 +311,7 @@ fn load_data(args: &Args) -> GameData {
         locations: Arc::new(locations),
     }
 }
+
 /// Corregge i nomi di blocco che non esistono in BLOCKS.BSA.
 fn fix_missing_block_names(
     locations: &mut HashMap<(i32, i32), DFLocation>,
@@ -323,7 +346,6 @@ fn fix_missing_block_names(
             let suffix6 = &name[name.len() - 6..];
             let stem = &name[..name.len() - 4];
             let number = &stem[stem.len() - 2..];
-            // --- Tentativo 1: DFU esatto (prefix + suffix6) ---
             let mut found = String::new();
             for real in &sorted {
                 if real.starts_with(prefix) && real.ends_with(suffix6) {
@@ -336,7 +358,6 @@ fn fix_missing_block_names(
                 fixed += 1;
                 continue;
             }
-            // --- Tentativo 2: prefix + ?? + numero + ".RMB" ---
             let number_suffix = format!("{number}.RMB");
             let candidates: Vec<&str> = sorted
             .iter()
@@ -392,6 +413,7 @@ fn fix_missing_block_names(
     }
     eprintln!("fixup blocchi: {fixed} corretti, {unfixed} non correggibili");
 }
+
 // =============================================================================
 // Scelta del punto di partenza
 // =============================================================================
@@ -419,16 +441,6 @@ fn find_start(data: &GameData) -> (i32, i32) {
 // =============================================================================
 // Ricarica della Library quando arriva un nuovo script QRC/QBN
 // =============================================================================
-/// Sistema di reload della `Library` dei quest.
-///
-/// Emesso da `quest_llm.rs` (Fase 2 del runtime unificato) quando l'LLM produce
-/// uno script QRC/QBN completo e lo salva in `quests/generated/`. Il sistema
-/// rilegge il file, lo parsa con `dfquest::QuestScript::parse`, e lo inserisce
-/// nella `Library` in uso. Da quel momento la quest è attiva nel gioco,
-/// esattamente come una quest originale di Daggerfall.
-///
-/// Finché `quest_llm.rs` non emette `QuestScriptReadyEvent`, il sistema è
-/// inerte: nessun comportamento cambia.
 pub fn reload_quest_library(
     mut events: EventReader<QuestScriptReadyEvent>,
     mut lib: ResMut<QuestLibRes>,
@@ -463,7 +475,6 @@ fn main() {
     let args = parse_args();
     let data = load_data(&args);
 
-    // Inizializza la cache degli NPC custom dalla cartella delle texture
     let custom_npcs = interior::CustomNpcCache::load(&args.textures_dir);
 
     let privateer_loc = data
@@ -496,11 +507,13 @@ fn main() {
     println!("         T = viaggio rapido (mappa dell'Iliac Bay). ");
     println!("         M = apri/chiudi mappa dell'Iliac Bay. ");
     println!("         L = mappa locale della città (taverne verdi, negozi rossi, gilde blu). ");
+    println!("         L (in dungeon) = mappa orbitante 3D del dungeon. ");
     println!("         G = attiva/disattiva l'erba. ");
-    println!("         E / U = entra nel locale o dungeon / esci vicino alla porta (Backspace = esci sempre). ");
-    println!("         C = equipaggiamento, Z = arma, X = torcia. ");
+    println!("         E = entra nel locale/dungeon, apri/chiudi porta vicina. ");
+    println!("         Backspace = esci sempre da dungeon/locali. ");
+    println!("         C = equipaggiamento, H = scheda personaggio, Z = arma, X = torcia. ");
+    println!("         V = apri il bottino di un cadavere vicino. ");
 
-    // ── dfquest: libreria + stato delle quest ─────────────────────────────
     let (quest_lib, quest_warnings) = dfquest::Library::load_dir(
         std::path::Path::new(dfquest::DEFAULT_QUESTS_DIR),
     );
@@ -508,10 +521,6 @@ fn main() {
         eprintln!("dfquest: {w}");
     }
 
-    // Fase 2: includi anche gli script generati dall'LLM in `quests/generated/`.
-    // Se la cartella non esiste, `load_dir` restituisce una Library vuota e un
-    // warning: non è un errore, vuol dire che nessuno script è stato generato
-    // finora.
     let generated_dir = std::path::Path::new("quests/generated");
     let mut quest_lib = quest_lib;
     if generated_dir.is_dir() {
@@ -551,7 +560,6 @@ fn main() {
              quest_lib.get("N0B00Y16").is_some(),
     );
 
-    // ────────────────────────────────────────────────────────────────────────
     App::new()
     .add_plugins(
         DefaultPlugins.set(WindowPlugin {
@@ -564,15 +572,34 @@ fn main() {
         }),
     )
     .add_plugins(dialog::DialogPlugin)
+    .add_plugins((
+        main_quest::MainQuestPlugin,
+        qbn_npc::QbnNpcPlugin,
+        journal::JournalPlugin,
+        quest_items::QuestItemsPlugin,
+        quest_pickups::QuestPickupsPlugin,
+        toast::ToastPlugin,
+    ))
     .add_plugins(quest_llm::QuestPlugin)
     .add_plugins(tts::TtsPlugin)
+
     .add_plugins(rain_fx::RainFxPlugin)
     .add_plugins(npc_home::NpcHomePlugin)
     .add_plugins(fps_weapon::FpsWeaponPlugin)
     .add_plugins(calendar::CalendarPlugin)
     .add_plugins(compass::CompassPlugin)
     .add_plugins(ship::ShipPlugin)
-    .add_plugins(fast_travel::FastTravelPlugin) // <-- Aggiunto plugin viaggio rapido
+    .add_plugins(combat::CombatPlugin)
+    .add_plugins(damage_fx::DamageFxPlugin)
+    .add_plugins(loot::LootPlugin)
+    .add_plugins(character::CharacterPlugin)
+    .add_plugins(character_sheet::CharacterSheetPlugin)
+    .add_plugins(spell_guide::GuideSpellPlugin)
+    .add_plugins(relief_post::FakeReliefPlugin)
+    .add_plugins(underwater_fx::UnderwaterFxPlugin)
+    .add_plugins(underwater::UnderwaterPlugin)
+    .add_plugins(fast_travel::FastTravelPlugin)
+    .add_plugins(dungeon_map::DungeonMapPlugin)
     .add_plugins(tiles::FollowerMoodPlugin)
     .add_plugins(vitals::VitalsPlugin)
     .add_plugins(tuning_menu::TuningMenuPlugin)
@@ -581,20 +608,18 @@ fn main() {
     .add_plugins(torch::TorchPlugin)
     .add_plugins(savegame::SaveGamePlugin)
     .add_plugins(equipment::EquipmentPlugin)
-    .add_plugins(relief_post::FakeReliefPlugin)
+
     .add_plugins(dungeon::DungeonPlugin)
     .add_plugins(snow_fx::SnowFxPlugin)
-    .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
 
+    .add_plugins(ocean::OceanPlugin)
+    // ---------------------------------------------------------
+    .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .add_plugins(ModTexturesPlugin {
         dir: args.mods_dir.clone(),
                  textures_dir: Some(args.textures_dir.clone()),
                  nearest_filter: false,
     })
-    // ── Cielo procedurale Dynamic Skies (DREAM-SKY) ────────────────────
-    // Deve venire DOPO `ModTexturesPlugin` perché `spawn_dream_sky` ha
-    // bisogno di `ModTextures` per caricare le texture (`CdMCloudy`, ecc.).
-    // Il `MaterialPlugin` per `DreamSkyMaterial` è già dentro `DreamSkyPlugin`.
     .add_plugins(sky::dream_sky::DreamSkyPlugin)
     .add_plugins(custom_cursor::CustomCursorPlugin {
         cursor_path: Some(args.textures_dir.join("cursorA.png")),
@@ -605,14 +630,10 @@ fn main() {
                      brightness: 450.0,
     })
     .insert_resource(data)
-    // ── dfquest: risorse lette da `dialog.rs` (wrapper Resource) ──────
     .insert_resource(QuestLibRes(quest_lib))
     .insert_resource(QuestStatesRes(quest_states))
-    // ── evento ponte quest_llm → reload ───────────────────────────────
     .add_event::<QuestScriptReadyEvent>()
-    // ── NPC Custom ────────────────────────────────────────────────────
     .insert_resource(custom_npcs)
-    // ────────────────────────────────────────────────────────────────
     .insert_resource(HeightField::default())
     .insert_resource(StartInfo { mx, my })
     .insert_resource(StartDungeonConfig {
@@ -632,6 +653,7 @@ fn main() {
     .add_event::<music::MusicEvent>()
     .insert_resource(music::MusicController::default())
     .init_resource::<music::MusicDucking>()
+    .init_resource::<magic_items::MagicItemsCatalog>()
     .add_systems(
         Startup,
         (
@@ -641,10 +663,10 @@ fn main() {
          local_map::setup_local_map,
          music::start_music,
          grass::setup_grass,
+
         )
         .chain(),
     )
-    // ── Gruppo A: simulazione (13 sistemi, sotto il limite di 16) ─────
     .add_systems(
         Update,
         (
@@ -652,17 +674,21 @@ fn main() {
          player::player_look,
          interior::interior_enter_exit,
          interior::interior_move,
+         interior::interior_toggle_doors,
+         interior::animate_doors,
          interior::face_flats,
-         npc_anim::update_npcs, // 6
-         tiles::update_followers, // ← aggiunto
+         npc_anim::update_npcs,
+         tiles::update_followers,
          tiles::update_enemies,
          player::player_move,
          map::update_ship_marker,
          rebase_origin,
          stream_tiles,
          collect_tiles,
+         // L'acqua non è più un figlio dei chunk: il piano segue il giocatore
+         ocean::update_ocean_plane,
          sky::update_dream_texture,
-         sky::update_sky.run_if(interior::outside),
+         sky::update_sky,
         )
         .chain(),
     )
@@ -681,14 +707,11 @@ fn main() {
         .chain()
         .after(collect_tiles),
     )
-    // ── Gruppo C: ricarica Library degli script generati (Fase 2) ─────
-    // Separato dagli altri gruppi: dipende solo dal fatto che `quest_poll`
-    // (in `quest_llm.rs`) abbia emesso `QuestScriptReadyEvent`. Finché non
-    // succede, il sistema è inerte (nessun evento da leggere).
     .add_systems(Update, reload_quest_library)
     .add_systems(Update, toggle_borderless)
     .run();
 }
+
 // =============================================================================
 // Setup iniziale
 // =============================================================================
@@ -708,20 +731,22 @@ fn setup(
     .unwrap_or_else(|e| fail(e));
     let ground = terrain_height(&samples, 64.0, 64.0);
     commands.insert_resource(origin);
-    let reach = (radius.0 as f32 + 0.3) * MAP_PIXEL_SIZE;
+
+    let reach = (radius.0 as f32) * MAP_PIXEL_SIZE;
+
     commands.spawn((
         Camera3d::default(),
                     Projection::Perspective(PerspectiveProjection {
                         fov: 70.0_f32.to_radians(),
                                             near: 0.1,
-                                            far: 60_000.0,
+                                            far: reach * 2.0,
                                             ..default()
                     }),
                     DistanceFog {
                         color: SKY,
                         falloff: FogFalloff::Linear {
-                            start: reach * 0.5,
-                            end: reach,
+                            start: reach * 0.3,
+                            end: reach * 0.9,
                         },
                         ..default()
                     },
@@ -734,6 +759,7 @@ fn setup(
     ));
     let _ = CELL_SIZE;
 }
+
 // =============================================================================
 // F11: schermo intero senza bordi (toggle)
 // =============================================================================

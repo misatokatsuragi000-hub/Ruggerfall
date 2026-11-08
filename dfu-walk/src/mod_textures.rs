@@ -174,8 +174,6 @@ impl ModTextures {
             array_count += 1;
         }
 
-
-
         let mut material_count = 0usize;
         let mut materials_unparsed: Vec<String> = Vec::new();
         for name in m.material_names() {
@@ -195,13 +193,11 @@ impl ModTextures {
             }
         }
 
-
         if tex_count > 0 || material_count > 0 {
             let mut top: Vec<(u32, usize)> = mod_coverage.into_iter().collect();
             top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             top.truncate(10);
             let top: Vec<String> = top.iter().map(|(a, n)| format!("{a}({n})")).collect();
-
         }
 
         self.archives.push(m);
@@ -235,7 +231,6 @@ impl ModTextures {
             self.loose_paths.insert(stem.to_ascii_lowercase(), path);
             count += 1;
         }
-
     }
 
     /// Decodifica (una sola volta) una texture sciolta e ne restituisce l'handle.
@@ -375,7 +370,6 @@ impl ModTextures {
             for name in albedo_loose_names(key) {
                 if self.loose_paths.contains_key(&name) {
                     if let Some(h) = self.load_loose(&name, images) {
-
                         return Some(h);
                     }
                 }
@@ -798,8 +792,15 @@ impl ModTextures {
         found
     }
 
+    /// Nomi (minuscoli) delle texture nei `.dfmod`.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.by_name.keys().map(String::as_str)
+    }
+
+    /// Nomi (minuscoli) delle texture sciolte in `StreamingAssets/Textures`.
+    /// Usata da `fps_weapon.rs` per scansionare anche i PNG oltre ai `.dfmod`.
+    pub fn loose_names(&self) -> impl Iterator<Item = &str> {
+        self.loose_paths.keys().map(String::as_str)
     }
 
     fn load_2d(

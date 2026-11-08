@@ -6,7 +6,7 @@
 //!
 //! - Pool fisso di `PARTICLE_COUNT` gocce (default 2000). Spawnate tutte al
 //!   primo activate, despawnate tutte quando smette di piovere.
-//! - Ogni goccia è un piccolo rettangolo (0.02 × 0.4 m) billboardato **in Y**:
+//! - Ogni goccia è un piccolo rettangolo (0.02 × 0.4 m) billboardato in Y:
 //!   resta verticale, guarda la camera in yaw. Una sola `Mesh` condivisa e un
 //!   solo `StandardMaterial` condiviso → Bevy raggruppa in un batch.
 //! - Aggiornamento in `Update`: O(N) trasformazioni per frame, con N=2000 è
@@ -16,26 +16,26 @@
 //!   player si sposta di molto in un frame (teletrasporto), tutte le gocce
 //!   vengono riciclate subito attorno alla nuova posizione.
 //! - **Non** piove in interni/dungeon, anche se il meteo è Pioggia.
+//! - **Non** piove sott'acqua: il tuffo spegne le gocce, la riemersione le riaccende.
 //!
 //! ## Attivazione
 //!
 //! `update_rain_activation` legge `CurrentPreset` (opzionale: se il plugin del
-//! cielo non è caricato, la pioggia resta spenta) e `InteriorState` /
+//! cielo non è caricato, la pioggia resta spenta) e `InteriorState`/
 //! `DungeonState` (opzionali). Se il preset è Pioggia o Temporale **e** si è
-//! all'aperto, attiva; altrimenti spegne.
+//! all'aperto **e** non sott'acqua, attiva; altrimenti spegne.
 //!
 //! ## Integrazione
 //!
 //! In `main.rs`:
 //!   `mod rain_fx;`
 //!   `.add_plugins(rain_fx::RainFxPlugin)`
-
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
-
 use crate::player::Player;
 use crate::sky::dream_sky::CurrentPreset;
+use crate::underwater::UnderwaterState;
 
 // =============================================================================
 // Parametri
@@ -81,12 +81,14 @@ impl Rng {
         }
         self
     }
+
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
     }
+
     fn f32(&mut self) -> f32 {
         // 24 bit di mantissa: precisione buona, distribuzione uniforme.
         ((self.next() >> 40) as f32) / 16_777_216.0
@@ -127,10 +129,10 @@ impl Plugin for RainFxPlugin {
             Update,
             (
                 setup_rain_assets,
-                update_rain_activation,
-                update_rain_particles,
+             update_rain_activation,
+             update_rain_particles,
             )
-                .chain(),
+            .chain(),
         );
     }
 }
@@ -147,6 +149,7 @@ fn setup_rain_assets(
     if state.mesh.is_some() {
         return;
     }
+
     let hw = DROP_WIDTH * 0.5;
     let hh = DROP_HEIGHT * 0.5;
     let mut mesh = Mesh::new(
@@ -168,15 +171,15 @@ fn setup_rain_assets(
         vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
     );
     mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
-    state.mesh = Some(meshes.add(mesh));
 
+    state.mesh = Some(meshes.add(mesh));
     state.material = Some(materials.add(StandardMaterial {
         base_color: Color::srgba(0.72, 0.80, 0.92, 0.45),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        cull_mode: None,
-        perceptual_roughness: 1.0,
-        ..default()
+                                        alpha_mode: AlphaMode::Blend,
+                                        unlit: true,
+                                        cull_mode: None,
+                                        perceptual_roughness: 1.0,
+                                        ..default()
     }));
 }
 
@@ -189,12 +192,17 @@ fn update_rain_activation(
     preset: Option<Res<CurrentPreset>>,
     interior: Option<Res<crate::interior::InteriorState>>,
     dungeon: Option<Res<crate::dungeon::DungeonState>>,
+    underwater: Res<UnderwaterState>,
     mut state: ResMut<RainState>,
     player: Query<&Transform, With<Player>>,
 ) {
     let outside = !interior.as_ref().is_some_and(|i| i.is_inside())
-        && !dungeon.as_ref().is_some_and(|d| d.is_inside());
-    let should_be_active = outside && preset.as_ref().is_some_and(|p| p.current.is_rain());
+    && !dungeon.as_ref().is_some_and(|d| d.is_inside());
+
+    // Sott'acqua non piove: il tuffo despawna le gocce, la riemersione le ricrea.
+    let should_be_active = outside
+    && preset.as_ref().is_some_and(|p| p.current.is_rain())
+    && !underwater.is_underwater;
 
     if should_be_active == state.active {
         return;
@@ -217,11 +225,12 @@ fn update_rain_activation(
     let (Some(mesh), Some(material)) = (state.mesh.clone(), state.material.clone()) else {
         return;
     };
+
     let center = player_tf.translation;
     // Reset del seed in base alla posizione, così due sessioni nella stessa
     // zona hanno la stessa distribuzione (utile per screenshot).
     state.rng = std::mem::take(&mut state.rng)
-        .seed(center.x.to_bits() as u64 ^ ((center.z.to_bits() as u64).rotate_left(32)));
+    .seed(center.x.to_bits() as u64 ^ ((center.z.to_bits() as u64).rotate_left(32)));
 
     let mut new_particles = Vec::with_capacity(PARTICLE_COUNT);
     for _ in 0..PARTICLE_COUNT {
@@ -234,6 +243,7 @@ fn update_rain_activation(
         );
         new_particles.push(e);
     }
+
     state.particles = new_particles;
     state.last_player_pos = center;
     state.active = true;
@@ -251,18 +261,19 @@ fn spawn_drop(
     let radius = rng.f32().sqrt() * RADIUS; // sqrt: distribuzione uniforme sul disco
     let pos = Vec3::new(
         player_pos.x + angle.cos() * radius,
-        player_pos.y + rng.f32() * HEIGHT,
-        player_pos.z + angle.sin() * radius,
+                        player_pos.y + rng.f32() * HEIGHT,
+                        player_pos.z + angle.sin() * radius,
     );
     let velocity = Vec3::new(WIND.x, -SPEED, WIND.y);
+
     commands
-        .spawn((
-            Mesh3d(mesh.clone()),
+    .spawn((
+        Mesh3d(mesh.clone()),
             MeshMaterial3d(material.clone()),
             Transform::from_translation(pos),
             RainDrop { velocity },
-        ))
-        .id()
+    ))
+    .id()
 }
 
 // =============================================================================
@@ -278,6 +289,7 @@ fn update_rain_particles(
     if !state.active {
         return;
     }
+
     let Ok(player_tf) = player.get_single() else {
         return;
     };
@@ -293,7 +305,7 @@ fn update_rain_particles(
     // gocce attorno alla nuova posizione. Evita che le gocce "vecchie" siano
     // ormai fuori dal cilindro e ci mettano secondi a rientrare.
     let teleported = player_pos.distance_squared(state.last_player_pos)
-        > TELEPORT_RECYCLE_DIST * TELEPORT_RECYCLE_DIST;
+    > TELEPORT_RECYCLE_DIST * TELEPORT_RECYCLE_DIST;
     state.last_player_pos = player_pos;
 
     for (mut transform, drop) in &mut drops {
@@ -302,8 +314,8 @@ fn update_rain_particles(
             let radius = state.rng.f32().sqrt() * RADIUS;
             transform.translation = Vec3::new(
                 player_pos.x + angle.cos() * radius,
-                player_pos.y + state.rng.f32() * HEIGHT,
-                player_pos.z + angle.sin() * radius,
+                                              player_pos.y + state.rng.f32() * HEIGHT,
+                                              player_pos.z + angle.sin() * radius,
             );
             continue;
         }
@@ -317,8 +329,8 @@ fn update_rain_particles(
             let radius = state.rng.f32().sqrt() * RADIUS;
             transform.translation = Vec3::new(
                 player_pos.x + angle.cos() * radius,
-                player_pos.y + HEIGHT,
-                player_pos.z + angle.sin() * radius,
+                                              player_pos.y + HEIGHT,
+                                              player_pos.z + angle.sin() * radius,
             );
         }
 
